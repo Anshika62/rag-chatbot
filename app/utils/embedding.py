@@ -1,25 +1,24 @@
 from typing import List
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from huggingface_hub import InferenceClient
 
 
 class EmbeddingManager:
 
     def __init__(
         self,
-        model_name: str = "all-MiniLM-L6-v2"
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     ):
         try:
             self.model_name = model_name
-            self.model = SentenceTransformer(
-                model_name,
-                device="cpu"
+            self.client = InferenceClient(
+                provider="hf-inference"
             )
 
         except Exception:
             raise RuntimeError(
-                "Unable to load embedding model"
+                "Unable to initialize embedding service"
             )
 
     def generate_embedding(
@@ -33,18 +32,31 @@ class EmbeddingManager:
                     "Text list cannot be empty"
                 )
 
-            embeddings = self.model.encode(
+            result = self.client.feature_extraction(
                 texts,
-                show_progress_bar=False,
-                batch_size=1
+                model=self.model_name
             )
 
-            return np.asarray(embeddings)
+            embeddings = np.asarray(result)
+
+            if embeddings.ndim == 3:
+                embeddings = embeddings.mean(axis=1)
+
+            elif embeddings.ndim == 2:
+                if len(texts) == 1:
+                    embeddings = embeddings.mean(axis=0, keepdims=True)
+
+            elif embeddings.ndim != 2:
+                raise RuntimeError(
+                    "Unexpected embedding shape"
+                )
+
+            return embeddings.astype(np.float32)
 
         except ValueError:
             raise
 
-        except Exception:
+        except Exception as exc:
             raise RuntimeError(
-                "Unable to generate embeddings"
+                f"Unable to generate embeddings: {exc}"
             )
