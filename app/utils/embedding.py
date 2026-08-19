@@ -12,7 +12,10 @@ class EmbeddingManager:
     ):
         try:
             self.model_name = model_name
-            self.model = SentenceTransformer(model_name)
+            self.model = SentenceTransformer(
+                model_name,
+                device="cpu"
+            )
 
         except Exception:
             raise RuntimeError(
@@ -32,7 +35,8 @@ class EmbeddingManager:
 
             embeddings = self.model.encode(
                 texts,
-                show_progress_bar=False
+                show_progress_bar=False,
+                batch_size=1
             )
 
             return np.asarray(embeddings)
