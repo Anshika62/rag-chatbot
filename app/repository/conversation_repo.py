@@ -1,47 +1,52 @@
-from sqlalchemy import func
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import SQLAlchemyError
 
 from app.models.conversation import Conversation
 from app.models.message import Message
 
+
+# ============================================================
+# CREATE CONVERSATION
+# ============================================================
 
 def create_conversation(
     db: Session,
     user_id: int,
     title: str | None
 ):
-    try:
-        last_conversation_number = (
-            db.query(
-                func.max(Conversation.conversation_number)
-            )
-            .filter(
-                Conversation.user_id == user_id
-            )
-            .scalar()
+    # Get latest conversation number for this user
+    last_conversation = (
+        db.query(Conversation)
+        .filter(
+            Conversation.user_id == user_id
         )
-
-        next_conversation_number = (
-            (last_conversation_number or 0) + 1
+        .order_by(
+            Conversation.conversation_number.desc()
         )
+        .first()
+    )
 
-        conversation = Conversation(
-            user_id=user_id,
-            title=title,
-            conversation_number=next_conversation_number
-        )
+    next_conversation_number = (
+        1
+        if last_conversation is None
+        else last_conversation.conversation_number + 1
+    )
 
-        db.add(conversation)
-        db.commit()
-        db.refresh(conversation)
+    conversation = Conversation(
+        user_id=user_id,
+        title=title,
+        conversation_number=next_conversation_number
+    )
 
-        return conversation
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
 
-    except SQLAlchemyError:
-        db.rollback()
-        raise
+    return conversation
 
+
+# ============================================================
+# CREATE MESSAGE
+# ============================================================
 
 def create_message(
     db: Session,
@@ -49,124 +54,125 @@ def create_message(
     role: str,
     content: str
 ):
-    try:
-        last_message_number = (
-            db.query(
-                func.max(Message.message_number)
-            )
-            .filter(
-                Message.conversation_id == conversation_id
-            )
-            .scalar()
+    # Get latest message number for this conversation
+    last_message = (
+        db.query(Message)
+        .filter(
+            Message.conversation_id == conversation_id
         )
-
-        next_message_number = (
-            (last_message_number or 0) + 1
+        .order_by(
+            Message.message_number.desc()
         )
+        .first()
+    )
 
-        message = Message(
-            conversation_id=conversation_id,
-            role=role,
-            content=content,
-            message_number=next_message_number
-        )
+    next_message_number = (
+        1
+        if last_message is None
+        else last_message.message_number + 1
+    )
 
-        db.add(message)
-        db.commit()
-        db.refresh(message)
+    message = Message(
+        conversation_id=conversation_id,
+        role=role,
+        content=content,
+        message_number=next_message_number
+    )
 
-        return message
+    db.add(message)
+    db.commit()
+    db.refresh(message)
 
-    except SQLAlchemyError:
-        db.rollback()
-        raise
+    return message
 
+
+# ============================================================
+# GET SINGLE CONVERSATION
+# ============================================================
 
 def get_conversation(
     db: Session,
     conversation_id: int,
     user_id: int
 ):
-    try:
-        return (
-            db.query(Conversation)
-            .filter(
-                Conversation.id == conversation_id,
-                Conversation.user_id == user_id
-            )
-            .first()
+    return (
+        db.query(Conversation)
+        .filter(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user_id
         )
-
-    except SQLAlchemyError:
-        db.rollback()
-        raise
+        .first()
+    )
 
 
-def get_last_10_messages(
-    db: Session,
-    conversation_id: int
-):
-    try:
-        messages = (
-            db.query(Message)
-            .filter(
-                Message.conversation_id == conversation_id
-            )
-            .order_by(
-                Message.created_at.desc()
-            )
-            .limit(10)
-            .all()
-        )
-
-        return list(reversed(messages))
-
-    except SQLAlchemyError:
-        db.rollback()
-        raise
-
+# ============================================================
+# GET ALL CONVERSATIONS FOR USER
+# ============================================================
 
 def get_conversations_by_user(
     db: Session,
     user_id: int
 ):
-    try:
-        return (
-            db.query(Conversation)
-            .filter(
-                Conversation.user_id == user_id
-            )
-            .order_by(
-                Conversation.updated_at.desc()
-            )
-            .all()
+    return (
+        db.query(Conversation)
+        .filter(
+            Conversation.user_id == user_id
         )
+        .order_by(
+            Conversation.updated_at.desc()
+        )
+        .all()
+    )
 
-    except SQLAlchemyError:
-        db.rollback()
-        raise
 
+# ============================================================
+# GET LAST 10 MESSAGES
+# ============================================================
+
+def get_last_10_messages(
+    db: Session,
+    conversation_id: int
+):
+    messages = (
+        db.query(Message)
+        .filter(
+            Message.conversation_id == conversation_id
+        )
+        .order_by(
+            Message.created_at.desc()
+        )
+        .limit(10)
+        .all()
+    )
+
+    return list(
+        reversed(messages)
+    )
+
+
+# ============================================================
+# GET ALL MESSAGES
+# ============================================================
 
 def get_all_messages(
     db: Session,
     conversation_id: int
 ):
-    try:
-        return (
-            db.query(Message)
-            .filter(
-                Message.conversation_id == conversation_id
-            )
-            .order_by(
-                Message.created_at.asc()
-            )
-            .all()
+    return (
+        db.query(Message)
+        .filter(
+            Message.conversation_id == conversation_id
         )
+        .order_by(
+            Message.message_number.asc()
+        )
+        .all()
+    )
 
-    except SQLAlchemyError:
-        db.rollback()
-        raise
 
+# ============================================================
+# UPDATE CONVERSATION TITLE
+# ============================================================
 
 def update_conversation_title(
     db: Session,
@@ -174,54 +180,48 @@ def update_conversation_title(
     user_id: int,
     title: str
 ):
-    try:
-        conversation = (
-            db.query(Conversation)
-            .filter(
-                Conversation.id == conversation_id,
-                Conversation.user_id == user_id
-            )
-            .first()
+    conversation = (
+        db.query(Conversation)
+        .filter(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user_id
         )
+        .first()
+    )
 
-        if not conversation:
-            return None
+    if not conversation:
+        return None
 
-        conversation.title = title
+    conversation.title = title
 
-        db.commit()
-        db.refresh(conversation)
+    db.commit()
+    db.refresh(conversation)
 
-        return conversation
+    return conversation
 
-    except SQLAlchemyError:
-        db.rollback()
-        raise
 
+# ============================================================
+# DELETE CONVERSATION
+# ============================================================
 
 def delete_conversation(
     db: Session,
     conversation_id: int,
     user_id: int
 ):
-    try:
-        conversation = (
-            db.query(Conversation)
-            .filter(
-                Conversation.id == conversation_id,
-                Conversation.user_id == user_id
-            )
-            .first()
+    conversation = (
+        db.query(Conversation)
+        .filter(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user_id
         )
+        .first()
+    )
 
-        if not conversation:
-            return False
+    if not conversation:
+        return False
 
-        db.delete(conversation)
-        db.commit()
+    db.delete(conversation)
+    db.commit()
 
-        return True
-
-    except SQLAlchemyError:
-        db.rollback()
-        raise
+    return True

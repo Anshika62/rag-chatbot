@@ -28,6 +28,10 @@ from app.service.external.LLM_service import generate_title
 from app.service.rag_service import query_documents_stream
 
 
+# ============================================================
+# ROUTER
+# ============================================================
+
 router = APIRouter(
     prefix="/conversation",
     tags=["Conversation"]
@@ -36,7 +40,14 @@ router = APIRouter(
 logger = logging.getLogger(__name__)
 
 
-def _get_current_user(db: Session, email: str):
+# ============================================================
+# CURRENT USER
+# ============================================================
+
+def _get_current_user(
+    db: Session,
+    email: str
+):
     user = get_user_by_email(
         db=db,
         email=email
@@ -51,6 +62,10 @@ def _get_current_user(db: Session, email: str):
     return user
 
 
+# ============================================================
+# SEND MESSAGE / STREAM RESPONSE
+# ============================================================
+
 @router.post("")
 def send_message(
     request: QueryRequest,
@@ -64,7 +79,10 @@ def send_message(
 
     conversation_id = request.conversation_id
 
+    # --------------------------------------------------------
     # Create new conversation
+    # --------------------------------------------------------
+
     if conversation_id is None:
 
         title = generate_title(
@@ -79,7 +97,10 @@ def send_message(
 
         conversation_id = conversation.id
 
-    # Use existing conversation
+    # --------------------------------------------------------
+    # Existing conversation
+    # --------------------------------------------------------
+
     else:
 
         conversation = get_conversation(
@@ -89,10 +110,15 @@ def send_message(
         )
 
         if not conversation:
+
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Conversation not found"
             )
+
+    # --------------------------------------------------------
+    # SSE EVENT GENERATOR
+    # --------------------------------------------------------
 
     def event_generator():
 
@@ -115,23 +141,27 @@ def send_message(
                     f"data: {json.dumps(event_data)}\n\n"
                 )
 
-        except Exception as e:
+        except Exception:
 
             logger.exception(
-                "Conversation streaming failed. "
+                "Conversation streaming failed: "
                 "conversation_id=%s, user_id=%s",
                 conversation_id,
                 user.id
             )
 
-            # Keep the SSE stream alive long enough
-            # to send a proper error event to the client.
             error_data = {
                 "event": "error",
                 "success": False,
                 "error_code": "INTERNAL_SERVER_ERROR",
                 "conversation_id": conversation_id,
+                "conversation_number": getattr(
+                    conversation,
+                    "conversation_number",
+                    None
+                ),
                 "message_id": None,
+                "message_number": None,
                 "delta": None,
                 "text_content": "Internal server error"
             }
@@ -140,6 +170,10 @@ def send_message(
                 "event: error\n"
                 f"data: {json.dumps(error_data)}\n\n"
             )
+
+    # --------------------------------------------------------
+    # SSE RESPONSE
+    # --------------------------------------------------------
 
     return StreamingResponse(
         event_generator(),
@@ -151,6 +185,10 @@ def send_message(
         }
     )
 
+
+# ============================================================
+# LIST CONVERSATIONS
+# ============================================================
 
 @router.get("")
 def list_conversations(
@@ -170,9 +208,16 @@ def list_conversations(
     data = [
         {
             "conversation_id": conversation.id,
+            "conversation_number": (
+                conversation.conversation_number
+            ),
             "title": conversation.title,
-            "created_at": conversation.created_at.isoformat(),
-            "updated_at": conversation.updated_at.isoformat()
+            "created_at": (
+                conversation.created_at.isoformat()
+            ),
+            "updated_at": (
+                conversation.updated_at.isoformat()
+            )
         }
         for conversation in conversations
     ]
@@ -183,6 +228,10 @@ def list_conversations(
         status_code=status.HTTP_200_OK
     )
 
+
+# ============================================================
+# GET CONVERSATION DETAIL
+# ============================================================
 
 @router.get("/{conversation_id}")
 def get_conversation_detail(
@@ -202,6 +251,7 @@ def get_conversation_detail(
     )
 
     if not conversation:
+
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found"
@@ -216,15 +266,27 @@ def get_conversation_detail(
         message="Conversation fetched successfully",
         data={
             "conversation_id": conversation.id,
+            "conversation_number": (
+                conversation.conversation_number
+            ),
             "title": conversation.title,
-            "created_at": conversation.created_at.isoformat(),
-            "updated_at": conversation.updated_at.isoformat(),
+            "created_at": (
+                conversation.created_at.isoformat()
+            ),
+            "updated_at": (
+                conversation.updated_at.isoformat()
+            ),
             "messages": [
                 {
                     "message_id": message.id,
+                    "message_number": (
+                        message.message_number
+                    ),
                     "role": message.role,
                     "content": message.content,
-                    "created_at": message.created_at.isoformat()
+                    "created_at": (
+                        message.created_at.isoformat()
+                    )
                 }
                 for message in messages
             ]
@@ -232,6 +294,10 @@ def get_conversation_detail(
         status_code=status.HTTP_200_OK
     )
 
+
+# ============================================================
+# UPDATE CONVERSATION TITLE
+# ============================================================
 
 @router.patch("/{conversation_id}")
 def update_title(
@@ -253,6 +319,7 @@ def update_title(
     )
 
     if not conversation:
+
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found"
@@ -262,11 +329,18 @@ def update_title(
         message="Title updated successfully",
         data={
             "conversation_id": conversation.id,
+            "conversation_number": (
+                conversation.conversation_number
+            ),
             "title": conversation.title
         },
         status_code=status.HTTP_200_OK
     )
 
+
+# ============================================================
+# DELETE CONVERSATION
+# ============================================================
 
 @router.delete("/{conversation_id}")
 def delete_conversation_endpoint(
@@ -286,6 +360,7 @@ def delete_conversation_endpoint(
     )
 
     if not deleted:
+
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found"

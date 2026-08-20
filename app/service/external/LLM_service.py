@@ -1,3 +1,5 @@
+import json
+
 from fastapi import HTTPException, status
 
 from langchain_groq import ChatGroq
@@ -197,7 +199,7 @@ def generate_answer(
         )
 
         # ----------------------------------------------------
-        # Check tool calls
+        # Tool call flow
         # ----------------------------------------------------
 
         if response.tool_calls:
@@ -279,6 +281,91 @@ def generate_answer(
 
 
 # ============================================================
+# PARSE STREAM TOOL CALLS
+# ============================================================
+
+def _parse_tool_calls(
+    tool_call_chunks: list
+):
+    """
+    Convert streamed tool-call chunks into complete
+    tool-call dictionaries.
+
+    This is used only when the streaming LLM decides
+    to call a conversation tool.
+    """
+
+    if not tool_call_chunks:
+        return []
+
+    tool_calls = {}
+
+    for chunk in tool_call_chunks:
+
+        index = chunk.get(
+            "index",
+            0
+        )
+
+        if index not in tool_calls:
+
+            tool_calls[index] = {
+                "id": "",
+                "name": "",
+                "args": ""
+            }
+
+        tool_call = tool_calls[index]
+
+        tool_call["id"] += (
+            chunk.get("id")
+            or ""
+        )
+
+        tool_call["name"] += (
+            chunk.get("name")
+            or ""
+        )
+
+        tool_call["args"] += (
+            chunk.get("args")
+            or ""
+        )
+
+    parsed_calls = []
+
+    for tool_call in tool_calls.values():
+
+        args_text = tool_call["args"].strip()
+
+        if args_text:
+
+            try:
+
+                args = json.loads(
+                    args_text
+                )
+
+            except json.JSONDecodeError:
+
+                args = {}
+
+        else:
+
+            args = {}
+
+        parsed_calls.append(
+            {
+                "id": tool_call["id"],
+                "name": tool_call["name"],
+                "args": args
+            }
+        )
+
+    return parsed_calls
+
+
+# ============================================================
 # STREAMING ANSWER
 # ============================================================
 
@@ -290,26 +377,35 @@ def generate_answer_stream(
     conversation_id: int | None = None
 ):
     """
-    Streaming RAG + tool calling.
+    Streaming RAG + conversation tool calling.
+
+    Normal flow:
+
+        User Question
+             ↓
+        LLM.stream()
+             ↓
+        delta chunks
+             ↓
+        final answer
+
+    Tool flow:
+
+        User Question
+             ↓
+        LLM.stream()
+             ↓
+        Tool Call detected
+             ↓
+        Execute Tool
+             ↓
+        Final LLM.stream()
+             ↓
+        delta chunks
 
     Important:
-
-    Tool execution itself is not streamed.
-
-    Flow:
-
-        First LLM call
-             ↓
-        Tool requested?
-          /       \
-        No        Yes
-        ↓          ↓
-      Stream    Execute tool
-      answer       ↓
-                   Final LLM
-                     ↓
-                   Stream
-                   answer
+    The normal answer is now streamed directly instead of
+    calling invoke() first.
     """
 
     try:
@@ -343,28 +439,101 @@ def generate_answer_stream(
 
             llm_with_tools = llm
 
-        # ----------------------------------------------------
-        # First call
-        #
-        # We need invoke() first because we need to know
-        # whether the model wants to call a tool.
-        # ----------------------------------------------------
+        # ====================================================
+        # STREAM FIRST LLM RESPONSE
+        # ====================================================
 
-        response = llm_with_tools.invoke(
+        streamed_chunks = []
+
+        tool_call_chunks = []
+
+        for chunk in llm_with_tools.stream(
             messages
+        ):
+
+            streamed_chunks.append(
+                chunk
+            )
+
+            # ------------------------------------------------
+            # Collect possible tool-call chunks
+            # ------------------------------------------------
+
+            if getattr(
+                chunk,
+                "tool_call_chunks",
+                None
+            ):
+
+                tool_call_chunks.extend(
+                    chunk.tool_call_chunks
+                )
+
+            # ------------------------------------------------
+            # Normal content streaming
+            #
+            # Do not send content immediately if tool calls
+            # are being generated. We first need to know
+            # whether this response is a tool-call response.
+            # ------------------------------------------------
+
+        # ====================================================
+        # CHECK TOOL CALL
+        # ====================================================
+
+        tool_calls = _parse_tool_calls(
+            tool_call_chunks
         )
 
         # ====================================================
         # TOOL CALL FLOW
         # ====================================================
 
-        if response.tool_calls:
+        if tool_calls:
+
+            # ------------------------------------------------
+            # Reconstruct AI response from streamed chunks
+            # ------------------------------------------------
+
+            full_ai_response = None
+
+            for chunk in streamed_chunks:
+
+                if full_ai_response is None:
+
+                    full_ai_response = chunk
+
+                else:
+
+                    try:
+
+                        full_ai_response = (
+                            full_ai_response + chunk
+                        )
+
+                    except Exception:
+
+                        pass
+
+            # ------------------------------------------------
+            # Fallback if reconstruction failed
+            # ------------------------------------------------
+
+            if full_ai_response is None:
+
+                raise RuntimeError(
+                    "Unable to reconstruct tool call response"
+                )
 
             tool_messages = [
-                response
+                full_ai_response
             ]
 
-            for tool_call in response.tool_calls:
+            # ------------------------------------------------
+            # Execute tools
+            # ------------------------------------------------
+
+            for tool_call in tool_calls:
 
                 tool_name = tool_call["name"]
 
@@ -398,7 +567,7 @@ def generate_answer_stream(
                 )
 
                 # --------------------------------------------
-                # Add result
+                # Add tool result
                 # --------------------------------------------
 
                 tool_messages.append(
@@ -410,16 +579,12 @@ def generate_answer_stream(
                 )
 
             # ------------------------------------------------
-            # Final LLM response
+            # Final answer streaming
             # ------------------------------------------------
 
             final_messages = (
                 messages + tool_messages
             )
-
-            # ------------------------------------------------
-            # Stream final answer
-            # ------------------------------------------------
 
             for chunk in llm_with_tools.stream(
                 final_messages
@@ -436,25 +601,17 @@ def generate_answer_stream(
         # NORMAL STREAMING FLOW
         # ====================================================
 
-        # The first response already contains the answer.
-        # Stream it as one chunk to keep the interface
-        # consistent with the normal streaming flow.
+        for chunk in streamed_chunks:
 
-        if response.content:
+            if not chunk.content:
+                continue
 
-            yield response.content
+            yield chunk.content
 
     except HTTPException:
         raise
 
     except Exception as exc:
-
-        # IMPORTANT:
-        #
-        # Do NOT yield "[ERROR: ...]"
-        #
-        # Raise the exception so rag_service can create
-        # the proper SSE error event.
 
         raise RuntimeError(
             f"Unable to generate streaming response: {exc}"

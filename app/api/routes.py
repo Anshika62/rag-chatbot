@@ -8,6 +8,6 @@ from app.api.documents import router as documents_router
 router = APIRouter()
 
 router.include_router(auth_router)
-# router.include_router(files_router)
+router.include_router(files_router)
 router.include_router(conversation_router)
 router.include_router(documents_router)
