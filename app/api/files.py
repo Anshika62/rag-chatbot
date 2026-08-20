@@ -64,5 +64,6 @@ def upload_file(
     return process_document(
         file=file,
         db=db,
-        conversation_id=conversation_id
+        conversation_id=conversation_id,
+        user_id=user.id
     )

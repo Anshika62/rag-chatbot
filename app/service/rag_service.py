@@ -46,7 +46,8 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 def process_document(
     file,
     db,
-    conversation_id: int
+    conversation_id: int,
+    user_id:int
 ):
 
     try:
@@ -113,6 +114,7 @@ def process_document(
         document = create_document(
             db=db,
             file_name=file.filename,
+            user_id=user_id,
             conversation_id=conversation_id
         )
 
