@@ -1,7 +1,6 @@
 from typing import List
-
 import numpy as np
-from huggingface_hub import InferenceClient
+from sentence_transformers import SentenceTransformer
 
 
 class EmbeddingManager:
@@ -11,14 +10,13 @@ class EmbeddingManager:
         model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     ):
         try:
-            self.model_name = model_name
-            self.client = InferenceClient(
-                provider="hf-inference"
+            self.model = SentenceTransformer(
+                model_name
             )
 
-        except Exception:
+        except Exception as exc:
             raise RuntimeError(
-                "Unable to initialize embedding service"
+                f"Unable to initialize embedding model: {exc}"
             )
 
     def generate_embedding(
@@ -32,26 +30,47 @@ class EmbeddingManager:
                     "Text list cannot be empty"
                 )
 
-            result = self.client.feature_extraction(
-                texts,
-                model=self.model_name
-            )
+            cleaned_texts = [
+                text.strip()
+                for text in texts
+                if text and text.strip()
+            ]
 
-            embeddings = np.asarray(result)
-
-            if embeddings.ndim == 3:
-                embeddings = embeddings.mean(axis=1)
-
-            elif embeddings.ndim == 2:
-                if len(texts) == 1:
-                    embeddings = embeddings.mean(axis=0, keepdims=True)
-
-            elif embeddings.ndim != 2:
-                raise RuntimeError(
-                    "Unexpected embedding shape"
+            if not cleaned_texts:
+                raise ValueError(
+                    "Text list contains no valid text"
                 )
 
-            return embeddings.astype(np.float32)
+            embeddings = self.model.encode(
+                cleaned_texts,
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            )
+
+            embeddings = np.asarray(
+                embeddings,
+                dtype=np.float32
+            )
+
+            # Single text can return shape (384,)
+            if embeddings.ndim == 1:
+                embeddings = embeddings.reshape(1, -1)
+
+            if embeddings.ndim != 2:
+                raise RuntimeError(
+                    f"Unexpected embedding shape: "
+                    f"{embeddings.shape}"
+                )
+
+            # all-MiniLM-L6-v2 produces 384-dimensional vectors
+            if embeddings.shape[1] != 384:
+                raise RuntimeError(
+                    f"Unexpected embedding dimension: "
+                    f"{embeddings.shape[1]}. "
+                    f"Expected 384."
+                )
+
+            return embeddings
 
         except ValueError:
             raise

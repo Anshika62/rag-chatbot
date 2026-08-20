@@ -1,4 +1,5 @@
 import json
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -32,9 +33,14 @@ router = APIRouter(
     tags=["Conversation"]
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _get_current_user(db: Session, email: str):
-    user = get_user_by_email(db=db, email=email)
+    user = get_user_by_email(
+        db=db,
+        email=email
+    )
 
     if not user:
         raise HTTPException(
@@ -45,19 +51,25 @@ def _get_current_user(db: Session, email: str):
     return user
 
 
-
 @router.post("")
 def send_message(
     request: QueryRequest,
     db: Session = Depends(get_db),
     email: str = Depends(verify_token)
 ):
-    user = _get_current_user(db, email)
+    user = _get_current_user(
+        db=db,
+        email=email
+    )
 
     conversation_id = request.conversation_id
 
+    # Create new conversation
     if conversation_id is None:
-        title = generate_title(request.question)
+
+        title = generate_title(
+            request.question
+        )
 
         conversation = create_conversation(
             db=db,
@@ -67,7 +79,9 @@ def send_message(
 
         conversation_id = conversation.id
 
+    # Use existing conversation
     else:
+
         conversation = get_conversation(
             db=db,
             conversation_id=conversation_id,
@@ -81,24 +95,61 @@ def send_message(
             )
 
     def event_generator():
-        for event_data in query_documents_stream(
-            question=request.question,
-            db=db,
-            user_id=user.id,
-            conversation_id=conversation_id
-        ):
-            event_name = event_data.get("event", "message")
+
+        try:
+
+            for event_data in query_documents_stream(
+                question=request.question,
+                db=db,
+                user_id=user.id,
+                conversation_id=conversation_id
+            ):
+
+                event_name = event_data.get(
+                    "event",
+                    "message"
+                )
+
+                yield (
+                    f"event: {event_name}\n"
+                    f"data: {json.dumps(event_data)}\n\n"
+                )
+
+        except Exception as e:
+
+            logger.exception(
+                "Conversation streaming failed. "
+                "conversation_id=%s, user_id=%s",
+                conversation_id,
+                user.id
+            )
+
+            # Keep the SSE stream alive long enough
+            # to send a proper error event to the client.
+            error_data = {
+                "event": "error",
+                "success": False,
+                "error_code": "INTERNAL_SERVER_ERROR",
+                "conversation_id": conversation_id,
+                "message_id": None,
+                "delta": None,
+                "text_content": "Internal server error"
+            }
 
             yield (
-                f"event: {event_name}\n"
-                f"data: {json.dumps(event_data)}\n\n"
+                "event: error\n"
+                f"data: {json.dumps(error_data)}\n\n"
             )
 
     return StreamingResponse(
         event_generator(),
-        media_type="text/event-stream"
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
     )
-
 
 
 @router.get("")
@@ -106,7 +157,10 @@ def list_conversations(
     db: Session = Depends(get_db),
     email: str = Depends(verify_token)
 ):
-    user = _get_current_user(db, email)
+    user = _get_current_user(
+        db=db,
+        email=email
+    )
 
     conversations = get_conversations_by_user(
         db=db,
@@ -115,12 +169,12 @@ def list_conversations(
 
     data = [
         {
-            "conversation_id": c.id,
-            "title": c.title,
-            "created_at": c.created_at.isoformat(),
-            "updated_at": c.updated_at.isoformat()
+            "conversation_id": conversation.id,
+            "title": conversation.title,
+            "created_at": conversation.created_at.isoformat(),
+            "updated_at": conversation.updated_at.isoformat()
         }
-        for c in conversations
+        for conversation in conversations
     ]
 
     return success_response(
@@ -130,14 +184,16 @@ def list_conversations(
     )
 
 
-
 @router.get("/{conversation_id}")
 def get_conversation_detail(
     conversation_id: int,
     db: Session = Depends(get_db),
     email: str = Depends(verify_token)
 ):
-    user = _get_current_user(db, email)
+    user = _get_current_user(
+        db=db,
+        email=email
+    )
 
     conversation = get_conversation(
         db=db,
@@ -165,12 +221,12 @@ def get_conversation_detail(
             "updated_at": conversation.updated_at.isoformat(),
             "messages": [
                 {
-                    "message_id": m.id,
-                    "role": m.role,
-                    "content": m.content,
-                    "created_at": m.created_at.isoformat()
+                    "message_id": message.id,
+                    "role": message.role,
+                    "content": message.content,
+                    "created_at": message.created_at.isoformat()
                 }
-                for m in messages
+                for message in messages
             ]
         },
         status_code=status.HTTP_200_OK
@@ -184,7 +240,10 @@ def update_title(
     db: Session = Depends(get_db),
     email: str = Depends(verify_token)
 ):
-    user = _get_current_user(db, email)
+    user = _get_current_user(
+        db=db,
+        email=email
+    )
 
     conversation = update_conversation_title(
         db=db,
@@ -215,7 +274,10 @@ def delete_conversation_endpoint(
     db: Session = Depends(get_db),
     email: str = Depends(verify_token)
 ):
-    user = _get_current_user(db, email)
+    user = _get_current_user(
+        db=db,
+        email=email
+    )
 
     deleted = delete_conversation(
         db=db,

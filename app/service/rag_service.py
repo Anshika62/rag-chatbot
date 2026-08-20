@@ -1,4 +1,6 @@
 import os
+import logging
+
 import pdfplumber
 
 from fastapi import HTTPException, status
@@ -16,17 +18,24 @@ from app.repository.document_repo import (
 from app.repository.conversation_repo import (
     get_conversation,
     get_last_10_messages,
-    create_message
+    create_message,
+    create_conversation
 )
 
-from app.service.external.LLM_service import generate_answer, generate_answer_stream, generate_title
-from app.repository.conversation_repo import create_conversation
+from app.service.external.LLM_service import (
+    generate_answer,
+    generate_answer_stream,
+    generate_title
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 embedding_manager = EmbeddingManager()
 
 
-# PDF / document vector store
+# Document vector store
 vector_store = Vectorstore(
     collection_name="pdf_documents"
 )
@@ -42,14 +51,12 @@ UPLOAD_DIR = "Uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-
 def process_document(
     file,
     db,
     conversation_id: int,
-    user_id:int
+    user_id: int
 ):
-
     try:
 
         # 1. Validate file
@@ -101,8 +108,7 @@ def process_document(
             chunks
         )
 
-        # 6. Save document chunks in Qdrant
-        #    with conversation_id
+        # 6. Save chunks in vector store
         vector_store.add_documents(
             chunks=chunks,
             embeddings=embeddings,
@@ -110,7 +116,7 @@ def process_document(
             conversation_id=conversation_id
         )
 
-        # 7. Save document in Neon DB
+        # 7. Save document in database
         document = create_document(
             db=db,
             file_name=file.filename,
@@ -118,14 +124,13 @@ def process_document(
             conversation_id=conversation_id
         )
 
-        # 8. Save chunks in Neon DB
+        # 8. Save chunks in database
         create_chunks(
             db=db,
             doc_id=document.id,
             chunks=chunks
         )
 
-        # 9. Return response
         return {
             "message": "Document processed successfully",
             "document_id": document.id,
@@ -138,6 +143,8 @@ def process_document(
         raise
 
     except Exception:
+        logger.exception("Document processing failed")
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Unable to process document"
@@ -152,12 +159,14 @@ def query_documents(
 ):
     try:
 
-        if not question.strip():
+        # 1. Validate question
+        if not question or not question.strip():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Question cannot be empty"
             )
 
+        # 2. Validate conversation
         conversation = get_conversation(
             db=db,
             conversation_id=conversation_id,
@@ -170,66 +179,71 @@ def query_documents(
                 detail="Conversation not found"
             )
 
-
+        # 3. Get chat history
         previous_messages = get_last_10_messages(
             db=db,
             conversation_id=conversation_id
         )
 
-
-        chat_history = []
-
-        for message in previous_messages:
-            chat_history.append({
+        chat_history = [
+            {
                 "role": message.role,
                 "content": message.content
-            })
+            }
+            for message in previous_messages
+        ]
 
+        # 4. Generate query embedding
         query_embedding = embedding_manager.generate_embedding(
             [question]
         )
 
+        # 5. Search relevant documents
         results = vector_store.search(
             query_embedding=query_embedding,
             conversation_id=conversation_id,
             top_k=3
         )
 
-        contexts = []
-
-        for point in results:
-            contexts.append(
-                point.payload["text"]
-            )
+        # 6. Extract contexts
+        contexts = [
+            point.payload["text"]
+            for point in results
+        ]
 
         context = "\n\n".join(contexts)
 
-        print("CHAT HISTORY:")
-        print(chat_history)
-
-        answer = generate_answer(
-              question=question,
-              context=context,
-              chat_history=chat_history,
-              db=db,
-              conversation_id=conversation_id
+        logger.info(
+            "Conversation query: conversation_id=%s, contexts=%s",
+            conversation_id,
+            len(contexts)
         )
 
-        user_message = create_message(
+        # 7. Generate answer
+        answer = generate_answer(
+            question=question,
+            context=context,
+            chat_history=chat_history,
+            db=db,
+            conversation_id=conversation_id
+        )
+
+        # 8. Save user message
+        create_message(
             db=db,
             conversation_id=conversation_id,
             role="user",
             content=question
         )
 
-        assistant_message = create_message(
+        # 9. Save assistant message
+        create_message(
             db=db,
             conversation_id=conversation_id,
             role="assistant",
             content=answer
         )
 
-        # 11. Return response
         return {
             "conversation_id": conversation_id,
             "question": question,
@@ -241,10 +255,16 @@ def query_documents(
         raise
 
     except Exception as e:
-        print("RAG SERVICE ERROR:", repr(e))
+
+        logger.exception(
+            "RAG query failed: conversation_id=%s, user_id=%s",
+            conversation_id,
+            user_id
+        )
+
         raise HTTPException(
-             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-             detail=str(e)
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
         )
 
 
@@ -254,7 +274,40 @@ def query_documents_stream(
     user_id: int,
     conversation_id: int
 ):
+    """
+    Streaming RAG conversation flow.
+
+    SSE events:
+        start
+        delta
+        done
+        error
+    """
+
     try:
+
+        # --------------------------------------------------
+        # 1. Validate question
+        # --------------------------------------------------
+
+        if not question or not question.strip():
+
+            yield {
+                "event": "error",
+                "success": False,
+                "error_code": "BAD_REQUEST",
+                "conversation_id": conversation_id,
+                "message_id": None,
+                "delta": None,
+                "text_content": "Question cannot be empty"
+            }
+
+            return
+
+        # --------------------------------------------------
+        # 2. Validate conversation
+        # --------------------------------------------------
+
         conversation = get_conversation(
             db=db,
             conversation_id=conversation_id,
@@ -262,6 +315,7 @@ def query_documents_stream(
         )
 
         if not conversation:
+
             yield {
                 "event": "error",
                 "success": False,
@@ -271,7 +325,12 @@ def query_documents_stream(
                 "delta": None,
                 "text_content": "Conversation not found"
             }
+
             return
+
+        # --------------------------------------------------
+        # 3. Get conversation history
+        # --------------------------------------------------
 
         previous_messages = get_last_10_messages(
             db=db,
@@ -280,21 +339,33 @@ def query_documents_stream(
 
         chat_history = [
             {
-                "role": m.role,
-                "content": m.content
+                "role": message.role,
+                "content": message.content
             }
-            for m in previous_messages
+            for message in previous_messages
         ]
+
+        # --------------------------------------------------
+        # 4. Generate embedding
+        # --------------------------------------------------
 
         query_embedding = embedding_manager.generate_embedding(
             [question]
         )
+
+        # --------------------------------------------------
+        # 5. Search relevant documents
+        # --------------------------------------------------
 
         results = vector_store.search(
             query_embedding=query_embedding,
             conversation_id=conversation_id,
             top_k=3
         )
+
+        # --------------------------------------------------
+        # 6. Extract contexts
+        # --------------------------------------------------
 
         contexts = [
             point.payload["text"]
@@ -303,12 +374,17 @@ def query_documents_stream(
 
         context = "\n\n".join(contexts)
 
-        create_message(
-            db=db,
-            conversation_id=conversation_id,
-            role="user",
-            content=question
+        logger.info(
+            "Starting conversation stream: "
+            "conversation_id=%s, user_id=%s, contexts=%s",
+            conversation_id,
+            user_id,
+            len(contexts)
         )
+
+        # --------------------------------------------------
+        # 7. Send start event
+        # --------------------------------------------------
 
         yield {
             "event": "start",
@@ -320,6 +396,21 @@ def query_documents_stream(
             "text_content": ""
         }
 
+        # --------------------------------------------------
+        # 8. Save user message
+        # --------------------------------------------------
+
+        user_message = create_message(
+            db=db,
+            conversation_id=conversation_id,
+            role="user",
+            content=question
+        )
+
+        # --------------------------------------------------
+        # 9. Stream LLM response
+        # --------------------------------------------------
+
         full_answer = ""
 
         for chunk in generate_answer_stream(
@@ -327,6 +418,10 @@ def query_documents_stream(
             context=context,
             chat_history=chat_history
         ):
+
+            if not chunk:
+                continue
+
             full_answer += chunk
 
             yield {
@@ -334,10 +429,14 @@ def query_documents_stream(
                 "success": True,
                 "error_code": None,
                 "conversation_id": conversation_id,
-                "message_id": None,
+                "message_id": user_message.id,
                 "delta": chunk,
                 "text_content": full_answer
             }
+
+        # --------------------------------------------------
+        # 10. Save assistant response
+        # --------------------------------------------------
 
         assistant_message = create_message(
             db=db,
@@ -345,6 +444,10 @@ def query_documents_stream(
             role="assistant",
             content=full_answer
         )
+
+        # --------------------------------------------------
+        # 11. Send done event
+        # --------------------------------------------------
 
         yield {
             "event": "done",
@@ -356,8 +459,21 @@ def query_documents_stream(
             "text_content": full_answer
         }
 
+        logger.info(
+            "Conversation stream completed: conversation_id=%s",
+            conversation_id
+        )
+
     except Exception as e:
-        print("QUERY STREAM ERROR:", repr(e))
+
+        # IMPORTANT:
+        # This prints the complete traceback in Render logs.
+        logger.exception(
+            "QUERY STREAM ERROR: "
+            "conversation_id=%s, user_id=%s",
+            conversation_id,
+            user_id
+        )
 
         yield {
             "event": "error",
@@ -369,6 +485,7 @@ def query_documents_stream(
             "text_content": "Internal server error"
         }
 
+
 def handle_conversation(
     question: str,
     db: Session,
@@ -377,7 +494,12 @@ def handle_conversation(
 ):
     try:
 
+        # --------------------------------------------------
+        # 1. Create / get conversation
+        # --------------------------------------------------
+
         if conversation_id is None:
+
             title = generate_title(question)
 
             conversation = create_conversation(
@@ -389,6 +511,7 @@ def handle_conversation(
             conversation_id = conversation.id
 
         else:
+
             conversation = get_conversation(
                 db=db,
                 conversation_id=conversation_id,
@@ -401,6 +524,10 @@ def handle_conversation(
                     detail="Conversation not found"
                 )
 
+        # --------------------------------------------------
+        # 2. Get chat history
+        # --------------------------------------------------
+
         previous_messages = get_last_10_messages(
             db=db,
             conversation_id=conversation_id
@@ -408,21 +535,33 @@ def handle_conversation(
 
         chat_history = [
             {
-                "role": m.role,
-                "content": m.content
+                "role": message.role,
+                "content": message.content
             }
-            for m in previous_messages
+            for message in previous_messages
         ]
+
+        # --------------------------------------------------
+        # 3. Generate embedding
+        # --------------------------------------------------
 
         query_embedding = embedding_manager.generate_embedding(
             [question]
         )
+
+        # --------------------------------------------------
+        # 4. Search documents
+        # --------------------------------------------------
 
         results = vector_store.search(
             query_embedding=query_embedding,
             conversation_id=conversation_id,
             top_k=3
         )
+
+        # --------------------------------------------------
+        # 5. Extract contexts
+        # --------------------------------------------------
 
         contexts = [
             point.payload["text"]
@@ -431,13 +570,21 @@ def handle_conversation(
 
         context = "\n\n".join(contexts)
 
+        # --------------------------------------------------
+        # 6. Generate answer
+        # --------------------------------------------------
+
         answer = generate_answer(
-             question=question,
-             context=context,
-             chat_history=chat_history,
-             db=db,
-             conversation_id=conversation_id
+            question=question,
+            context=context,
+            chat_history=chat_history,
+            db=db,
+            conversation_id=conversation_id
         )
+
+        # --------------------------------------------------
+        # 7. Save messages
+        # --------------------------------------------------
 
         create_message(
             db=db,
@@ -465,6 +612,14 @@ def handle_conversation(
         raise
 
     except Exception as e:
+
+        logger.exception(
+            "Conversation handling failed: "
+            "conversation_id=%s, user_id=%s",
+            conversation_id,
+            user_id
+        )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
