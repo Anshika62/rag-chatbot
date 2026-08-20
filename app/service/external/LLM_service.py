@@ -3,14 +3,132 @@ from fastapi import HTTPException, status
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 
-from app.service.tools.conversation_tool import create_conversation_tools
+from app.service.tools.conversation_tool import (
+    create_conversation_tools
+)
 
+
+# ============================================================
+# LLM
+# ============================================================
 
 llm = ChatGroq(
     model="openai/gpt-oss-20b",
     temperature=0.2
 )
 
+
+# ============================================================
+# PROMPT
+# ============================================================
+
+SYSTEM_PROMPT = """
+You are a helpful AI assistant.
+
+You have access to:
+
+1. Conversation history
+2. Retrieved document context
+3. Conversation tools when required
+
+Follow these rules:
+
+- Use retrieved document context when the question is about
+  uploaded documents.
+- Use conversation history for follow-up questions.
+- If information from the conversation is required and is not
+  available in the provided history, use the available
+  conversation tools.
+- Do not invent information.
+- If the answer is not available from the provided context,
+  conversation history, or tools, clearly say that you do not
+  have enough information.
+- Keep answers clear and relevant.
+"""
+
+
+# ============================================================
+# BUILD MESSAGES
+# ============================================================
+
+def _build_messages(
+    question: str,
+    context: str,
+    chat_history: list[dict] | None = None
+):
+    if chat_history is None:
+        chat_history = []
+
+    recent_history = chat_history[-10:]
+
+    history_text = ""
+
+    for message in recent_history:
+
+        role = message.get(
+            "role",
+            ""
+        )
+
+        content = message.get(
+            "content",
+            ""
+        )
+
+        history_text += (
+            f"{role}: {content}\n"
+        )
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                SYSTEM_PROMPT
+            ),
+            (
+                "human",
+                """Conversation History:
+
+{history}
+
+Retrieved Document Context:
+
+{context}
+
+Current User Question:
+
+{question}"""
+            )
+        ]
+    )
+
+    return prompt.format_messages(
+        history=history_text,
+        context=context or "No relevant document context found.",
+        question=question
+    )
+
+
+# ============================================================
+# CREATE TOOLS
+# ============================================================
+
+def _create_tools(
+    db=None,
+    conversation_id: int | None = None
+):
+    if db is None or conversation_id is None:
+        return []
+
+    return create_conversation_tools(
+        db=db,
+        conversation_id=conversation_id
+    )
+
+
+# ============================================================
+# NORMAL ANSWER
+# ============================================================
 
 def generate_answer(
     question: str,
@@ -20,91 +138,83 @@ def generate_answer(
     conversation_id: int | None = None
 ):
     """
-    Generate an answer using:
-    1. Retrieved RAG context
-    2. Previous conversation messages
-    3. Current user question
-    4. External tools when required
+    Non-streaming RAG + conversation tool calling.
+
+    Flow:
+
+    User Question
+        ↓
+    RAG Context
+        ↓
+    Conversation History
+        ↓
+    LLM
+        ↓
+    Tool Call if required
+        ↓
+    Tool Result
+        ↓
+    Final LLM Answer
     """
 
     try:
-        if chat_history is None:
-            chat_history = []
 
-        recent_history = chat_history[-10:]
-
-        history_text = ""
-
-        for message in recent_history:
-            role = message.get("role", "")
-            content = message.get("content", "")
-
-            history_text += f"{role}: {content}\n"
-
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    """You are a helpful AI assistant.
-
-Answer the user's question using BOTH the conversation history
-AND the retrieved document context, as appropriate.
-
-- If the question is a follow-up or refers to something mentioned
-  earlier in the conversation, use the conversation history.
-- If the question is about document content, use the retrieved context.
-- If additional conversation information is required, use the available
-  conversation tools.
-- If neither the history nor the context has the answer, say so clearly.
-
-Do not make up information."""
-                ),
-                (
-                    "human",
-                    """Conversation History:
-{history}
-
-Retrieved Context:
-{context}
-
-Current Question:
-{question}"""
-                )
-            ]
-        )
-
-        messages = prompt.format_messages(
-            history=history_text,
+        messages = _build_messages(
+            question=question,
             context=context,
-            question=question
+            chat_history=chat_history
         )
 
-        # Create request-specific tools using the current DB session
-        tools = []
+        # ----------------------------------------------------
+        # Create request-scoped tools
+        # ----------------------------------------------------
 
-        if db is not None and conversation_id is not None:
-            tools = create_conversation_tools(
-                db=db,
-                conversation_id=conversation_id
+        tools = _create_tools(
+            db=db,
+            conversation_id=conversation_id
+        )
+
+        # ----------------------------------------------------
+        # Bind tools
+        # ----------------------------------------------------
+
+        if tools:
+
+            llm_with_tools = llm.bind_tools(
+                tools
             )
 
-        # Bind tools to LLM
-        llm_with_tools = llm.bind_tools(tools)
+        else:
 
+            llm_with_tools = llm
+
+        # ----------------------------------------------------
         # First LLM call
-        response = llm_with_tools.invoke(messages)
+        # ----------------------------------------------------
 
-        # Check whether LLM requested a tool
+        response = llm_with_tools.invoke(
+            messages
+        )
+
+        # ----------------------------------------------------
+        # Check tool calls
+        # ----------------------------------------------------
+
         if response.tool_calls:
 
-            tool_messages = [response]
+            tool_messages = [
+                response
+            ]
 
             for tool_call in response.tool_calls:
 
                 tool_name = tool_call["name"]
-                tool_args = tool_call["args"]
 
-                # Find requested tool
+                tool_args = tool_call.get(
+                    "args",
+                    {}
+                )
+
                 selected_tool = next(
                     (
                         tool
@@ -115,12 +225,24 @@ Current Question:
                 )
 
                 if selected_tool is None:
-                    continue
 
+                    raise RuntimeError(
+                        f"Requested tool not found: "
+                        f"{tool_name}"
+                    )
+
+                # --------------------------------------------
                 # Execute tool
-                tool_result = selected_tool.invoke(tool_args)
+                # --------------------------------------------
 
-                # Add tool result to conversation
+                tool_result = selected_tool.invoke(
+                    tool_args
+                )
+
+                # --------------------------------------------
+                # Add tool result
+                # --------------------------------------------
+
                 tool_messages.append(
                     {
                         "role": "tool",
@@ -129,107 +251,244 @@ Current Question:
                     }
                 )
 
-            # Send tool result back to LLM
+            # ------------------------------------------------
+            # Final LLM call
+            # ------------------------------------------------
+
             final_response = llm_with_tools.invoke(
                 messages + tool_messages
             )
 
             return final_response.content
 
-        # Normal response when no tool is required
+        # ----------------------------------------------------
+        # Normal answer
+        # ----------------------------------------------------
+
         return response.content
 
     except HTTPException:
         raise
 
-    except Exception:
+    except Exception as exc:
+
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Unable to generate response from LLM"
-        )
+        ) from exc
 
+
+# ============================================================
+# STREAMING ANSWER
+# ============================================================
 
 def generate_answer_stream(
     question: str,
     context: str,
-    chat_history: list[dict] | None = None
+    chat_history: list[dict] | None = None,
+    db=None,
+    conversation_id: int | None = None
 ):
     """
-    Streams the LLM response token by token as a generator.
+    Streaming RAG + tool calling.
+
+    Important:
+
+    Tool execution itself is not streamed.
+
+    Flow:
+
+        First LLM call
+             ↓
+        Tool requested?
+          /       \
+        No        Yes
+        ↓          ↓
+      Stream    Execute tool
+      answer       ↓
+                   Final LLM
+                     ↓
+                   Stream
+                   answer
     """
 
     try:
-        if chat_history is None:
-            chat_history = []
 
-        recent_history = chat_history[-10:]
-
-        history_text = ""
-
-        for message in recent_history:
-            role = message.get("role", "")
-            content = message.get("content", "")
-
-            history_text += f"{role}: {content}\n"
-
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    """You are a helpful AI assistant.
-
-Answer the user's question using BOTH the conversation history
-AND the retrieved document context, as appropriate.
-
-- If the question is a follow-up or refers to something mentioned
-  earlier in the conversation, use the conversation history.
-- If the question is about document content, use the retrieved context.
-- If neither the history nor the context has the answer, say so clearly.
-
-Do not make up information."""
-                ),
-                (
-                    "human",
-                    """Conversation History:
-{history}
-
-Retrieved Context:
-{context}
-
-Current Question:
-{question}"""
-                )
-            ]
-        )
-
-        messages = prompt.format_messages(
-            history=history_text,
+        messages = _build_messages(
+            question=question,
             context=context,
-            question=question
+            chat_history=chat_history
         )
 
-        for chunk in llm.stream(messages):
-            if chunk.content:
+        # ----------------------------------------------------
+        # Create request-scoped tools
+        # ----------------------------------------------------
+
+        tools = _create_tools(
+            db=db,
+            conversation_id=conversation_id
+        )
+
+        # ----------------------------------------------------
+        # Bind tools
+        # ----------------------------------------------------
+
+        if tools:
+
+            llm_with_tools = llm.bind_tools(
+                tools
+            )
+
+        else:
+
+            llm_with_tools = llm
+
+        # ----------------------------------------------------
+        # First call
+        #
+        # We need invoke() first because we need to know
+        # whether the model wants to call a tool.
+        # ----------------------------------------------------
+
+        response = llm_with_tools.invoke(
+            messages
+        )
+
+        # ====================================================
+        # TOOL CALL FLOW
+        # ====================================================
+
+        if response.tool_calls:
+
+            tool_messages = [
+                response
+            ]
+
+            for tool_call in response.tool_calls:
+
+                tool_name = tool_call["name"]
+
+                tool_args = tool_call.get(
+                    "args",
+                    {}
+                )
+
+                selected_tool = next(
+                    (
+                        tool
+                        for tool in tools
+                        if tool.name == tool_name
+                    ),
+                    None
+                )
+
+                if selected_tool is None:
+
+                    raise RuntimeError(
+                        f"Requested tool not found: "
+                        f"{tool_name}"
+                    )
+
+                # --------------------------------------------
+                # Execute tool
+                # --------------------------------------------
+
+                tool_result = selected_tool.invoke(
+                    tool_args
+                )
+
+                # --------------------------------------------
+                # Add result
+                # --------------------------------------------
+
+                tool_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": str(tool_result)
+                    }
+                )
+
+            # ------------------------------------------------
+            # Final LLM response
+            # ------------------------------------------------
+
+            final_messages = (
+                messages + tool_messages
+            )
+
+            # ------------------------------------------------
+            # Stream final answer
+            # ------------------------------------------------
+
+            for chunk in llm_with_tools.stream(
+                final_messages
+            ):
+
+                if not chunk.content:
+                    continue
+
                 yield chunk.content
 
-    except Exception as e:
-        yield f"[ERROR: Unable to generate response: {str(e)}]"
+            return
+
+        # ====================================================
+        # NORMAL STREAMING FLOW
+        # ====================================================
+
+        # The first response already contains the answer.
+        # Stream it as one chunk to keep the interface
+        # consistent with the normal streaming flow.
+
+        if response.content:
+
+            yield response.content
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+
+        # IMPORTANT:
+        #
+        # Do NOT yield "[ERROR: ...]"
+        #
+        # Raise the exception so rag_service can create
+        # the proper SSE error event.
+
+        raise RuntimeError(
+            f"Unable to generate streaming response: {exc}"
+        ) from exc
 
 
-def generate_title(question: str) -> str:
+# ============================================================
+# GENERATE CONVERSATION TITLE
+# ============================================================
+
+def generate_title(
+    question: str
+) -> str:
     """
-    Generates a short conversation title from the first user question.
+    Generate a short conversation title.
     """
 
     try:
+
         title_prompt = ChatPromptTemplate.from_messages(
             [
                 (
                     "system",
-                    """Generate a short, clear title (3-6 words) for a
-conversation that starts with the given user message.
-Do not use quotes. Do not add punctuation at the end.
-Return ONLY the title text, nothing else."""
+                    """
+Generate a short, clear title
+(3-6 words) for a conversation
+that starts with the given user message.
+
+Rules:
+
+- Do not use quotes.
+- Do not add punctuation at the end.
+- Return ONLY the title.
+"""
                 ),
                 (
                     "human",
@@ -242,11 +501,18 @@ Return ONLY the title text, nothing else."""
             question=question
         )
 
-        response = llm.invoke(messages)
+        response = llm.invoke(
+            messages
+        )
 
         title = response.content.strip()
 
-        return title if title else question[:50]
+        if not title:
+
+            return question[:50]
+
+        return title[:100]
 
     except Exception:
+
         return question[:50]
