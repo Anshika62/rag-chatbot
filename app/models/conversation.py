@@ -1,14 +1,34 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
-from sqlalchemy.orm import relationship
 from datetime import datetime
+
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    DateTime,
+    ForeignKey,
+    UniqueConstraint
+)
+from sqlalchemy.orm import relationship
 
 from app.core.database import Base
 
 
 class Conversation(Base):
+
     __tablename__ = "conversations"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True
+    )
+
+    # User-facing conversation number
+    # Starts from 1 separately for every user
+    conversation_number = Column(
+        Integer,
+        nullable=False
+    )
 
     user_id = Column(
         Integer,
@@ -30,6 +50,14 @@ class Conversation(Base):
         DateTime,
         default=datetime.utcnow,
         onupdate=datetime.utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "conversation_number",
+            name="uq_user_conversation_number"
+        ),
     )
 
     # Conversation belongs to one user

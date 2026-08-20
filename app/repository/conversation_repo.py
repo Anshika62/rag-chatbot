@@ -1,3 +1,4 @@
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -11,9 +12,24 @@ def create_conversation(
     title: str | None
 ):
     try:
+        last_conversation_number = (
+            db.query(
+                func.max(Conversation.conversation_number)
+            )
+            .filter(
+                Conversation.user_id == user_id
+            )
+            .scalar()
+        )
+
+        next_conversation_number = (
+            (last_conversation_number or 0) + 1
+        )
+
         conversation = Conversation(
             user_id=user_id,
-            title=title
+            title=title,
+            conversation_number=next_conversation_number
         )
 
         db.add(conversation)
@@ -34,10 +50,25 @@ def create_message(
     content: str
 ):
     try:
+        last_message_number = (
+            db.query(
+                func.max(Message.message_number)
+            )
+            .filter(
+                Message.conversation_id == conversation_id
+            )
+            .scalar()
+        )
+
+        next_message_number = (
+            (last_message_number or 0) + 1
+        )
+
         message = Message(
             conversation_id=conversation_id,
             role=role,
-            content=content
+            content=content,
+            message_number=next_message_number
         )
 
         db.add(message)
@@ -81,7 +112,9 @@ def get_last_10_messages(
             .filter(
                 Message.conversation_id == conversation_id
             )
-            .order_by(Message.created_at.desc())
+            .order_by(
+                Message.created_at.desc()
+            )
             .limit(10)
             .all()
         )
@@ -93,18 +126,19 @@ def get_last_10_messages(
         raise
 
 
-# ============ NAYE FUNCTIONS ============
-
 def get_conversations_by_user(
     db: Session,
     user_id: int
 ):
-    """User ki saari conversations, latest update wali sabse upar."""
     try:
         return (
             db.query(Conversation)
-            .filter(Conversation.user_id == user_id)
-            .order_by(Conversation.updated_at.desc())
+            .filter(
+                Conversation.user_id == user_id
+            )
+            .order_by(
+                Conversation.updated_at.desc()
+            )
             .all()
         )
 
@@ -117,12 +151,15 @@ def get_all_messages(
     db: Session,
     conversation_id: int
 ):
-    """Ek conversation ke saare messages, purane se naye order mein."""
     try:
         return (
             db.query(Message)
-            .filter(Message.conversation_id == conversation_id)
-            .order_by(Message.created_at.asc())
+            .filter(
+                Message.conversation_id == conversation_id
+            )
+            .order_by(
+                Message.created_at.asc()
+            )
             .all()
         )
 
@@ -137,7 +174,6 @@ def update_conversation_title(
     user_id: int,
     title: str
 ):
-    """Sirf title update karo, agar conversation is user ki hai to."""
     try:
         conversation = (
             db.query(Conversation)
@@ -152,6 +188,7 @@ def update_conversation_title(
             return None
 
         conversation.title = title
+
         db.commit()
         db.refresh(conversation)
 
@@ -167,7 +204,6 @@ def delete_conversation(
     conversation_id: int,
     user_id: int
 ):
-    """Conversation delete karo (messages/documents cascade delete honge model ki wajah se)."""
     try:
         conversation = (
             db.query(Conversation)
