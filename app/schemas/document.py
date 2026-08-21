@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Optional
+
 from pydantic import BaseModel, ConfigDict
 
 from app.models.document import DocumentStatus
@@ -15,8 +16,10 @@ class FolderCreate(BaseModel):
     parent_id: Optional[str] = None
 
 
-class DocumentRename(BaseModel):
-    file_name: str
+# ---- Document metadata update ----
+class DocumentUpdate(BaseModel):
+    file_name: Optional[str] = None
+    mime_type: Optional[str] = None
 
 
 # ---- Response: single document/folder ----
@@ -35,7 +38,7 @@ class DocumentOut(DocumentBase):
     updated_at: datetime
 
 
-# ---- Response: listing
+# ---- Response: listing ----
 class DocumentListOut(BaseModel):
     items: list[DocumentOut]
     total: int

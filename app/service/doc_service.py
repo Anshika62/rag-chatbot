@@ -19,30 +19,51 @@ UPLOAD_DIR = "Uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-def generate_gcs_path(user_id: str, document_id: str, original_filename: str) -> str:
+def generate_gcs_path(
+    user_id: str,
+    document_id: str,
+    original_filename: str,
+) -> str:
     safe_filename = original_filename.replace("/", "_").strip()
-    return f"users/{user_id}/documents/{document_id}/{safe_filename}"
+
+    return (
+        f"users/{user_id}/documents/"
+        f"{document_id}/{safe_filename}"
+    )
 
 
 def create_folder_service(
-    db: Session, file_name: str, parent_id: Optional[str], user_id: str
+    db: Session,
+    file_name: str,
+    parent_id: Optional[str],
+    user_id: str,
 ) -> Optional[Document]:
 
     if not parent_id:
         parent_id = None
 
     if parent_id:
-        parent = document_repo.get_owned_folder_by_id(db, parent_id, user_id)
+        parent = document_repo.get_owned_folder_by_id(
+            db,
+            parent_id,
+            user_id,
+        )
+
         if not parent:
             return None
 
-    return document_repo.create_folder(db, file_name, parent_id, user_id)
+    return document_repo.create_folder(
+        db,
+        file_name,
+        parent_id,
+        user_id,
+    )
 
 
 # ============================================================
 # UPLOAD DOCUMENT
-# (merged: Drive-style storage record + RAG chunk/embedding)
 # ============================================================
+
 
 def upload_document_service(
     db: Session,
@@ -54,20 +75,26 @@ def upload_document_service(
 
     if not parent_id:
         parent_id = None
+
     if not conversation_id:
         conversation_id = None
 
     if parent_id:
-        parent = document_repo.get_owned_folder_by_id(db, parent_id, user_id)
+        parent = document_repo.get_owned_folder_by_id(
+            db,
+            parent_id,
+            user_id,
+        )
+
         if not parent:
             return None
 
     # --------------------------------------------------------
-    # 1. Create the document row first (status=UPLOADING)
+    # 1. Create document row
     # --------------------------------------------------------
 
     doc = document_repo.create_file(
-        db,
+        db=db,
         file_name=file.filename,
         parent_id=parent_id,
         user_id=user_id,
@@ -76,22 +103,27 @@ def upload_document_service(
     )
 
     # --------------------------------------------------------
-    # 2. Read bytes once, save to disk
+    # 2. Read bytes and save locally
     # --------------------------------------------------------
 
     contents = file.file.read()
 
-    file_path = os.path.join(UPLOAD_DIR, f"{doc.id}_{file.filename}")
+    file_path = os.path.join(
+        UPLOAD_DIR,
+        f"{doc.id}_{file.filename}",
+    )
 
     with open(file_path, "wb") as f:
         f.write(contents)
 
-    gcs_path = generate_gcs_path(user_id, doc.id, file.filename)
+    gcs_path = generate_gcs_path(
+        user_id,
+        doc.id,
+        file.filename,
+    )
 
     # --------------------------------------------------------
-    # 3. RAG processing — only when the file belongs to a
-    #    conversation (needed for querying later) AND is a
-    #    format we know how to extract text from.
+    # 3. RAG processing
     # --------------------------------------------------------
 
     if conversation_id is not None:
@@ -106,8 +138,8 @@ def upload_document_service(
             )
 
             doc = document_repo.update_file_storage_info(
-                db,
-                doc,
+                db=db,
+                doc=doc,
                 gcs_path=gcs_path,
                 size_bytes=len(contents),
                 status=DocumentStatus.READY,
@@ -115,28 +147,34 @@ def upload_document_service(
 
         except Exception:
             logger.exception(
-                "RAG processing failed for document_id=%s", doc.id
+                "RAG processing failed for document_id=%s",
+                doc.id,
             )
 
             doc = document_repo.update_file_storage_info(
-                db,
-                doc,
+                db=db,
+                doc=doc,
                 gcs_path=gcs_path,
                 size_bytes=len(contents),
                 status=DocumentStatus.FAILED,
             )
 
     else:
-        # No conversation attached -> just store it, no RAG needed
+        # No conversation attached -> no RAG indexing
         doc = document_repo.update_file_storage_info(
-            db,
-            doc,
+            db=db,
+            doc=doc,
             gcs_path=gcs_path,
             size_bytes=len(contents),
             status=DocumentStatus.READY,
         )
 
     return doc
+
+
+# ============================================================
+# RAG PROCESSING
+# ============================================================
 
 
 def _process_for_rag(
@@ -147,8 +185,8 @@ def _process_for_rag(
     user_id: str,
 ) -> None:
     """
-    Extract text, chunk it, embed it, and store both the
-    chunks (Postgres) and vectors (Qdrant) for this document.
+    Extract text, chunk it, generate embeddings,
+    store vectors in Qdrant and chunks in PostgreSQL.
     """
 
     text = ""
@@ -159,7 +197,8 @@ def _process_for_rag(
 
     if not text.strip():
         logger.warning(
-            "No extractable text for document_id=%s, skipping RAG indexing",
+            "No extractable text for document_id=%s, "
+            "skipping RAG indexing",
             doc.id,
         )
         return
@@ -167,7 +206,12 @@ def _process_for_rag(
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=100,
-        separators=["\n\n", "\n", " ", ""],
+        separators=[
+            "\n\n",
+            "\n",
+            " ",
+            "",
+        ],
     )
 
     chunks = text_splitter.split_text(text)
@@ -175,7 +219,17 @@ def _process_for_rag(
     if not chunks:
         return
 
-    embeddings = embedding_manager.generate_embedding(chunks)
+    # --------------------------------------------------------
+    # Generate embeddings
+    # --------------------------------------------------------
+
+    embeddings = embedding_manager.generate_embedding(
+        chunks
+    )
+
+    # --------------------------------------------------------
+    # Store vectors in Qdrant
+    # --------------------------------------------------------
 
     vector_store.add_documents(
         chunks=chunks,
@@ -184,6 +238,10 @@ def _process_for_rag(
         conversation_id=conversation_id,
         user_id=user_id,
     )
+
+    # --------------------------------------------------------
+    # Store chunks in PostgreSQL
+    # --------------------------------------------------------
 
     document_repo.create_chunks(
         db=db,
@@ -198,31 +256,101 @@ def _process_for_rag(
     )
 
 
-def rename_document_service(
-    db: Session, doc_id: str, user_id: str, new_name: str
+# ============================================================
+# DOCUMENT METADATA UPDATE
+# ============================================================
+
+
+def update_document_service(
+    db: Session,
+    doc_id: str,
+    user_id: str,
+    file_name: Optional[str] = None,
+    mime_type: Optional[str] = None,
 ) -> Optional[Document]:
-    doc = document_repo.get_owned_document_by_id(db, doc_id, user_id)
+    """
+    Update document metadata for the current user's document.
+
+    Only supplied fields are changed.
+    """
+
+    doc = document_repo.get_owned_document_by_id(
+        db,
+        doc_id,
+        user_id,
+    )
+
     if not doc:
         return None
-    return document_repo.rename_document(db, doc, new_name)
+
+    # Nothing to update
+    if file_name is None and mime_type is None:
+        return doc
+
+    return document_repo.update_document(
+        db=db,
+        doc=doc,
+        file_name=file_name,
+        mime_type=mime_type,
+    )
 
 
-def delete_document_service(db: Session, doc_id: str, user_id: str) -> bool:
-    doc = document_repo.get_owned_document_by_id(db, doc_id, user_id)
+# ============================================================
+# DELETE
+# ============================================================
+
+
+def delete_document_service(
+    db: Session,
+    doc_id: str,
+    user_id: str,
+) -> bool:
+
+    doc = document_repo.get_owned_document_by_id(
+        db,
+        doc_id,
+        user_id,
+    )
+
     if not doc:
         return False
-    _delete_recursive(db, doc)
+
+    _delete_recursive(
+        db,
+        doc,
+    )
+
     return True
 
 
-def _delete_recursive(db: Session, doc: Document) -> None:
+def _delete_recursive(
+    db: Session,
+    doc: Document,
+) -> None:
+
     if doc.is_folder:
-        children = document_repo.get_children(db, doc.id)
+        children = document_repo.get_children(
+            db,
+            doc.id,
+        )
+
         for child in children:
-            _delete_recursive(db, child)
+            _delete_recursive(
+                db,
+                child,
+            )
+
     else:
-        # TODO: GCS delete -> gcs_client.delete(doc.gcs_path)
-        # TODO: Vector DB delete -> vector_store.delete(document_id=doc.id)
+        # TODO:
+        # GCS delete -> gcs_client.delete(doc.gcs_path)
+
+        # TODO:
+        # Vector DB delete ->
+        # vector_store.delete(document_id=doc.id)
+
         pass
 
-    document_repo.delete_document_row(db, doc)
+    document_repo.delete_document_row(
+        db,
+        doc,
+    )

@@ -1,6 +1,5 @@
 import enum
 import uuid
-from datetime import datetime
 
 from sqlalchemy import (
     Column,
@@ -48,14 +47,32 @@ class Document(Base):
         index=True,
     )
 
-    is_folder = Column(Boolean, nullable=False, default=False)
+    is_folder = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
 
-    file_name = Column(String, nullable=False)
+    file_name = Column(
+        String,
+        nullable=False,
+    )
 
-    gcs_path = Column(String(1024), nullable=True, unique=True)
+    gcs_path = Column(
+        String(1024),
+        nullable=True,
+        unique=True,
+    )
 
-    mime_type = Column(String(128), nullable=True)
-    size_bytes = Column(BigInteger, nullable=True)
+    mime_type = Column(
+        String(128),
+        nullable=True,
+    )
+
+    size_bytes = Column(
+        BigInteger,
+        nullable=True,
+    )
 
     status = Column(
         Enum(DocumentStatus),
@@ -69,19 +86,28 @@ class Document(Base):
         nullable=True,
     )
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
     updated_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),
         onupdate=func.now(),
     )
-    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+    deleted_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     parent = relationship(
         "Document",
         remote_side=[id],
         back_populates="children",
     )
+
     children = relationship(
         "Document",
         back_populates="parent",
