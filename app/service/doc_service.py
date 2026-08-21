@@ -1,21 +1,34 @@
+import os
+import logging
 from typing import Optional
+
+import pdfplumber
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.models.document import Document, DocumentStatus
 from app.repository import document_repo
+from app.service.rag_clients import embedding_manager, vector_store
 
 
-def generate_gcs_path(user_id: int, document_id: int, original_filename: str) -> str:
+logger = logging.getLogger(__name__)
+
+UPLOAD_DIR = "Uploads"
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def generate_gcs_path(user_id: str, document_id: str, original_filename: str) -> str:
     safe_filename = original_filename.replace("/", "_").strip()
     return f"users/{user_id}/documents/{document_id}/{safe_filename}"
 
 
 def create_folder_service(
-    db: Session, file_name: str, parent_id: Optional[int], user_id: int
+    db: Session, file_name: str, parent_id: Optional[str], user_id: str
 ) -> Optional[Document]:
 
-    if not parent_id or parent_id <= 0:
+    if not parent_id:
         parent_id = None
 
     if parent_id:
@@ -26,17 +39,22 @@ def create_folder_service(
     return document_repo.create_folder(db, file_name, parent_id, user_id)
 
 
+# ============================================================
+# UPLOAD DOCUMENT
+# (merged: Drive-style storage record + RAG chunk/embedding)
+# ============================================================
+
 def upload_document_service(
     db: Session,
     file: UploadFile,
-    parent_id: Optional[int],
-    conversation_id: Optional[int],
-    user_id: int,
+    parent_id: Optional[str],
+    conversation_id: Optional[str],
+    user_id: str,
 ) -> Optional[Document]:
-    
-    if not parent_id or parent_id <= 0:
+
+    if not parent_id:
         parent_id = None
-    if not conversation_id or conversation_id <= 0:
+    if not conversation_id:
         conversation_id = None
 
     if parent_id:
@@ -44,6 +62,9 @@ def upload_document_service(
         if not parent:
             return None
 
+    # --------------------------------------------------------
+    # 1. Create the document row first (status=UPLOADING)
+    # --------------------------------------------------------
 
     doc = document_repo.create_file(
         db,
@@ -54,24 +75,131 @@ def upload_document_service(
         conversation_id=conversation_id,
     )
 
-   
-    gcs_path = generate_gcs_path(user_id, doc.id, file.filename)
+    # --------------------------------------------------------
+    # 2. Read bytes once, save to disk
+    # --------------------------------------------------------
 
-    
     contents = file.file.read()
 
-    
-    doc = document_repo.update_file_storage_info(
-        db,
-        doc,
-        gcs_path=gcs_path,
-        size_bytes=len(contents),
-        status=DocumentStatus.PROCESSING,  
-    )
+    file_path = os.path.join(UPLOAD_DIR, f"{doc.id}_{file.filename}")
+
+    with open(file_path, "wb") as f:
+        f.write(contents)
+
+    gcs_path = generate_gcs_path(user_id, doc.id, file.filename)
+
+    # --------------------------------------------------------
+    # 3. RAG processing — only when the file belongs to a
+    #    conversation (needed for querying later) AND is a
+    #    format we know how to extract text from.
+    # --------------------------------------------------------
+
+    if conversation_id is not None:
+
+        try:
+            _process_for_rag(
+                db=db,
+                doc=doc,
+                file_path=file_path,
+                conversation_id=conversation_id,
+                user_id=user_id,
+            )
+
+            doc = document_repo.update_file_storage_info(
+                db,
+                doc,
+                gcs_path=gcs_path,
+                size_bytes=len(contents),
+                status=DocumentStatus.READY,
+            )
+
+        except Exception:
+            logger.exception(
+                "RAG processing failed for document_id=%s", doc.id
+            )
+
+            doc = document_repo.update_file_storage_info(
+                db,
+                doc,
+                gcs_path=gcs_path,
+                size_bytes=len(contents),
+                status=DocumentStatus.FAILED,
+            )
+
+    else:
+        # No conversation attached -> just store it, no RAG needed
+        doc = document_repo.update_file_storage_info(
+            db,
+            doc,
+            gcs_path=gcs_path,
+            size_bytes=len(contents),
+            status=DocumentStatus.READY,
+        )
+
     return doc
 
+
+def _process_for_rag(
+    db: Session,
+    doc: Document,
+    file_path: str,
+    conversation_id: str,
+    user_id: str,
+) -> None:
+    """
+    Extract text, chunk it, embed it, and store both the
+    chunks (Postgres) and vectors (Qdrant) for this document.
+    """
+
+    text = ""
+
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            text += page.extract_text() or ""
+
+    if not text.strip():
+        logger.warning(
+            "No extractable text for document_id=%s, skipping RAG indexing",
+            doc.id,
+        )
+        return
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=100,
+        separators=["\n\n", "\n", " ", ""],
+    )
+
+    chunks = text_splitter.split_text(text)
+
+    if not chunks:
+        return
+
+    embeddings = embedding_manager.generate_embedding(chunks)
+
+    vector_store.add_documents(
+        chunks=chunks,
+        embeddings=embeddings,
+        filename=doc.file_name,
+        conversation_id=conversation_id,
+        user_id=user_id,
+    )
+
+    document_repo.create_chunks(
+        db=db,
+        doc_id=doc.id,
+        chunks=chunks,
+    )
+
+    logger.info(
+        "RAG indexing completed: document_id=%s, chunks=%s",
+        doc.id,
+        len(chunks),
+    )
+
+
 def rename_document_service(
-    db: Session, doc_id: int, user_id: int, new_name: str
+    db: Session, doc_id: str, user_id: str, new_name: str
 ) -> Optional[Document]:
     doc = document_repo.get_owned_document_by_id(db, doc_id, user_id)
     if not doc:
@@ -79,7 +207,7 @@ def rename_document_service(
     return document_repo.rename_document(db, doc, new_name)
 
 
-def delete_document_service(db: Session, doc_id: int, user_id: int) -> bool:
+def delete_document_service(db: Session, doc_id: str, user_id: str) -> bool:
     doc = document_repo.get_owned_document_by_id(db, doc_id, user_id)
     if not doc:
         return False

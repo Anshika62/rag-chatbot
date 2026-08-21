@@ -4,7 +4,7 @@ from datetime import datetime
 
 class QueryRequest(BaseModel):
     question: str
-    conversation_id: int | None = None
+    conversation_id: str | None = None
 
 
 class ConversationTitleUpdate(BaseModel):
@@ -12,7 +12,7 @@ class ConversationTitleUpdate(BaseModel):
 
 
 class ConversationSummary(BaseModel):
-    id: int
+    id: str
     title: str | None
     created_at: datetime
     updated_at: datetime
@@ -22,7 +22,7 @@ class ConversationSummary(BaseModel):
 
 
 class MessageOut(BaseModel):
-    id: int
+    id: str
     role: str
     content: str
     created_at: datetime

@@ -1,14 +1,23 @@
-from sqlalchemy import Column, Integer, ForeignKey, Text
+import uuid
+
+from sqlalchemy import Column, String, ForeignKey, Text
 from sqlalchemy.orm import relationship
+
 from app.core.database import Base
 
 
 class Docs_chunks(Base):
     __tablename__ = "docs_chunks"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+        index=True,
+    )
 
-    doc_id = Column(Integer,
+    doc_id = Column(
+        String(36),
         ForeignKey("documents.id"),
         nullable=False
     )

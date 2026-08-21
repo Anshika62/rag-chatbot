@@ -6,29 +6,7 @@ from app.models.document import Document, DocumentStatus
 from app.models.document_chunks import Docs_chunks
 
 
-# ---------- Existing (fixed: user_id ab required) ----------
-def create_document(
-    db: Session,
-    file_name: str,
-    user_id: int,
-    conversation_id: Optional[int] = None,
-):
-    try:
-        document = Document(
-            file_name=file_name,
-            user_id=user_id,
-            conversation_id=conversation_id,
-        )
-        db.add(document)
-        db.commit()
-        db.refresh(document)
-        return document
-    except SQLAlchemyError:
-        db.rollback()
-        raise
-
-
-def create_chunks(db: Session, doc_id: int, chunks: list[str]):
+def create_chunks(db: Session, doc_id: str, chunks: list[str]):
     try:
         chunk_objects = [
             Docs_chunks(doc_id=doc_id, chunk_text=chunk)
@@ -42,7 +20,7 @@ def create_chunks(db: Session, doc_id: int, chunks: list[str]):
         raise
 
 
-def get_document_by_id(db: Session, doc_id: int):
+def get_document_by_id(db: Session, doc_id: str):
     try:
         return db.query(Document).filter(Document.id == doc_id).first()
     except SQLAlchemyError:
@@ -50,7 +28,7 @@ def get_document_by_id(db: Session, doc_id: int):
         raise
 
 
-def get_chunks_by_document_id(db: Session, doc_id: int):
+def get_chunks_by_document_id(db: Session, doc_id: str):
     try:
         return (
             db.query(Docs_chunks)
@@ -64,7 +42,7 @@ def get_chunks_by_document_id(db: Session, doc_id: int):
 
 # ---------- New: Drive-jaisa folder/file operations ----------
 
-def create_folder(db: Session, file_name: str, parent_id: Optional[int], user_id: int):
+def create_folder(db: Session, file_name: str, parent_id: Optional[str], user_id: str):
     try:
         folder = Document(
             file_name=file_name,
@@ -84,10 +62,10 @@ def create_folder(db: Session, file_name: str, parent_id: Optional[int], user_id
 def create_file(
     db: Session,
     file_name: str,
-    parent_id: Optional[int],
-    user_id: int,
+    parent_id: Optional[str],
+    user_id: str,
     mime_type: Optional[str],
-    conversation_id: Optional[int] = None,
+    conversation_id: Optional[str] = None,
 ):
     try:
         doc = Document(
@@ -127,7 +105,7 @@ def update_file_storage_info(
         raise
 
 
-def get_owned_document_by_id(db: Session, doc_id: int, user_id: int):
+def get_owned_document_by_id(db: Session, doc_id: str, user_id: str):
     """Ownership-checked fetch — documents.py endpoints isi ko use karenge."""
     try:
         return (
@@ -140,7 +118,7 @@ def get_owned_document_by_id(db: Session, doc_id: int, user_id: int):
         raise
 
 
-def get_owned_folder_by_id(db: Session, folder_id: int, user_id: int):
+def get_owned_folder_by_id(db: Session, folder_id: str, user_id: str):
     try:
         return (
             db.query(Document)
@@ -156,20 +134,39 @@ def get_owned_folder_by_id(db: Session, folder_id: int, user_id: int):
         raise
 
 
-def list_documents_by_parent(db: Session, parent_id: Optional[int], user_id: int):
+def list_documents_by_parent(
+    db: Session,
+    parent_id: Optional[str],
+    user_id: str,
+    skip: int = 0,
+    limit: int = 20,
+):
+    """
+    Returns (items, total_count) for the given folder, paginated.
+    Folders are always listed before files, both alphabetically.
+    """
     try:
-        return (
-            db.query(Document)
-            .filter(Document.parent_id == parent_id, Document.user_id == user_id)
+        base_query = db.query(Document).filter(
+            Document.parent_id == parent_id, Document.user_id == user_id
+        )
+
+        total = base_query.count()
+
+        items = (
+            base_query
             .order_by(Document.is_folder.desc(), Document.file_name.asc())
+            .offset(skip)
+            .limit(limit)
             .all()
         )
+
+        return items, total
     except SQLAlchemyError:
         db.rollback()
         raise
 
 
-def get_children(db: Session, parent_id: int):
+def get_children(db: Session, parent_id: str):
     """Parent ownership already verify ho chuki hoti hai caller me — yahan sirf children fetch."""
     try:
         return db.query(Document).filter(Document.parent_id == parent_id).all()

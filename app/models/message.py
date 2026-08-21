@@ -1,13 +1,12 @@
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
     Column,
-    Integer,
     String,
     DateTime,
     ForeignKey,
-    Text,
-    UniqueConstraint
+    Text
 )
 from sqlalchemy.orm import relationship
 
@@ -19,20 +18,14 @@ class Message(Base):
     __tablename__ = "messages"
 
     id = Column(
-        Integer,
+        String(36),
         primary_key=True,
+        default=lambda: str(uuid.uuid4()),
         index=True
     )
 
-    # User-facing message number
-    # Starts from 1 separately for every conversation
-    message_number = Column(
-        Integer,
-        nullable=False
-    )
-
     conversation_id = Column(
-        Integer,
+        String(36),
         ForeignKey("conversations.id"),
         nullable=False
     )
@@ -50,14 +43,6 @@ class Message(Base):
     created_at = Column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc)
-    )
-
-    __table_args__ = (
-        UniqueConstraint(
-            "conversation_id",
-            "message_number",
-            name="uq_conversation_message_number"
-        ),
     )
 
     conversation = relationship(

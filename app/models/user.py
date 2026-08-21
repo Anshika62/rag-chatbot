@@ -1,14 +1,23 @@
-from sqlalchemy import Column, Integer, String, DateTime
+import uuid
 from datetime import datetime, timezone
-from app.core.database import Base
+
+from sqlalchemy import Column, String, DateTime
 from sqlalchemy.orm import relationship
+
+from app.core.database import Base
 
 
 class User(Base):
     __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
+
+    id = Column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+        index=True
+    )
     username = Column(String, unique=True, nullable=False, index=True)
-    email = Column(String, unique=True,nullable=False,index=True)
+    email = Column(String, unique=True, nullable=False, index=True)
     hashed_password = Column(String, nullable=False)
     created_at = Column(
         DateTime,

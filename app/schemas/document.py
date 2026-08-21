@@ -1,4 +1,3 @@
-
 from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel, ConfigDict
@@ -12,8 +11,8 @@ class DocumentBase(BaseModel):
 
 # ---- Folder create ----
 class FolderCreate(BaseModel):
-    file_name: str                     
-    parent_id: Optional[int] = None    
+    file_name: str
+    parent_id: Optional[str] = None
 
 
 class DocumentRename(BaseModel):
@@ -24,19 +23,22 @@ class DocumentRename(BaseModel):
 class DocumentOut(DocumentBase):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
-    user_id: int
-    parent_id: Optional[int]
+    id: str
+    user_id: str
+    parent_id: Optional[str]
     is_folder: bool
     mime_type: Optional[str] = None
     size_bytes: Optional[int] = None
     status: DocumentStatus
-    conversation_id: Optional[int] = None
+    conversation_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
 
-# ---- Response: listing 
+# ---- Response: listing
 class DocumentListOut(BaseModel):
     items: list[DocumentOut]
     total: int
+    page: int
+    page_size: int
+    total_pages: int

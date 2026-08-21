@@ -43,6 +43,9 @@ class Vectorstore:
 
         self._create_collection()
 
+    # =========================================================
+    # COLLECTION
+    # =========================================================
 
     def _create_collection(self):
 
@@ -65,17 +68,24 @@ class Vectorstore:
 
         self._ensure_indexes()
 
+    # =========================================================
+    # PAYLOAD INDEXES
+    # =========================================================
 
     def _ensure_indexes(self):
 
         indexes = [
             (
                 "conversation_id",
-                PayloadSchemaType.INTEGER
+                PayloadSchemaType.KEYWORD
             ),
             (
                 "user_id",
-                PayloadSchemaType.INTEGER
+                PayloadSchemaType.KEYWORD
+            ),
+            (
+                "message_id",
+                PayloadSchemaType.KEYWORD
             ),
             (
                 "type",
@@ -86,25 +96,55 @@ class Vectorstore:
         for field_name, field_schema in indexes:
 
             try:
+
                 self.client.create_payload_index(
                     collection_name=self.collection_name,
                     field_name=field_name,
                     field_schema=field_schema
                 )
 
-            except Exception:
-                # Index may already exist
-                pass
+                print(
+                    f"Qdrant index created: "
+                    f"{field_name} -> {field_schema}"
+                )
 
+            except Exception as e:
+
+                error_message = str(e).lower()
+
+                # Index already exists
+                if (
+                    "already exists" in error_message
+                    or "already exist" in error_message
+                ):
+                    print(
+                        f"Qdrant index already exists: "
+                        f"{field_name}"
+                    )
+
+                else:
+                    print(
+                        f"Failed to create Qdrant index "
+                        f"for '{field_name}': {e}"
+                    )
+
+                    raise
+
+    # =========================================================
+    # ADD DOCUMENT CHUNKS
+    # =========================================================
 
     def add_documents(
         self,
         chunks: List[str],
         embeddings,
         filename: str,
-        conversation_id: int,
-        user_id: int
+        conversation_id: str,
+        user_id: str
     ):
+
+        conversation_id = str(conversation_id)
+        user_id = str(user_id)
 
         points = []
 
@@ -137,6 +177,9 @@ class Vectorstore:
             points=points
         )
 
+    # =========================================================
+    # ADD CONVERSATION MESSAGES
+    # =========================================================
 
     def add_conversation_messages(
         self,
@@ -151,18 +194,26 @@ class Vectorstore:
             embeddings
         ):
 
+            conversation_id = str(
+                message["conversation_id"]
+            )
+
+            user_id = str(
+                message["user_id"]
+            )
+
+            message_id = str(
+                message["message_id"]
+            )
+
             points.append(
                 PointStruct(
                     id=str(uuid.uuid4()),
                     vector=embedding.tolist(),
                     payload={
-                        "conversation_id": (
-                            message["conversation_id"]
-                        ),
-                        "user_id": message["user_id"],
-                        "message_id": (
-                            message["message_id"]
-                        ),
+                        "conversation_id": conversation_id,
+                        "user_id": user_id,
+                        "message_id": message_id,
                         "role": message["role"],
                         "content": message["content"],
                         "type": "conversation"
@@ -180,14 +231,20 @@ class Vectorstore:
             points=points
         )
 
+    # =========================================================
+    # SEARCH DOCUMENTS
+    # =========================================================
 
     def search(
         self,
         query_embedding,
-        user_id: int,
-        conversation_id: int,
+        user_id: str,
+        conversation_id: str,
         top_k: int = 3
     ):
+
+        user_id = str(user_id)
+        conversation_id = str(conversation_id)
 
         document_filter = Filter(
             must=[
@@ -221,14 +278,20 @@ class Vectorstore:
 
         return results.points
 
+    # =========================================================
+    # SEARCH CONVERSATION HISTORY
+    # =========================================================
 
     def search_conversation_history(
         self,
         query_embedding,
-        user_id: int,
-        conversation_id: int,
+        user_id: str,
+        conversation_id: str,
         top_k: int = 5
     ):
+
+        user_id = str(user_id)
+        conversation_id = str(conversation_id)
 
         history_filter = Filter(
             must=[

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form, status
 from sqlalchemy.orm import Session
 from typing import Optional
 
@@ -61,8 +61,8 @@ def create_folder(
 @router.post("/upload", response_model=DocumentOut)
 def upload_document(
     file: UploadFile = File(...),
-    parent_id: Optional[int] = Form(None),
-    conversation_id: Optional[int] = Form(None),
+    parent_id: Optional[str] = Form(None),
+    conversation_id: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     email: str = Depends(verify_token),
 ):
@@ -91,26 +91,37 @@ def upload_document(
 
 @router.get("")
 def list_documents(
-    parent_id: Optional[int] = None,
+    parent_id: Optional[str] = None,
+    page: int = Query(1, ge=1, description="Page number, starts at 1"),
+    page_size: int = Query(20, ge=1, le=100, description="Items per page (max 100)"),
     db: Session = Depends(get_db),
     email: str = Depends(verify_token),
 ):
     user = _get_current_user(db, email)
 
-    items = document_repo.list_documents_by_parent(db, parent_id, user.id)
+    skip = (page - 1) * page_size
+
+    items, total = document_repo.list_documents_by_parent(
+        db, parent_id, user.id, skip=skip, limit=page_size
+    )
+
+    total_pages = (total + page_size - 1) // page_size if total else 0
 
     return success_response(
         message="Documents fetched successfully",
         data={
             "items": [DocumentOut.model_validate(i).model_dump(mode="json") for i in items],
-            "total": len(items),
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
         },
     )
 
 
 @router.get("/{document_id}", response_model=DocumentOut)
 def get_document(
-    document_id: int,
+    document_id: str,
     db: Session = Depends(get_db),
     email: str = Depends(verify_token),
 ):
@@ -131,7 +142,7 @@ def get_document(
 
 @router.patch("/{document_id}", response_model=DocumentOut)
 def rename_document(
-    document_id: int,
+    document_id: str,
     payload: DocumentRename,
     db: Session = Depends(get_db),
     email: str = Depends(verify_token),
@@ -159,7 +170,7 @@ def rename_document(
 
 @router.delete("/{document_id}")
 def delete_document(
-    document_id: int,
+    document_id: str,
     db: Session = Depends(get_db),
     email: str = Depends(verify_token),
 ):

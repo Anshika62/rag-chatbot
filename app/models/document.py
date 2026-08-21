@@ -1,9 +1,9 @@
 import enum
+import uuid
 from datetime import datetime
 
 from sqlalchemy import (
     Column,
-    Integer,
     String,
     Boolean,
     BigInteger,
@@ -18,28 +18,33 @@ from app.core.database import Base
 
 
 class DocumentStatus(str, enum.Enum):
-    UPLOADING = "uploading"    
-    PROCESSING = "processing"  
-    READY = "ready"            
-    FAILED = "failed"          
+    UPLOADING = "uploading"
+    PROCESSING = "processing"
+    READY = "ready"
+    FAILED = "failed"
 
 
 class Document(Base):
     __tablename__ = "documents"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+        index=True,
+    )
 
     user_id = Column(
-        Integer,
+        String(36),
         ForeignKey("users.id"),
         nullable=False,
         index=True,
     )
 
     parent_id = Column(
-        Integer,
+        String(36),
         ForeignKey("documents.id"),
-        nullable=True,   
+        nullable=True,
         index=True,
     )
 
@@ -59,9 +64,9 @@ class Document(Base):
     )
 
     conversation_id = Column(
-        Integer,
+        String(36),
         ForeignKey("conversations.id"),
-        nullable=True,   
+        nullable=True,
     )
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -70,7 +75,7 @@ class Document(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
-    deleted_at = Column(DateTime(timezone=True), nullable=True)  
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
 
     parent = relationship(
         "Document",
@@ -82,7 +87,6 @@ class Document(Base):
         back_populates="parent",
         cascade="all, delete-orphan",
     )
-
 
     conversation = relationship(
         "Conversation",

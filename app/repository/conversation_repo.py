@@ -10,31 +10,12 @@ from app.models.message import Message
 
 def create_conversation(
     db: Session,
-    user_id: int,
+    user_id: str,
     title: str | None
 ):
-    # Get latest conversation number for this user
-    last_conversation = (
-        db.query(Conversation)
-        .filter(
-            Conversation.user_id == user_id
-        )
-        .order_by(
-            Conversation.conversation_number.desc()
-        )
-        .first()
-    )
-
-    next_conversation_number = (
-        1
-        if last_conversation is None
-        else last_conversation.conversation_number + 1
-    )
-
     conversation = Conversation(
         user_id=user_id,
-        title=title,
-        conversation_number=next_conversation_number
+        title=title
     )
 
     db.add(conversation)
@@ -50,33 +31,14 @@ def create_conversation(
 
 def create_message(
     db: Session,
-    conversation_id: int,
+    conversation_id: str,
     role: str,
     content: str
 ):
-    # Get latest message number for this conversation
-    last_message = (
-        db.query(Message)
-        .filter(
-            Message.conversation_id == conversation_id
-        )
-        .order_by(
-            Message.message_number.desc()
-        )
-        .first()
-    )
-
-    next_message_number = (
-        1
-        if last_message is None
-        else last_message.message_number + 1
-    )
-
     message = Message(
         conversation_id=conversation_id,
         role=role,
-        content=content,
-        message_number=next_message_number
+        content=content
     )
 
     db.add(message)
@@ -92,8 +54,8 @@ def create_message(
 
 def get_conversation(
     db: Session,
-    conversation_id: int,
-    user_id: int
+    conversation_id: str,
+    user_id: str
 ):
     return (
         db.query(Conversation)
@@ -111,7 +73,7 @@ def get_conversation(
 
 def get_conversations_by_user(
     db: Session,
-    user_id: int
+    user_id: str
 ):
     return (
         db.query(Conversation)
@@ -131,7 +93,7 @@ def get_conversations_by_user(
 
 def get_last_10_messages(
     db: Session,
-    conversation_id: int
+    conversation_id: str
 ):
     messages = (
         db.query(Message)
@@ -156,7 +118,7 @@ def get_last_10_messages(
 
 def get_all_messages(
     db: Session,
-    conversation_id: int
+    conversation_id: str
 ):
     return (
         db.query(Message)
@@ -164,7 +126,7 @@ def get_all_messages(
             Message.conversation_id == conversation_id
         )
         .order_by(
-            Message.message_number.asc()
+            Message.created_at.asc()
         )
         .all()
     )
@@ -176,8 +138,8 @@ def get_all_messages(
 
 def update_conversation_title(
     db: Session,
-    conversation_id: int,
-    user_id: int,
+    conversation_id: str,
+    user_id: str,
     title: str
 ):
     conversation = (
@@ -206,8 +168,8 @@ def update_conversation_title(
 
 def delete_conversation(
     db: Session,
-    conversation_id: int,
-    user_id: int
+    conversation_id: str,
+    user_id: str
 ):
     conversation = (
         db.query(Conversation)

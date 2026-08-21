@@ -155,13 +155,7 @@ def send_message(
                 "success": False,
                 "error_code": "INTERNAL_SERVER_ERROR",
                 "conversation_id": conversation_id,
-                "conversation_number": getattr(
-                    conversation,
-                    "conversation_number",
-                    None
-                ),
                 "message_id": None,
-                "message_number": None,
                 "delta": None,
                 "text_content": "Internal server error"
             }
@@ -208,9 +202,6 @@ def list_conversations(
     data = [
         {
             "conversation_id": conversation.id,
-            "conversation_number": (
-                conversation.conversation_number
-            ),
             "title": conversation.title,
             "created_at": (
                 conversation.created_at.isoformat()
@@ -235,7 +226,7 @@ def list_conversations(
 
 @router.get("/{conversation_id}")
 def get_conversation_detail(
-    conversation_id: int,
+    conversation_id: str,
     db: Session = Depends(get_db),
     email: str = Depends(verify_token)
 ):
@@ -266,9 +257,6 @@ def get_conversation_detail(
         message="Conversation fetched successfully",
         data={
             "conversation_id": conversation.id,
-            "conversation_number": (
-                conversation.conversation_number
-            ),
             "title": conversation.title,
             "created_at": (
                 conversation.created_at.isoformat()
@@ -279,9 +267,6 @@ def get_conversation_detail(
             "messages": [
                 {
                     "message_id": message.id,
-                    "message_number": (
-                        message.message_number
-                    ),
                     "role": message.role,
                     "content": message.content,
                     "created_at": (
@@ -301,7 +286,7 @@ def get_conversation_detail(
 
 @router.patch("/{conversation_id}")
 def update_title(
-    conversation_id: int,
+    conversation_id: str,
     request: ConversationTitleUpdate,
     db: Session = Depends(get_db),
     email: str = Depends(verify_token)
@@ -329,9 +314,6 @@ def update_title(
         message="Title updated successfully",
         data={
             "conversation_id": conversation.id,
-            "conversation_number": (
-                conversation.conversation_number
-            ),
             "title": conversation.title
         },
         status_code=status.HTTP_200_OK
@@ -344,7 +326,7 @@ def update_title(
 
 @router.delete("/{conversation_id}")
 def delete_conversation_endpoint(
-    conversation_id: int,
+    conversation_id: str,
     db: Session = Depends(get_db),
     email: str = Depends(verify_token)
 ):

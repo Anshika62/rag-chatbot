@@ -1,12 +1,11 @@
+import uuid
 from datetime import datetime
 
 from sqlalchemy import (
     Column,
-    Integer,
     String,
     DateTime,
-    ForeignKey,
-    UniqueConstraint
+    ForeignKey
 )
 from sqlalchemy.orm import relationship
 
@@ -18,20 +17,14 @@ class Conversation(Base):
     __tablename__ = "conversations"
 
     id = Column(
-        Integer,
+        String(36),
         primary_key=True,
+        default=lambda: str(uuid.uuid4()),
         index=True
     )
 
-    # User-facing conversation number
-    # Starts from 1 separately for every user
-    conversation_number = Column(
-        Integer,
-        nullable=False
-    )
-
     user_id = Column(
-        Integer,
+        String(36),
         ForeignKey("users.id"),
         nullable=False
     )
@@ -50,14 +43,6 @@ class Conversation(Base):
         DateTime,
         default=datetime.utcnow,
         onupdate=datetime.utcnow
-    )
-
-    __table_args__ = (
-        UniqueConstraint(
-            "user_id",
-            "conversation_number",
-            name="uq_user_conversation_number"
-        ),
     )
 
     # Conversation belongs to one user
