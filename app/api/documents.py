@@ -35,6 +35,11 @@ router = APIRouter(
 )
 
 
+# ============================================================
+# CURRENT USER
+# ============================================================
+
+
 def _get_current_user(
     db: Session,
     email: str,
@@ -68,8 +73,8 @@ def create_folder(
     email: str = Depends(verify_token),
 ):
     user = _get_current_user(
-        db,
-        email,
+        db=db,
+        email=email,
     )
 
     folder = doc_service.create_folder_service(
@@ -111,17 +116,24 @@ def upload_document(
     email: str = Depends(verify_token),
 ):
     user = _get_current_user(
-        db,
-        email,
+        db=db,
+        email=email,
     )
 
-    doc = doc_service.upload_document_service(
-        db=db,
-        file=file,
-        parent_id=parent_id,
-        conversation_id=conversation_id,
-        user_id=user.id,
-    )
+    try:
+        doc = doc_service.upload_document_service(
+            db=db,
+            file=file,
+            parent_id=parent_id,
+            conversation_id=conversation_id,
+            user_id=user.id,
+        )
+
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
 
     if not doc:
         raise HTTPException(
@@ -161,8 +173,8 @@ def list_documents(
     email: str = Depends(verify_token),
 ):
     user = _get_current_user(
-        db,
-        email,
+        db=db,
+        email=email,
     )
 
     skip = (page - 1) * page_size
@@ -213,8 +225,8 @@ def get_document(
     email: str = Depends(verify_token),
 ):
     user = _get_current_user(
-        db,
-        email,
+        db=db,
+        email=email,
     )
 
     doc = document_repo.get_owned_document_by_id(
@@ -253,8 +265,8 @@ def update_document(
     email: str = Depends(verify_token),
 ):
     user = _get_current_user(
-        db,
-        email,
+        db=db,
+        email=email,
     )
 
     doc = doc_service.update_document_service(
@@ -293,8 +305,8 @@ def delete_document(
     email: str = Depends(verify_token),
 ):
     user = _get_current_user(
-        db,
-        email,
+        db=db,
+        email=email,
     )
 
     deleted = doc_service.delete_document_service(

@@ -1,42 +1,39 @@
 from langchain_core.tools import tool
 
 from app.repository.conversation_repo import get_last_10_messages
+from app.service.tools.search_kb import (
+    create_search_knowledge_base_tool,
+)
 
 
 def create_conversation_tools(
     db,
-    conversation_id: int
+    user_id: str,
+    conversation_id: str,
 ):
-    """
-    Create conversation-related tools for the current conversation.
-    """
-
     @tool
     def get_conversation_history() -> str:
-        """
-        Fetch recent messages from the current conversation.
-
-        Use this tool when additional conversation history
-        is required to answer the user's question.
-        """
+        """Fetch recent messages from the current conversation."""
 
         messages = get_last_10_messages(
             db=db,
-            conversation_id=conversation_id
+            conversation_id=conversation_id,
         )
 
         if not messages:
             return "No previous conversation history found."
 
-        history = []
+        return "\n".join(
+            f"{message.role}: {message.content}"
+            for message in messages
+        )
 
-        for message in messages:
-            history.append(
-                f"{message.role}: {message.content}"
-            )
-
-        return "\n".join(history)
+    search_knowledge_base = create_search_knowledge_base_tool(
+        user_id=str(user_id),
+        conversation_id=str(conversation_id),
+    )
 
     return [
-        get_conversation_history
+        get_conversation_history,
+        search_knowledge_base,
     ]

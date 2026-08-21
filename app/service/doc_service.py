@@ -9,6 +9,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.models.document import Document, DocumentStatus
 from app.repository import document_repo
+from app.repository.conversation_repo import (
+    create_conversation,
+    get_conversation,
+)
 from app.service.rag_clients import embedding_manager, vector_store
 
 
@@ -19,17 +23,28 @@ UPLOAD_DIR = "Uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
+# ============================================================
+# GCS PATH
+# ============================================================
+
+
 def generate_gcs_path(
     user_id: str,
     document_id: str,
     original_filename: str,
 ) -> str:
+
     safe_filename = original_filename.replace("/", "_").strip()
 
     return (
         f"users/{user_id}/documents/"
         f"{document_id}/{safe_filename}"
     )
+
+
+# ============================================================
+# CREATE FOLDER
+# ============================================================
 
 
 def create_folder_service(
@@ -43,6 +58,7 @@ def create_folder_service(
         parent_id = None
 
     if parent_id:
+
         parent = document_repo.get_owned_folder_by_id(
             db,
             parent_id,
@@ -61,6 +77,75 @@ def create_folder_service(
 
 
 # ============================================================
+# GET / CREATE CONVERSATION FOR DOCUMENT
+# ============================================================
+
+
+def _get_or_create_document_conversation(
+    db: Session,
+    conversation_id: Optional[str],
+    user_id: str,
+) -> str:
+    """
+    Resolve the conversation that will own the uploaded document.
+
+    Rules:
+    1. If conversation_id is not provided:
+       create a new conversation for the current user.
+
+    2. If conversation_id is provided:
+       verify that the conversation belongs to the current user.
+
+    3. A user can NEVER attach a document to another user's
+       conversation.
+    """
+
+    # --------------------------------------------------------
+    # No conversation_id supplied
+    # --------------------------------------------------------
+
+    if not conversation_id:
+
+        conversation = create_conversation(
+            db=db,
+            user_id=user_id,
+            title="Document Upload",
+        )
+
+        if not conversation:
+            raise RuntimeError(
+                "Failed to create conversation for document upload"
+            )
+
+        logger.info(
+            "Created new conversation=%s for document upload "
+            "user_id=%s",
+            conversation.id,
+            user_id,
+        )
+
+        return str(conversation.id)
+
+    # --------------------------------------------------------
+    # conversation_id supplied
+    # --------------------------------------------------------
+
+    conversation = get_conversation(
+        db=db,
+        conversation_id=str(conversation_id),
+        user_id=user_id,
+    )
+
+    if not conversation:
+        raise PermissionError(
+            "Conversation not found or does not belong "
+            "to the current user"
+        )
+
+    return str(conversation.id)
+
+
+# ============================================================
 # UPLOAD DOCUMENT
 # ============================================================
 
@@ -73,13 +158,22 @@ def upload_document_service(
     user_id: str,
 ) -> Optional[Document]:
 
+    # --------------------------------------------------------
+    # Normalize values
+    # --------------------------------------------------------
+
     if not parent_id:
         parent_id = None
 
     if not conversation_id:
         conversation_id = None
 
+    # --------------------------------------------------------
+    # Validate parent folder ownership
+    # --------------------------------------------------------
+
     if parent_id:
+
         parent = document_repo.get_owned_folder_by_id(
             db,
             parent_id,
@@ -88,6 +182,35 @@ def upload_document_service(
 
         if not parent:
             return None
+
+    # --------------------------------------------------------
+    # Resolve conversation
+    #
+    # If no conversation_id:
+    #     create one automatically for current user.
+    #
+    # If conversation_id:
+    #     verify ownership.
+    # --------------------------------------------------------
+
+    try:
+
+        conversation_id = _get_or_create_document_conversation(
+            db=db,
+            conversation_id=conversation_id,
+            user_id=user_id,
+        )
+
+    except PermissionError as exc:
+
+        logger.warning(
+            "Unauthorized conversation access attempt: "
+            "user_id=%s conversation_id=%s",
+            user_id,
+            conversation_id,
+        )
+
+        raise exc
 
     # --------------------------------------------------------
     # 1. Create document row
@@ -116,6 +239,10 @@ def upload_document_service(
     with open(file_path, "wb") as f:
         f.write(contents)
 
+    # --------------------------------------------------------
+    # GCS path
+    # --------------------------------------------------------
+
     gcs_path = generate_gcs_path(
         user_id,
         doc.id,
@@ -126,47 +253,48 @@ def upload_document_service(
     # 3. RAG processing
     # --------------------------------------------------------
 
-    if conversation_id is not None:
+    try:
 
-        try:
-            _process_for_rag(
-                db=db,
-                doc=doc,
-                file_path=file_path,
-                conversation_id=conversation_id,
-                user_id=user_id,
-            )
+        _process_for_rag(
+            db=db,
+            doc=doc,
+            file_path=file_path,
+            conversation_id=conversation_id,
+            user_id=user_id,
+        )
 
-            doc = document_repo.update_file_storage_info(
-                db=db,
-                doc=doc,
-                gcs_path=gcs_path,
-                size_bytes=len(contents),
-                status=DocumentStatus.READY,
-            )
-
-        except Exception:
-            logger.exception(
-                "RAG processing failed for document_id=%s",
-                doc.id,
-            )
-
-            doc = document_repo.update_file_storage_info(
-                db=db,
-                doc=doc,
-                gcs_path=gcs_path,
-                size_bytes=len(contents),
-                status=DocumentStatus.FAILED,
-            )
-
-    else:
-        # No conversation attached -> no RAG indexing
         doc = document_repo.update_file_storage_info(
             db=db,
             doc=doc,
             gcs_path=gcs_path,
             size_bytes=len(contents),
             status=DocumentStatus.READY,
+        )
+
+        logger.info(
+            "Document upload and RAG processing completed: "
+            "document_id=%s user_id=%s conversation_id=%s",
+            doc.id,
+            user_id,
+            conversation_id,
+        )
+
+    except Exception:
+
+        logger.exception(
+            "RAG processing failed for document_id=%s "
+            "user_id=%s conversation_id=%s",
+            doc.id,
+            user_id,
+            conversation_id,
+        )
+
+        doc = document_repo.update_file_storage_info(
+            db=db,
+            doc=doc,
+            gcs_path=gcs_path,
+            size_bytes=len(contents),
+            status=DocumentStatus.FAILED,
         )
 
     return doc
@@ -185,23 +313,42 @@ def _process_for_rag(
     user_id: str,
 ) -> None:
     """
-    Extract text, chunk it, generate embeddings,
+    Extract text, create chunks, generate embeddings,
     store vectors in Qdrant and chunks in PostgreSQL.
+
+    Qdrant payload contains:
+        user_id
+        conversation_id
+        filename
+        chunk_index
+        text
+        type=document
     """
+
+    # --------------------------------------------------------
+    # Extract PDF text
+    # --------------------------------------------------------
 
     text = ""
 
     with pdfplumber.open(file_path) as pdf:
+
         for page in pdf.pages:
+
             text += page.extract_text() or ""
 
     if not text.strip():
+
         logger.warning(
-            "No extractable text for document_id=%s, "
-            "skipping RAG indexing",
+            "No extractable text for document_id=%s",
             doc.id,
         )
+
         return
+
+    # --------------------------------------------------------
+    # Text splitting
+    # --------------------------------------------------------
 
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
@@ -217,6 +364,12 @@ def _process_for_rag(
     chunks = text_splitter.split_text(text)
 
     if not chunks:
+
+        logger.warning(
+            "No chunks generated for document_id=%s",
+            doc.id,
+        )
+
         return
 
     # --------------------------------------------------------
@@ -235,8 +388,8 @@ def _process_for_rag(
         chunks=chunks,
         embeddings=embeddings,
         filename=doc.file_name,
-        conversation_id=conversation_id,
-        user_id=user_id,
+        conversation_id=str(conversation_id),
+        user_id=str(user_id),
     )
 
     # --------------------------------------------------------
@@ -250,9 +403,13 @@ def _process_for_rag(
     )
 
     logger.info(
-        "RAG indexing completed: document_id=%s, chunks=%s",
+        "RAG indexing completed: "
+        "document_id=%s chunks=%s user_id=%s "
+        "conversation_id=%s",
         doc.id,
         len(chunks),
+        user_id,
+        conversation_id,
     )
 
 
@@ -270,8 +427,6 @@ def update_document_service(
 ) -> Optional[Document]:
     """
     Update document metadata for the current user's document.
-
-    Only supplied fields are changed.
     """
 
     doc = document_repo.get_owned_document_by_id(
@@ -283,7 +438,6 @@ def update_document_service(
     if not doc:
         return None
 
-    # Nothing to update
     if file_name is None and mime_type is None:
         return doc
 
@@ -329,23 +483,27 @@ def _delete_recursive(
 ) -> None:
 
     if doc.is_folder:
+
         children = document_repo.get_children(
             db,
             doc.id,
         )
 
         for child in children:
+
             _delete_recursive(
                 db,
                 child,
             )
 
     else:
-        # TODO:
-        # GCS delete -> gcs_client.delete(doc.gcs_path)
 
         # TODO:
-        # Vector DB delete ->
+        # GCS delete
+        # gcs_client.delete(doc.gcs_path)
+
+        # TODO:
+        # Qdrant vector delete
         # vector_store.delete(document_id=doc.id)
 
         pass
