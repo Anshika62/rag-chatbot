@@ -175,6 +175,16 @@ def _get_tool(
 # ============================================================
 
 
+# ============================================================
+# EXECUTE TOOL CALLS
+#
+# Also collects image references returned by search_knowledge_base
+# (content_type == "image") so callers can surface those images
+# alongside the text answer, the same way GPT/Gemini show an
+# image next to their response.
+# ============================================================
+
+
 def _execute_tool_calls(
     tools: list,
     tool_calls: list,
@@ -182,6 +192,7 @@ def _execute_tool_calls(
     log_prefix: str = "",
 ):
     tool_messages = []
+    collected_images = []
 
     for tool_call in tool_calls:
 
@@ -217,6 +228,24 @@ def _execute_tool_calls(
             conversation_id,
         )
 
+        if tool_name == "search_knowledge_base" and isinstance(tool_result, list):
+
+            for item in tool_result:
+
+                if (
+                    isinstance(item, dict)
+                    and item.get("content_type") == "image"
+                    and item.get("document_id")
+                ):
+
+                    collected_images.append(
+                        {
+                            "document_id": item.get("document_id"),
+                            "filename": item.get("filename"),
+                            "url": f"/documents/{item.get('document_id')}/file",
+                        }
+                    )
+
         tool_messages.append(
             {
                 "role": "tool",
@@ -225,7 +254,7 @@ def _execute_tool_calls(
             }
         )
 
-    return tool_messages
+    return tool_messages, collected_images
 
 
 # ============================================================
@@ -275,13 +304,13 @@ def generate_answer(
             response
         ]
 
-        tool_messages.extend(
-            _execute_tool_calls(
-                tools=tools,
-                tool_calls=response.tool_calls,
-                conversation_id=conversation_id,
-            )
+        extra_messages, _images = _execute_tool_calls(
+            tools=tools,
+            tool_calls=response.tool_calls,
+            conversation_id=conversation_id,
         )
+
+        tool_messages.extend(extra_messages)
 
         final_response = llm_with_tools.invoke(
             messages + tool_messages
@@ -390,7 +419,14 @@ def generate_answer_stream(
     db=None,
     user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    images_output: Optional[list] = None,
 ) -> Generator[str, None, None]:
+    """
+    images_output: if a list is passed in, it is extended in-place
+    with any image references collected from tool calls (e.g.
+    knowledge-base image chunks), so the caller can read it after
+    the generator is exhausted and attach it to the final response.
+    """
 
     try:
 
@@ -498,14 +534,17 @@ def generate_answer_stream(
         # Execute tools
         # ----------------------------------------------------
 
-        tool_messages.extend(
-            _execute_tool_calls(
-                tools=tools,
-                tool_calls=tool_calls,
-                conversation_id=conversation_id,
-                log_prefix="STREAM ",
-            )
+        extra_messages, collected_images = _execute_tool_calls(
+            tools=tools,
+            tool_calls=tool_calls,
+            conversation_id=conversation_id,
+            log_prefix="STREAM ",
         )
+
+        tool_messages.extend(extra_messages)
+
+        if images_output is not None:
+            images_output.extend(collected_images)
 
         # ----------------------------------------------------
         # Generate final response
@@ -596,3 +635,59 @@ Rules:
         )
 
         return question[:50]
+
+def _execute_tool_calls(
+    tools: list,
+    tool_calls: list,
+    conversation_id: Optional[str],
+    log_prefix: str = "",
+):
+    tool_messages = []
+    collected_images = []
+
+    for tool_call in tool_calls:
+
+        tool_name = tool_call["name"]
+        tool_args = tool_call.get("args", {})
+
+        selected_tool = _get_tool(tools=tools, tool_name=tool_name)
+
+        if selected_tool is None:
+            raise RuntimeError(f"Requested tool not found: {tool_name}")
+
+        logger.info(
+            "%sTOOL EXECUTING: tool=%s args=%s conversation_id=%s",
+            log_prefix, tool_name, tool_args, conversation_id,
+        )
+
+        tool_result = selected_tool.invoke(tool_args)
+
+        logger.info(
+            "%sTOOL RESULT: tool=%s conversation_id=%s",
+            log_prefix, tool_name, conversation_id,
+        )
+
+        # collect image references returned by search_knowledge_base
+        if tool_name == "search_knowledge_base" and isinstance(tool_result, list):
+
+            for item in tool_result:
+
+                if isinstance(item, dict) and item.get("content_type") == "image":
+
+                    collected_images.append(
+                        {
+                            "document_id": item.get("document_id"),
+                            "filename": item.get("filename"),
+                            "url": item.get("file_url"),
+                        }
+                    )
+
+        tool_messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "content": str(tool_result),
+            }
+        )
+
+    return tool_messages, collected_images

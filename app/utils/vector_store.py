@@ -1,6 +1,3 @@
-# app/utils/vector_store.py
-# SIRF `search()` METHOD change hua hai, baaki poora file same hai
-
 import os
 import uuid
 from typing import List
@@ -130,17 +127,18 @@ class Vectorstore:
         embeddings,
         filename: str,
         conversation_id: str,
-        user_id: str
+        user_id: str,
+        document_id: str,
+        content_type: str = "text",
     ):
 
         conversation_id = str(conversation_id)
         user_id = str(user_id)
+        document_id = str(document_id)
 
         points = []
 
-        for i, (chunk, embedding) in enumerate(
-            zip(chunks, embeddings)
-        ):
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
 
             points.append(
                 PointStruct(
@@ -152,15 +150,15 @@ class Vectorstore:
                         "text": chunk,
                         "type": "document",
                         "user_id": user_id,
-                        "conversation_id": conversation_id
+                        "conversation_id": conversation_id,
+                        "document_id": document_id,
+                        "content_type": content_type,
                     }
                 )
             )
 
         if not points:
-            raise ValueError(
-                "No document points available to store"
-            )
+            raise ValueError("No document points available to store")
 
         self.client.upsert(
             collection_name=self.collection_name,
@@ -217,15 +215,7 @@ class Vectorstore:
             points=points
         )
 
-    # =========================================================
-    # SEARCH DOCUMENTS  <-- CHANGED
-    #
-    # Ab sirf user_id se search hota hai, conversation_id se
-    # nahi. Matlab jo bhi document/image kabhi is user ne
-    # upload kiya hai, wo kisi bhi conversation se query hone
-    # par mil jayega -- manual conversation_id matching ki
-    # zaroorat nahi.
-    # =========================================================
+
 
     def search(
         self,
@@ -263,11 +253,6 @@ class Vectorstore:
 
         return results.points
 
-    # =========================================================
-    # SEARCH CONVERSATION HISTORY (unchanged -- ye conversation
-    # ke hisaab se hi rehna chahiye, kyuki ye chat-turn memory
-    # hai, document library nahi)
-    # =========================================================
 
     def search_conversation_history(
         self,

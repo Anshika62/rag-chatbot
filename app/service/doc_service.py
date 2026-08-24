@@ -1,4 +1,3 @@
-
 import os
 import logging
 from typing import Optional
@@ -434,28 +433,18 @@ def _process_image_for_rag(
         caption = generate_image_caption(file_path)
 
     except Exception:
-
         logger.exception(
-            "Image captioning failed for document_id=%s",
-            doc.id,
+            "Image captioning failed for document_id=%s", doc.id,
         )
-
         return
 
     if not caption or not caption.strip():
-
-        logger.warning(
-            "Empty caption generated for document_id=%s",
-            doc.id,
-        )
-
+        logger.warning("Empty caption generated for document_id=%s", doc.id)
         return
 
     chunks = [caption.strip()]
 
-    embeddings = embedding_manager.generate_embedding(
-        chunks
-    )
+    embeddings = embedding_manager.generate_embedding(chunks)
 
     vector_store.add_documents(
         chunks=chunks,
@@ -463,20 +452,15 @@ def _process_image_for_rag(
         filename=doc.file_name,
         conversation_id=str(conversation_id),
         user_id=str(user_id),
+        document_id=str(doc.id),
+        content_type="image",
     )
 
-    document_repo.create_chunks(
-        db=db,
-        doc_id=doc.id,
-        chunks=chunks,
-    )
+    document_repo.create_chunks(db=db, doc_id=doc.id, chunks=chunks)
 
     logger.info(
-        "Image RAG indexing completed: "
-        "document_id=%s user_id=%s conversation_id=%s",
-        doc.id,
-        user_id,
-        conversation_id,
+        "Image RAG indexing completed: document_id=%s user_id=%s "
+        "conversation_id=%s", doc.id, user_id, conversation_id,
     )
 
 
@@ -805,4 +789,205 @@ def _delete_recursive(
     document_repo.delete_document_row(
         db,
         doc,
+    )
+
+
+
+def _persist_pdf_image(
+    db: Session,
+    parent_doc: Document,
+    image_bytes: bytes,
+    extension: str,
+    page_index: int,
+    image_index: int,
+    conversation_id: str,
+    user_id: str,
+) -> Document:
+    """
+    Save an image extracted from a PDF as its own permanent
+    Document row (child of the PDF), so it can be served later
+    via /documents/{id}/file instead of being deleted.
+    """
+
+    mime_ext = "jpeg" if extension.lower() in ("jpg", "jpeg") else extension.lower()
+
+    filename = f"{parent_doc.file_name}_p{page_index}_{image_index}.{extension}"
+
+    image_doc = document_repo.create_file(
+        db=db,
+        file_name=filename,
+        parent_id=parent_doc.id,
+        user_id=user_id,
+        mime_type=f"image/{mime_ext}",
+        conversation_id=conversation_id,
+    )
+
+    file_path = os.path.join(UPLOAD_DIR, f"{image_doc.id}_{filename}")
+
+    with open(file_path, "wb") as f:
+        f.write(image_bytes)
+
+    image_doc = document_repo.update_file_storage_info(
+        db=db,
+        doc=image_doc,
+        gcs_path=generate_gcs_path(user_id, image_doc.id, filename),
+        size_bytes=len(image_bytes),
+        status=DocumentStatus.READY,
+    )
+
+    return image_doc
+
+
+def _extract_and_persist_pdf_images(
+    db: Session,
+    parent_doc: Document,
+    file_path: str,
+    conversation_id: str,
+    user_id: str,
+) -> list[tuple[Document, str]]:
+    """
+    Extract embedded raster images from a PDF, persist each as
+    its own Document row + file on disk (no deletion), and
+    return [(Document, file_path), ...] pairs.
+    """
+
+    results = []
+
+    pdf = fitz.open(file_path)
+
+    try:
+        for page_index in range(len(pdf)):
+            page = pdf[page_index]
+
+            for image_index, img in enumerate(page.get_images(full=True)):
+                xref = img[0]
+
+                try:
+                    base_image = pdf.extract_image(xref)
+                except Exception:
+                    logger.warning(
+                        "Unable to extract image xref=%s page=%s "
+                        "document_id=%s", xref, page_index, parent_doc.id,
+                    )
+                    continue
+
+                image_doc = _persist_pdf_image(
+                    db=db,
+                    parent_doc=parent_doc,
+                    image_bytes=base_image["image"],
+                    extension=base_image["ext"],
+                    page_index=page_index,
+                    image_index=image_index,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                )
+
+                image_path = os.path.join(
+                    UPLOAD_DIR, f"{image_doc.id}_{image_doc.file_name}",
+                )
+
+                results.append((image_doc, image_path))
+
+    finally:
+        pdf.close()
+
+    return results
+
+
+def _process_pdf_for_rag(
+    db: Session,
+    doc: Document,
+    file_path: str,
+    conversation_id: str,
+    user_id: str,
+) -> None:
+
+    text = ""
+
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            text += page.extract_text() or ""
+
+    text_chunks = []
+
+    if text.strip():
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=100,
+            separators=["\n\n", "\n", " ", ""],
+        )
+        text_chunks = text_splitter.split_text(text)
+    else:
+        logger.warning("No extractable text for document_id=%s", doc.id)
+
+    # --- text chunks indexed under the PDF's own document_id ---
+
+    if text_chunks:
+        embeddings = embedding_manager.generate_embedding(text_chunks)
+
+        vector_store.add_documents(
+            chunks=text_chunks,
+            embeddings=embeddings,
+            filename=doc.file_name,
+            conversation_id=str(conversation_id),
+            user_id=str(user_id),
+            document_id=str(doc.id),
+            content_type="text",
+        )
+
+        document_repo.create_chunks(db=db, doc_id=doc.id, chunks=text_chunks)
+
+    # --- embedded images: persist as child Documents + caption each ---
+
+    image_pairs = []
+
+    try:
+        image_pairs = _extract_and_persist_pdf_images(
+            db=db, parent_doc=doc, file_path=file_path,
+            conversation_id=conversation_id, user_id=user_id,
+        )
+    except Exception:
+        logger.exception(
+            "PDF image extraction failed for document_id=%s", doc.id,
+        )
+
+    image_count = 0
+
+    for image_doc, image_path in image_pairs:
+
+        try:
+            caption = generate_image_caption(image_path)
+
+            if not caption or not caption.strip():
+                continue
+
+            chunks = [caption.strip()]
+
+            embeddings = embedding_manager.generate_embedding(chunks)
+
+            vector_store.add_documents(
+                chunks=chunks,
+                embeddings=embeddings,
+                filename=image_doc.file_name,
+                conversation_id=str(conversation_id),
+                user_id=str(user_id),
+                document_id=str(image_doc.id),
+                content_type="image",
+            )
+
+            document_repo.create_chunks(
+                db=db, doc_id=image_doc.id, chunks=chunks,
+            )
+
+            image_count += 1
+
+        except Exception:
+            logger.exception(
+                "Captioning failed for image_document_id=%s parent=%s",
+                image_doc.id, doc.id,
+            )
+
+    logger.info(
+        "RAG indexing completed: document_id=%s text_chunks=%s "
+        "image_chunks=%s user_id=%s conversation_id=%s",
+        doc.id, len(text_chunks), image_count, user_id, conversation_id,
     )

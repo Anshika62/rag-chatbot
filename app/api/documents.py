@@ -10,7 +10,8 @@ from fastapi import (
     Form,
     status,
 )
-
+import os
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -247,4 +248,25 @@ def delete_document(
     return success_response(
         message="Document deleted successfully",
         data=None,
+    )
+
+@router.get("/{document_id}/file")
+def get_document_file(
+    document: Document = Depends(get_current_document),
+):
+    file_path = os.path.join(
+        "Uploads",
+        f"{document.id}_{document.file_name}",
+    )
+
+    if not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found on disk",
+        )
+
+    return FileResponse(
+        file_path,
+        media_type=document.mime_type or "application/octet-stream",
+        filename=document.file_name,
     )

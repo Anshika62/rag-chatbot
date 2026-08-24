@@ -112,6 +112,8 @@ def create_search_knowledge_base_tool(
                     "filename": payload.get("filename"),
                     "chunk_index": payload.get("chunk_index"),
                     "text": text,
+                    "document_id": payload.get("document_id"),
+                    "content_type": payload.get("content_type"),
                 }
             )
 
