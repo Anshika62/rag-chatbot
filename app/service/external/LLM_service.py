@@ -14,10 +14,20 @@ from app.service.tools.conversation_tool import (
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# LLM CONFIGURATION
+# ============================================================
+
+
 llm = ChatGroq(
     model="openai/gpt-oss-20b",
     temperature=0.2,
 )
+
+
+# ============================================================
+# SYSTEM PROMPT
+# ============================================================
 
 
 SYSTEM_PROMPT = """
@@ -45,6 +55,11 @@ Rules:
 - Use conversation history for follow-up questions.
 - Keep answers clear and concise.
 """
+
+
+# ============================================================
+# BUILD LLM MESSAGES
+# ============================================================
 
 
 def _build_messages(
@@ -85,6 +100,11 @@ Current User Question:
     )
 
 
+# ============================================================
+# CREATE TOOLS
+# ============================================================
+
+
 def _create_tools(
     db=None,
     user_id: Optional[str] = None,
@@ -104,6 +124,24 @@ def _create_tools(
     )
 
 
+# ============================================================
+# BIND TOOLS
+# ============================================================
+
+
+def _bind_tools(tools: list):
+    return (
+        llm.bind_tools(tools)
+        if tools
+        else llm
+    )
+
+
+# ============================================================
+# GET TOOL
+# ============================================================
+
+
 def _get_tool(
     tools: list,
     tool_name: str,
@@ -118,6 +156,69 @@ def _get_tool(
     )
 
 
+# ============================================================
+# EXECUTE TOOL CALLS
+# ============================================================
+
+
+def _execute_tool_calls(
+    tools: list,
+    tool_calls: list,
+    conversation_id: Optional[str],
+    log_prefix: str = "",
+):
+    tool_messages = []
+
+    for tool_call in tool_calls:
+
+        tool_name = tool_call["name"]
+        tool_args = tool_call.get("args", {})
+
+        selected_tool = _get_tool(
+            tools=tools,
+            tool_name=tool_name,
+        )
+
+        if selected_tool is None:
+            raise RuntimeError(
+                f"Requested tool not found: {tool_name}"
+            )
+
+        logger.info(
+            "%sTOOL EXECUTING: tool=%s args=%s conversation_id=%s",
+            log_prefix,
+            tool_name,
+            tool_args,
+            conversation_id,
+        )
+
+        tool_result = selected_tool.invoke(
+            tool_args
+        )
+
+        logger.info(
+            "%sTOOL RESULT: tool=%s conversation_id=%s",
+            log_prefix,
+            tool_name,
+            conversation_id,
+        )
+
+        tool_messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "content": str(tool_result),
+            }
+        )
+
+    return tool_messages
+
+
+# ============================================================
+# GENERATE ANSWER
+# ============================================================
+
+
 def generate_answer(
     question: str,
     chat_history: Optional[list[dict]] = None,
@@ -126,6 +227,7 @@ def generate_answer(
     conversation_id: Optional[str] = None,
 ):
     try:
+
         messages = _build_messages(
             question=question,
             chat_history=chat_history,
@@ -137,13 +239,11 @@ def generate_answer(
             conversation_id=conversation_id,
         )
 
-        llm_with_tools = (
-            llm.bind_tools(tools)
-            if tools
-            else llm
-        )
+        llm_with_tools = _bind_tools(tools)
 
-        response = llm_with_tools.invoke(messages)
+        response = llm_with_tools.invoke(
+            messages
+        )
 
         if not response.tool_calls:
             return response.content
@@ -157,38 +257,17 @@ def generate_answer(
             conversation_id,
         )
 
-        tool_messages = [response]
+        tool_messages = [
+            response
+        ]
 
-        for tool_call in response.tool_calls:
-            tool_name = tool_call["name"]
-            tool_args = tool_call.get("args", {})
-
-            selected_tool = _get_tool(
+        tool_messages.extend(
+            _execute_tool_calls(
                 tools=tools,
-                tool_name=tool_name,
+                tool_calls=response.tool_calls,
+                conversation_id=conversation_id,
             )
-
-            if selected_tool is None:
-                raise RuntimeError(
-                    f"Requested tool not found: {tool_name}"
-                )
-
-            logger.info(
-                "TOOL EXECUTING: tool=%s args=%s conversation_id=%s",
-                tool_name,
-                tool_args,
-                conversation_id,
-            )
-
-            tool_result = selected_tool.invoke(tool_args)
-
-            tool_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "content": str(tool_result),
-                }
-            )
+        )
 
         final_response = llm_with_tools.invoke(
             messages + tool_messages
@@ -200,6 +279,7 @@ def generate_answer(
         raise
 
     except Exception as exc:
+
         logger.exception(
             "LLM RESPONSE ERROR: conversation_id=%s error=%s",
             conversation_id,
@@ -212,38 +292,65 @@ def generate_answer(
         ) from exc
 
 
-def _parse_tool_calls(tool_call_chunks: list):
+# ============================================================
+# PARSE STREAMING TOOL CALLS
+# ============================================================
+
+
+def _parse_tool_calls(
+    tool_call_chunks: list,
+):
     if not tool_call_chunks:
         return []
 
     tool_calls = {}
 
     for chunk in tool_call_chunks:
-        index = chunk.get("index", 0)
+
+        index = chunk.get(
+            "index",
+            0,
+        )
 
         if index not in tool_calls:
+
             tool_calls[index] = {
                 "id": "",
                 "name": "",
                 "args": "",
             }
 
-        tool_calls[index]["id"] += chunk.get("id") or ""
-        tool_calls[index]["name"] += chunk.get("name") or ""
-        tool_calls[index]["args"] += chunk.get("args") or ""
+        tool_calls[index]["id"] += (
+            chunk.get("id") or ""
+        )
+
+        tool_calls[index]["name"] += (
+            chunk.get("name") or ""
+        )
+
+        tool_calls[index]["args"] += (
+            chunk.get("args") or ""
+        )
 
     parsed_calls = []
 
     for tool_call in tool_calls.values():
+
         args_text = tool_call["args"].strip()
 
         if args_text:
+
             try:
-                args = json.loads(args_text)
+                args = json.loads(
+                    args_text
+                )
+
             except json.JSONDecodeError as exc:
+
                 raise RuntimeError(
                     "Unable to parse tool arguments"
                 ) from exc
+
         else:
             args = {}
 
@@ -258,6 +365,11 @@ def _parse_tool_calls(tool_call_chunks: list):
     return parsed_calls
 
 
+# ============================================================
+# GENERATE STREAMING ANSWER
+# ============================================================
+
+
 def generate_answer_stream(
     question: str,
     chat_history: Optional[list[dict]] = None,
@@ -265,7 +377,9 @@ def generate_answer_stream(
     user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
 ) -> Generator[str, None, None]:
+
     try:
+
         messages = _build_messages(
             question=question,
             chat_history=chat_history,
@@ -277,11 +391,7 @@ def generate_answer_stream(
             conversation_id=conversation_id,
         )
 
-        llm_with_tools = (
-            llm.bind_tools(tools)
-            if tools
-            else llm
-        )
+        llm_with_tools = _bind_tools(tools)
 
         logger.info(
             "LLM STREAM START: conversation_id=%s tools=%s",
@@ -292,8 +402,13 @@ def generate_answer_stream(
         streamed_chunks = []
         tool_call_chunks = []
 
-        for chunk in llm_with_tools.stream(messages):
-            streamed_chunks.append(chunk)
+        for chunk in llm_with_tools.stream(
+            messages
+        ):
+
+            streamed_chunks.append(
+                chunk
+            )
 
             current_tool_chunks = getattr(
                 chunk,
@@ -302,6 +417,7 @@ def generate_answer_stream(
             )
 
             if current_tool_chunks:
+
                 tool_call_chunks.extend(
                     current_tool_chunks
                 )
@@ -310,11 +426,22 @@ def generate_answer_stream(
             tool_call_chunks
         )
 
+        # ----------------------------------------------------
+        # Normal streaming response
+        # ----------------------------------------------------
+
         if not tool_calls:
+
             for chunk in streamed_chunks:
+
                 if chunk.content:
                     yield chunk.content
+
             return
+
+        # ----------------------------------------------------
+        # Tool calls detected
+        # ----------------------------------------------------
 
         logger.info(
             "STREAM TOOL CALLS: tools=%s conversation_id=%s",
@@ -325,17 +452,26 @@ def generate_answer_stream(
             conversation_id,
         )
 
+        # ----------------------------------------------------
+        # Reconstruct AI tool-call response
+        # ----------------------------------------------------
+
         full_ai_response = None
 
         for chunk in streamed_chunks:
+
             if full_ai_response is None:
+
                 full_ai_response = chunk
+
             else:
+
                 full_ai_response = (
                     full_ai_response + chunk
                 )
 
         if full_ai_response is None:
+
             raise RuntimeError(
                 "Unable to reconstruct tool-call response"
             )
@@ -344,44 +480,22 @@ def generate_answer_stream(
             full_ai_response
         ]
 
-        for tool_call in tool_calls:
-            tool_name = tool_call["name"]
-            tool_args = tool_call.get("args", {})
+        # ----------------------------------------------------
+        # Execute tools
+        # ----------------------------------------------------
 
-            selected_tool = _get_tool(
+        tool_messages.extend(
+            _execute_tool_calls(
                 tools=tools,
-                tool_name=tool_name,
+                tool_calls=tool_calls,
+                conversation_id=conversation_id,
+                log_prefix="STREAM ",
             )
+        )
 
-            if selected_tool is None:
-                raise RuntimeError(
-                    f"Requested tool not found: {tool_name}"
-                )
-
-            logger.info(
-                "STREAM TOOL EXECUTING: tool=%s args=%s conversation_id=%s",
-                tool_name,
-                tool_args,
-                conversation_id,
-            )
-
-            tool_result = selected_tool.invoke(
-                tool_args
-            )
-
-            logger.info(
-                "STREAM TOOL RESULT: tool=%s conversation_id=%s",
-                tool_name,
-                conversation_id,
-            )
-
-            tool_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "content": str(tool_result),
-                }
-            )
+        # ----------------------------------------------------
+        # Generate final response
+        # ----------------------------------------------------
 
         final_messages = (
             messages + tool_messages
@@ -390,6 +504,7 @@ def generate_answer_stream(
         for chunk in llm_with_tools.stream(
             final_messages
         ):
+
             if chunk.content:
                 yield chunk.content
 
@@ -397,8 +512,10 @@ def generate_answer_stream(
         raise
 
     except Exception as exc:
+
         logger.exception(
-            "LLM STREAM RESPONSE ERROR: conversation_id=%s error=%s",
+            "LLM STREAM RESPONSE ERROR: "
+            "conversation_id=%s error=%s",
             conversation_id,
             str(exc),
         )
@@ -408,10 +525,17 @@ def generate_answer_stream(
         ) from exc
 
 
+# ============================================================
+# GENERATE CONVERSATION TITLE
+# ============================================================
+
+
 def generate_title(
     question: str,
 ) -> str:
+
     try:
+
         title_prompt = ChatPromptTemplate.from_messages(
             [
                 (
@@ -438,7 +562,9 @@ Rules:
             question=question
         )
 
-        response = llm.invoke(messages)
+        response = llm.invoke(
+            messages
+        )
 
         title = response.content.strip()
 
@@ -449,6 +575,7 @@ Rules:
         )
 
     except Exception as exc:
+
         logger.exception(
             "TITLE GENERATION ERROR: error=%s",
             str(exc),

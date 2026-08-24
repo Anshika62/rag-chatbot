@@ -13,7 +13,10 @@ from app.repository.conversation_repo import (
     create_conversation,
     get_conversation,
 )
-from app.service.rag_clients import embedding_manager, vector_store
+from app.service.rag_clients import (
+    embedding_manager,
+    vector_store,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -33,8 +36,10 @@ def generate_gcs_path(
     document_id: str,
     original_filename: str,
 ) -> str:
-
-    safe_filename = original_filename.replace("/", "_").strip()
+    safe_filename = original_filename.replace(
+        "/",
+        "_",
+    ).strip()
 
     return (
         f"users/{user_id}/documents/"
@@ -96,7 +101,7 @@ def _get_or_create_document_conversation(
     2. If conversation_id is provided:
        verify that the conversation belongs to the current user.
 
-    3. A user can NEVER attach a document to another user's
+    3. A user can never attach a document to another user's
        conversation.
     """
 
@@ -244,9 +249,9 @@ def upload_document_service(
     # --------------------------------------------------------
 
     gcs_path = generate_gcs_path(
-        user_id,
-        doc.id,
-        file.filename,
+        user_id=user_id,
+        document_id=doc.id,
+        original_filename=file.filename,
     )
 
     # --------------------------------------------------------
@@ -420,23 +425,16 @@ def _process_for_rag(
 
 def update_document_service(
     db: Session,
-    doc_id: str,
-    user_id: str,
+    doc: Document,
     file_name: Optional[str] = None,
     mime_type: Optional[str] = None,
-) -> Optional[Document]:
+) -> Document:
     """
-    Update document metadata for the current user's document.
+    Update document metadata.
+
+    The document has already been fetched and ownership-validated
+    by get_current_document() dependency.
     """
-
-    doc = document_repo.get_owned_document_by_id(
-        db,
-        doc_id,
-        user_id,
-    )
-
-    if not doc:
-        return None
 
     if file_name is None and mime_type is None:
         return doc
@@ -456,22 +454,18 @@ def update_document_service(
 
 def delete_document_service(
     db: Session,
-    doc_id: str,
-    user_id: str,
+    doc: Document,
 ) -> bool:
+    """
+    Delete a document or folder tree.
 
-    doc = document_repo.get_owned_document_by_id(
-        db,
-        doc_id,
-        user_id,
-    )
-
-    if not doc:
-        return False
+    Ownership has already been validated by
+    get_current_document() dependency.
+    """
 
     _delete_recursive(
-        db,
-        doc,
+        db=db,
+        doc=doc,
     )
 
     return True
@@ -492,8 +486,8 @@ def _delete_recursive(
         for child in children:
 
             _delete_recursive(
-                db,
-                child,
+                db=db,
+                doc=child,
             )
 
     else:

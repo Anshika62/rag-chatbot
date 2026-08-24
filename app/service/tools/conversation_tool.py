@@ -1,6 +1,9 @@
 from langchain_core.tools import tool
 
-from app.repository.conversation_repo import get_last_10_messages
+from app.repository.conversation_repo import (
+    get_last_10_messages,
+)
+
 from app.service.tools.search_kb import (
     create_search_knowledge_base_tool,
 )
@@ -11,13 +14,27 @@ def create_conversation_tools(
     user_id: str,
     conversation_id: str,
 ):
+    """
+    Create tools available to the current conversation.
+
+    user_id and conversation_id are supplied by the
+    authenticated/validated application context.
+
+    These values are NOT exposed as LLM tool arguments.
+    """
+
     @tool
     def get_conversation_history() -> str:
-        """Fetch recent messages from the current conversation."""
+        """
+        Fetch recent messages from the current conversation.
+
+        The conversation context is injected by the application
+        and is not provided by the LLM.
+        """
 
         messages = get_last_10_messages(
             db=db,
-            conversation_id=conversation_id,
+            conversation_id=str(conversation_id),
         )
 
         if not messages:

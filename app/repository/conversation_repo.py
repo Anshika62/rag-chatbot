@@ -4,18 +4,14 @@ from app.models.conversation import Conversation
 from app.models.message import Message
 
 
-# ============================================================
-# CREATE CONVERSATION
-# ============================================================
-
 def create_conversation(
     db: Session,
     user_id: str,
-    title: str | None
+    title: str | None = None,
 ):
     conversation = Conversation(
         user_id=user_id,
-        title=title
+        title=title,
     )
 
     db.add(conversation)
@@ -29,16 +25,17 @@ def create_conversation(
 # CREATE MESSAGE
 # ============================================================
 
+
 def create_message(
     db: Session,
     conversation_id: str,
     role: str,
-    content: str
+    content: str,
 ):
     message = Message(
         conversation_id=conversation_id,
         role=role,
-        content=content
+        content=content,
     )
 
     db.add(message)
@@ -52,16 +49,17 @@ def create_message(
 # GET SINGLE CONVERSATION
 # ============================================================
 
+
 def get_conversation(
     db: Session,
     conversation_id: str,
-    user_id: str
+    user_id: str,
 ):
     return (
         db.query(Conversation)
         .filter(
-            Conversation.id == conversation_id,
-            Conversation.user_id == user_id
+            Conversation.id == str(conversation_id),
+            Conversation.user_id == str(user_id),
         )
         .first()
     )
@@ -71,17 +69,18 @@ def get_conversation(
 # GET ALL CONVERSATIONS FOR USER
 # ============================================================
 
+
 def get_conversations_by_user(
     db: Session,
-    user_id: str
+    user_id: str,
 ):
     return (
         db.query(Conversation)
         .filter(
-            Conversation.user_id == user_id
+            Conversation.user_id == str(user_id),
         )
         .order_by(
-            Conversation.updated_at.desc()
+            Conversation.updated_at.desc(),
         )
         .all()
     )
@@ -91,42 +90,42 @@ def get_conversations_by_user(
 # GET LAST 10 MESSAGES
 # ============================================================
 
+
 def get_last_10_messages(
     db: Session,
-    conversation_id: str
+    conversation_id: str,
 ):
     messages = (
         db.query(Message)
         .filter(
-            Message.conversation_id == conversation_id
+            Message.conversation_id == str(conversation_id),
         )
         .order_by(
-            Message.created_at.desc()
+            Message.created_at.desc(),
         )
         .limit(10)
         .all()
     )
 
-    return list(
-        reversed(messages)
-    )
+    return list(reversed(messages))
 
 
 # ============================================================
 # GET ALL MESSAGES
 # ============================================================
 
+
 def get_all_messages(
     db: Session,
-    conversation_id: str
+    conversation_id: str,
 ):
     return (
         db.query(Message)
         .filter(
-            Message.conversation_id == conversation_id
+            Message.conversation_id == str(conversation_id),
         )
         .order_by(
-            Message.created_at.asc()
+            Message.created_at.asc(),
         )
         .all()
     )
@@ -136,17 +135,18 @@ def get_all_messages(
 # UPDATE CONVERSATION TITLE
 # ============================================================
 
+
 def update_conversation_title(
     db: Session,
     conversation_id: str,
     user_id: str,
-    title: str
+    title: str,
 ):
     conversation = (
         db.query(Conversation)
         .filter(
-            Conversation.id == conversation_id,
-            Conversation.user_id == user_id
+            Conversation.id == str(conversation_id),
+            Conversation.user_id == str(user_id),
         )
         .first()
     )
@@ -166,16 +166,17 @@ def update_conversation_title(
 # DELETE CONVERSATION
 # ============================================================
 
+
 def delete_conversation(
     db: Session,
     conversation_id: str,
-    user_id: str
+    user_id: str,
 ):
     conversation = (
         db.query(Conversation)
         .filter(
-            Conversation.id == conversation_id,
-            Conversation.user_id == user_id
+            Conversation.id == str(conversation_id),
+            Conversation.user_id == str(user_id),
         )
         .first()
     )

@@ -14,10 +14,14 @@ from fastapi import (
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.security import verify_token
 from app.core.response import success_response
+from app.core.dependency import (
+    get_current_user,
+    get_current_document,
+)
 
-from app.repository.user_repo import get_user_by_email
+from app.models.document import Document
+
 from app.repository import document_repo
 
 from app.schemas.document import (
@@ -36,29 +40,6 @@ router = APIRouter(
 
 
 # ============================================================
-# CURRENT USER
-# ============================================================
-
-
-def _get_current_user(
-    db: Session,
-    email: str,
-):
-    user = get_user_by_email(
-        db=db,
-        email=email,
-    )
-
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
-
-    return user
-
-
-# ============================================================
 # CREATE FOLDER
 # ============================================================
 
@@ -70,13 +51,8 @@ def _get_current_user(
 def create_folder(
     payload: FolderCreate,
     db: Session = Depends(get_db),
-    email: str = Depends(verify_token),
+    user=Depends(get_current_user),
 ):
-    user = _get_current_user(
-        db=db,
-        email=email,
-    )
-
     folder = doc_service.create_folder_service(
         db=db,
         file_name=payload.file_name,
@@ -113,13 +89,8 @@ def upload_document(
     parent_id: Optional[str] = Form(None),
     conversation_id: Optional[str] = Form(None),
     db: Session = Depends(get_db),
-    email: str = Depends(verify_token),
+    user=Depends(get_current_user),
 ):
-    user = _get_current_user(
-        db=db,
-        email=email,
-    )
-
     try:
         doc = doc_service.upload_document_service(
             db=db,
@@ -170,19 +141,14 @@ def list_documents(
         description="Items per page (max 100)",
     ),
     db: Session = Depends(get_db),
-    email: str = Depends(verify_token),
+    user=Depends(get_current_user),
 ):
-    user = _get_current_user(
-        db=db,
-        email=email,
-    )
-
     skip = (page - 1) * page_size
 
     items, total = document_repo.list_documents_by_parent(
-        db,
-        parent_id,
-        user.id,
+        db=db,
+        parent_id=parent_id,
+        user_id=user.id,
         skip=skip,
         limit=page_size,
     )
@@ -220,31 +186,12 @@ def list_documents(
     response_model=DocumentOut,
 )
 def get_document(
-    document_id: str,
-    db: Session = Depends(get_db),
-    email: str = Depends(verify_token),
+    document: Document = Depends(get_current_document),
 ):
-    user = _get_current_user(
-        db=db,
-        email=email,
-    )
-
-    doc = document_repo.get_owned_document_by_id(
-        db,
-        document_id,
-        user.id,
-    )
-
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document not found",
-        )
-
     return success_response(
         message="Document fetched successfully",
         data=DocumentOut.model_validate(
-            doc
+            document
         ).model_dump(mode="json"),
     )
 
@@ -261,27 +208,15 @@ def get_document(
 def update_document(
     document_id: str,
     payload: DocumentUpdate,
+    document: Document = Depends(get_current_document),
     db: Session = Depends(get_db),
-    email: str = Depends(verify_token),
 ):
-    user = _get_current_user(
-        db=db,
-        email=email,
-    )
-
     doc = doc_service.update_document_service(
         db=db,
-        doc_id=document_id,
-        user_id=user.id,
+        doc=document,
         file_name=payload.file_name,
         mime_type=payload.mime_type,
     )
-
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document not found",
-        )
 
     return success_response(
         message="Document updated successfully",
@@ -301,25 +236,13 @@ def update_document(
 )
 def delete_document(
     document_id: str,
+    document: Document = Depends(get_current_document),
     db: Session = Depends(get_db),
-    email: str = Depends(verify_token),
 ):
-    user = _get_current_user(
+    doc_service.delete_document_service(
         db=db,
-        email=email,
+        doc=document,
     )
-
-    deleted = doc_service.delete_document_service(
-        db=db,
-        doc_id=document_id,
-        user_id=user.id,
-    )
-
-    if not deleted:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document not found",
-        )
 
     return success_response(
         message="Document deleted successfully",

@@ -1,23 +1,29 @@
 import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    status,
+)
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.response import success_response
-from app.core.security import verify_token
+from app.core.dependency import (
+    get_current_user,
+    get_current_conversation,
+)
 
 from app.repository.conversation_repo import (
     create_conversation,
     delete_conversation,
     get_all_messages,
-    get_conversation,
     get_conversations_by_user,
     update_conversation_title,
 )
-from app.repository.user_repo import get_user_by_email
 
 from app.schemas.conversation_schema import (
     ConversationTitleUpdate,
@@ -36,38 +42,25 @@ router = APIRouter(
 logger = logging.getLogger(__name__)
 
 
-def _get_current_user(
-    db: Session,
-    email: str,
-):
-    user = get_user_by_email(
-        db=db,
-        email=email,
-    )
-
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
-
-    return user
+# ============================================================
+# SEND MESSAGE
+# ============================================================
 
 
 @router.post("")
 def send_message(
     request: QueryRequest,
     db: Session = Depends(get_db),
-    email: str = Depends(verify_token),
+    user=Depends(get_current_user),
 ):
-    user = _get_current_user(
-        db=db,
-        email=email,
-    )
-
     conversation_id = request.conversation_id
 
+    # --------------------------------------------------------
+    # Create conversation if conversation_id is not provided
+    # --------------------------------------------------------
+
     if conversation_id is None:
+
         title = generate_title(
             request.question,
         )
@@ -78,13 +71,20 @@ def send_message(
             title=title,
         )
 
-        conversation_id = conversation.id
+        conversation_id = str(conversation.id)
+
+    # --------------------------------------------------------
+    # Verify existing conversation ownership
+    # --------------------------------------------------------
 
     else:
+
+        from app.repository.conversation_repo import get_conversation
+
         conversation = get_conversation(
             db=db,
-            conversation_id=conversation_id,
-            user_id=user.id,
+            conversation_id=str(conversation_id),
+            user_id=str(user.id),
         )
 
         if not conversation:
@@ -93,14 +93,23 @@ def send_message(
                 detail="Conversation not found",
             )
 
+        conversation_id = str(conversation.id)
+
+    # --------------------------------------------------------
+    # SSE event generator
+    # --------------------------------------------------------
+
     def event_generator():
+
         try:
+
             for event_data in query_documents_stream(
                 question=request.question,
                 db=db,
-                user_id=user.id,
+                user_id=str(user.id),
                 conversation_id=conversation_id,
             ):
+
                 event_name = event_data.get(
                     "event",
                     "message",
@@ -112,6 +121,7 @@ def send_message(
                 )
 
         except Exception:
+
             logger.exception(
                 "Conversation streaming failed: "
                 "conversation_id=%s, user_id=%s",
@@ -145,24 +155,24 @@ def send_message(
     )
 
 
+# ============================================================
+# LIST CONVERSATIONS
+# ============================================================
+
+
 @router.get("")
 def list_conversations(
     db: Session = Depends(get_db),
-    email: str = Depends(verify_token),
+    user=Depends(get_current_user),
 ):
-    user = _get_current_user(
-        db=db,
-        email=email,
-    )
-
     conversations = get_conversations_by_user(
         db=db,
-        user_id=user.id,
+        user_id=str(user.id),
     )
 
     data = [
         {
-            "conversation_id": conversation.id,
+            "conversation_id": str(conversation.id),
             "title": conversation.title,
             "created_at": conversation.created_at.isoformat(),
             "updated_at": conversation.updated_at.isoformat(),
@@ -177,44 +187,31 @@ def list_conversations(
     )
 
 
+# ============================================================
+# GET CONVERSATION DETAIL
+# ============================================================
+
+
 @router.get("/{conversation_id}")
 def get_conversation_detail(
-    conversation_id: str,
+    conversation=Depends(get_current_conversation),
     db: Session = Depends(get_db),
-    email: str = Depends(verify_token),
 ):
-    user = _get_current_user(
-        db=db,
-        email=email,
-    )
-
-    conversation = get_conversation(
-        db=db,
-        conversation_id=conversation_id,
-        user_id=user.id,
-    )
-
-    if not conversation:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Conversation not found",
-        )
-
     messages = get_all_messages(
         db=db,
-        conversation_id=conversation_id,
+        conversation_id=str(conversation.id),
     )
 
     return success_response(
         message="Conversation fetched successfully",
         data={
-            "conversation_id": conversation.id,
+            "conversation_id": str(conversation.id),
             "title": conversation.title,
             "created_at": conversation.created_at.isoformat(),
             "updated_at": conversation.updated_at.isoformat(),
             "messages": [
                 {
-                    "message_id": message.id,
+                    "message_id": str(message.id),
                     "role": message.role,
                     "content": message.content,
                     "created_at": message.created_at.isoformat(),
@@ -226,63 +223,44 @@ def get_conversation_detail(
     )
 
 
+# ============================================================
+# UPDATE CONVERSATION TITLE
+# ============================================================
+
+
 @router.patch("/{conversation_id}")
 def update_title(
-    conversation_id: str,
     request: ConversationTitleUpdate,
+    conversation=Depends(get_current_conversation),
     db: Session = Depends(get_db),
-    email: str = Depends(verify_token),
 ):
-    user = _get_current_user(
-        db=db,
-        email=email,
-    )
+    conversation.title = request.title
 
-    conversation = update_conversation_title(
-        db=db,
-        conversation_id=conversation_id,
-        user_id=user.id,
-        title=request.title,
-    )
-
-    if not conversation:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Conversation not found",
-        )
+    db.commit()
+    db.refresh(conversation)
 
     return success_response(
         message="Title updated successfully",
         data={
-            "conversation_id": conversation.id,
+            "conversation_id": str(conversation.id),
             "title": conversation.title,
         },
         status_code=status.HTTP_200_OK,
     )
 
 
+# ============================================================
+# DELETE CONVERSATION
+# ============================================================
+
+
 @router.delete("/{conversation_id}")
 def delete_conversation_endpoint(
-    conversation_id: str,
+    conversation=Depends(get_current_conversation),
     db: Session = Depends(get_db),
-    email: str = Depends(verify_token),
 ):
-    user = _get_current_user(
-        db=db,
-        email=email,
-    )
-
-    deleted = delete_conversation(
-        db=db,
-        conversation_id=conversation_id,
-        user_id=user.id,
-    )
-
-    if not deleted:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Conversation not found",
-        )
+    db.delete(conversation)
+    db.commit()
 
     return success_response(
         message="Conversation deleted successfully",
