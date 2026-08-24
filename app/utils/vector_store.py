@@ -1,3 +1,6 @@
+# app/utils/vector_store.py
+# SIRF `search()` METHOD change hua hai, baaki poora file same hai
+
 import os
 import uuid
 from typing import List
@@ -43,10 +46,6 @@ class Vectorstore:
 
         self._create_collection()
 
-    # =========================================================
-    # COLLECTION
-    # =========================================================
-
     def _create_collection(self):
 
         collections = self.client.get_collections()
@@ -67,10 +66,6 @@ class Vectorstore:
             )
 
         self._ensure_indexes()
-
-    # =========================================================
-    # PAYLOAD INDEXES
-    # =========================================================
 
     def _ensure_indexes(self):
 
@@ -112,7 +107,6 @@ class Vectorstore:
 
                 error_message = str(e).lower()
 
-                # Index already exists
                 if (
                     "already exists" in error_message
                     or "already exist" in error_message
@@ -129,10 +123,6 @@ class Vectorstore:
                     )
 
                     raise
-
-    # =========================================================
-    # ADD DOCUMENT CHUNKS
-    # =========================================================
 
     def add_documents(
         self,
@@ -176,10 +166,6 @@ class Vectorstore:
             collection_name=self.collection_name,
             points=points
         )
-
-    # =========================================================
-    # ADD CONVERSATION MESSAGES
-    # =========================================================
 
     def add_conversation_messages(
         self,
@@ -232,19 +218,24 @@ class Vectorstore:
         )
 
     # =========================================================
-    # SEARCH DOCUMENTS
+    # SEARCH DOCUMENTS  <-- CHANGED
+    #
+    # Ab sirf user_id se search hota hai, conversation_id se
+    # nahi. Matlab jo bhi document/image kabhi is user ne
+    # upload kiya hai, wo kisi bhi conversation se query hone
+    # par mil jayega -- manual conversation_id matching ki
+    # zaroorat nahi.
     # =========================================================
 
     def search(
         self,
         query_embedding,
         user_id: str,
-        conversation_id: str,
+        conversation_id: str | None = None,
         top_k: int = 3
     ):
 
         user_id = str(user_id)
-        conversation_id = str(conversation_id)
 
         document_filter = Filter(
             must=[
@@ -252,12 +243,6 @@ class Vectorstore:
                     key="user_id",
                     match=MatchValue(
                         value=user_id
-                    )
-                ),
-                FieldCondition(
-                    key="conversation_id",
-                    match=MatchValue(
-                        value=conversation_id
                     )
                 ),
                 FieldCondition(
@@ -279,7 +264,9 @@ class Vectorstore:
         return results.points
 
     # =========================================================
-    # SEARCH CONVERSATION HISTORY
+    # SEARCH CONVERSATION HISTORY (unchanged -- ye conversation
+    # ke hisaab se hi rehna chahiye, kyuki ye chat-turn memory
+    # hai, document library nahi)
     # =========================================================
 
     def search_conversation_history(
