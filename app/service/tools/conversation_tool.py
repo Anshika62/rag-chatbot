@@ -6,8 +6,10 @@ from app.repository.conversation_repo import (
 
 from app.service.tools.search_kb import (
     create_search_knowledge_base_tool,
+    
 )
-
+from app.service.tools.datetime_tool import get_current_datetime
+from app.service.tools.weather_tool import get_weather
 
 def create_conversation_tools(
     db,
@@ -53,4 +55,6 @@ def create_conversation_tools(
     return [
         get_conversation_history,
         search_knowledge_base,
+        get_current_datetime,
+        get_weather,
     ]
