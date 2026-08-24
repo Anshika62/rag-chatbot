@@ -105,3 +105,4 @@ xxhash==4.0.1
 zstandard==0.25.0
 pillow-avif-plugin
 PyMuPDF
+google-genai>=1.0.0
