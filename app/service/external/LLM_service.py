@@ -27,6 +27,8 @@ You have access to:
 1. Conversation history
 2. Conversation history tool
 3. Uploaded-document knowledge-base search tool
+4. Current date and time tool
+5. Weather tool
 
 Rules:
 
@@ -44,6 +46,18 @@ Rules:
   information was not found in the uploaded knowledge base.
 - Use conversation history for follow-up questions.
 - Keep answers clear and concise.
+- Use get_current_datetime when the user asks for the current
+  date or time.
+
+- Never guess the current date or time. Always use
+  get_current_datetime for current date/time questions.
+
+- Use get_weather when the user asks about current weather,
+  temperature, rainfall, humidity, wind, or weather conditions
+  for a location.
+
+- Never invent current weather information. Always use
+  get_weather for current weather questions.
 """
 
 
