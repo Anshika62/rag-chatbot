@@ -11,7 +11,7 @@ origins = [
     "http://localhost:3000",   # React/Next frontend
     "http://localhost:5173",   # Vite frontend
     "https://your-frontend-domain.com",  # deployed frontend
-    "https://chat-bot-three-topaz.vercel.app/"
+    "https://chat-bot-three-topaz.vercel.app"
 ]
 
 app.add_middleware(
