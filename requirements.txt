@@ -106,3 +106,4 @@ zstandard==0.25.0
 pillow-avif-plugin
 PyMuPDF
 google-genai
+openpyxl
