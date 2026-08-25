@@ -30,7 +30,7 @@ from app.schemas.conversation_schema import (
     QueryRequest,
 )
 
-from app.service.external.LLM_service import generate_title
+from app.service.external.llm_service import generate_title
 from app.service.rag_service import query_documents_stream
 
 

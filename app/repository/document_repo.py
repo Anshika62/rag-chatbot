@@ -2,7 +2,8 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
-
+from app.repository import document_repo
+from app.core.database import SessionLocal
 from app.models.document import Document, DocumentStatus
 from app.models.document_chunks import Docs_chunks
 
