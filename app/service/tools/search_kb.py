@@ -8,8 +8,47 @@ from app.service.rag_clients import (
     vector_store,
 )
 
+from app.repository import document_repo
+from app.core.database import SessionLocal
+
 
 logger = logging.getLogger(__name__)
+
+
+def _is_image_query(query: str) -> bool:
+    """
+    Detect whether the user is asking for images,
+    pictures, photos, figures, diagrams, charts, etc.
+    """
+
+    image_keywords = [
+        "image",
+        "images",
+        "picture",
+        "pictures",
+        "photo",
+        "photos",
+        "figure",
+        "figures",
+        "diagram",
+        "diagrams",
+        "chart",
+        "charts",
+        "illustration",
+        "illustrations",
+        "चित्र",
+        "तस्वीर",
+        "फोटो",
+        "इमेज",
+        "डायग्राम",
+    ]
+
+    query_lower = query.lower()
+
+    return any(
+        keyword in query_lower
+        for keyword in image_keywords
+    )
 
 
 def create_search_knowledge_base_tool(
@@ -22,13 +61,15 @@ def create_search_knowledge_base_tool(
     authenticated user and conversation.
 
     user_id, conversation_id, and (optionally) document_id are
-    injected by the application and are NOT exposed as LLM tool
-    arguments.
+    injected by the application and are NOT exposed as LLM
+    tool arguments.
 
-    When document_id is provided, results are scoped to that one
-    uploaded document (matching either its own document_id, or,
-    for images extracted from a PDF, their parent_document_id) —
-    used for "ask about this specific file" style queries.
+    When document_id is provided, results are scoped to that
+    uploaded document.
+
+    For image-related queries on a specific PDF, the tool
+    directly retrieves image child documents instead of relying
+    on semantic/vector search.
     """
 
     user_id = str(user_id)
@@ -43,6 +84,9 @@ def create_search_knowledge_base_tool(
         """
         Search uploaded documents and indexed knowledge base
         for relevant information.
+
+        For image-related queries on a specific document,
+        returns the extracted image documents directly.
         """
 
         # ----------------------------------------------------
@@ -65,6 +109,9 @@ def create_search_knowledge_base_tool(
 
         # Never allow the LLM to request an excessive number
         # of vector-search results.
+        #
+        # This limit applies to normal vector search.
+        # Image retrieval below returns all extracted images.
         limit = min(limit, 4)
 
         clean_query = query.strip()
@@ -79,6 +126,130 @@ def create_search_knowledge_base_tool(
             document_id,
         )
 
+        # ====================================================
+        # DIRECT PDF IMAGE RETRIEVAL
+        # ====================================================
+        #
+        # If this is a specific document query and the user is
+        # asking for images, don't use semantic search.
+        #
+        # Instead:
+        #
+        # PDF
+        #   ├── image 1
+        #   ├── image 2
+        #   ├── image 3
+        #   └── ...
+        #
+        # are retrieved directly using parent_id.
+        # ====================================================
+
+        if document_id and _is_image_query(clean_query):
+
+            db = SessionLocal()
+
+            try:
+                # ------------------------------------------------
+                # Verify that the document belongs to the user
+                # ------------------------------------------------
+
+                parent_doc = document_repo.get_owned_document_by_id(
+                    db=db,
+                    doc_id=document_id,
+                    user_id=user_id,
+                )
+
+                if not parent_doc:
+                    return [
+                        {
+                            "filename": None,
+                            "chunk_index": None,
+                            "text": "Document not found.",
+                        }
+                    ]
+
+                # ------------------------------------------------
+                # Get all children of the PDF
+                # ------------------------------------------------
+
+                children = document_repo.get_children(
+                    db=db,
+                    parent_id=parent_doc.id,
+                )
+
+                # ------------------------------------------------
+                # Keep only image documents
+                # ------------------------------------------------
+
+                image_docs = [
+                    doc
+                    for doc in children
+                    if (
+                        not doc.is_folder
+                        and doc.mime_type
+                        and doc.mime_type.startswith("image/")
+                    )
+                ]
+
+                logger.info(
+                    "PDF IMAGE RETRIEVAL: "
+                    "document_id=%s image_count=%s",
+                    document_id,
+                    len(image_docs),
+                )
+
+                # ------------------------------------------------
+                # Format image results
+                # ------------------------------------------------
+
+                documents: list[dict[str, Any]] = []
+
+                for image_doc in image_docs:
+                    documents.append(
+                        {
+                            "filename": image_doc.file_name,
+                            "chunk_index": None,
+                            "text": (
+                                f"Image extracted from "
+                                f"{parent_doc.file_name}"
+                            ),
+                            "document_id": str(image_doc.id),
+                            "parent_document_id": str(
+                                parent_doc.id
+                            ),
+                            "content_type": image_doc.mime_type,
+                            "gcs_path": image_doc.gcs_path,
+                        }
+                    )
+
+                # ------------------------------------------------
+                # No images found
+                # ------------------------------------------------
+
+                if not documents:
+                    return [
+                        {
+                            "filename": None,
+                            "chunk_index": None,
+                            "text": (
+                                "No images were found in this PDF."
+                            ),
+                        }
+                    ]
+
+                # ------------------------------------------------
+                # Return ALL images
+                # ------------------------------------------------
+
+                return documents
+
+            finally:
+                db.close()
+
+        # ====================================================
+        # NORMAL SEMANTIC / VECTOR SEARCH
+        # ====================================================
+
         # ----------------------------------------------------
         # Generate query embedding
         # ----------------------------------------------------
@@ -90,24 +261,14 @@ def create_search_knowledge_base_tool(
         # ----------------------------------------------------
         # Search Qdrant
         #
-        # user_id is always enforced — a user can never search
-        # another user's documents.
+        # user_id is always enforced.
         #
         # conversation_id normally scopes the search to the
-        # current conversation (avoids diluting results with
-        # chunks from the user's other conversations). But when
-        # document_id is explicitly requested, we deliberately
-        # DON'T pass conversation_id — vector_store.search treats
-        # conversation_id=None as "no conversation filter" — so
-        # the query still finds the document even if it was
-        # originally uploaded under a different conversation_id
-        # than the one the current chat is using. document_id is
-        # already a much narrower, more specific scope than
-        # conversation_id, so this stays safe.
+        # current conversation.
         #
-        # We also pull a larger candidate pool in that case and
-        # filter to the exact document below, so we still end up
-        # with up to `limit` matches from just that document.
+        # When document_id is provided, conversation_id is not
+        # passed because document_id is already the narrower
+        # scope.
         # ----------------------------------------------------
 
         search_top_k = (
@@ -127,14 +288,18 @@ def create_search_knowledge_base_tool(
             top_k=search_top_k,
         )
 
-        # Diagnostic: tells us whether Qdrant returned zero raw
-        # matches at all (conversation_id/user_id filter issue),
-        # vs matches came back but document_id filtering below
-        # drops all of them (document_id/payload mismatch).
+        # ----------------------------------------------------
+        # Diagnostic logging
+        # ----------------------------------------------------
+
         logger.info(
             "KB SEARCH RAW: raw_count=%s sample_payload=%s",
             len(results),
-            (results[0].payload if results else None),
+            (
+                results[0].payload
+                if results
+                else None
+            ),
         )
 
         # ----------------------------------------------------
@@ -152,33 +317,49 @@ def create_search_knowledge_base_tool(
             if not text:
                 continue
 
-            point_document_id = payload.get("document_id")
-            point_parent_id = payload.get("parent_document_id")
+            point_document_id = payload.get(
+                "document_id"
+            )
 
-            # Scope to a single uploaded document when requested.
-            # An image extracted from a PDF is indexed under its
-            # own document_id but keeps parent_document_id pointing
-            # at the PDF, so match on either.
+            point_parent_id = payload.get(
+                "parent_document_id"
+            )
+
+            # ------------------------------------------------
+            # Scope to a single uploaded document
+            # ------------------------------------------------
+
             if document_id:
                 if (
-                     str(point_document_id) != str(document_id)
-                      and str(point_parent_id) != str(document_id)
+                    str(point_document_id)
+                    != str(document_id)
+                    and str(point_parent_id)
+                    != str(document_id)
                 ):
-                      continue
+                    continue
 
             documents.append(
                 {
-                    "filename": payload.get("filename"),
-                    "chunk_index": payload.get("chunk_index"),
+                    "filename": payload.get(
+                        "filename"
+                    ),
+                    "chunk_index": payload.get(
+                        "chunk_index"
+                    ),
                     "text": text,
-                    "document_id":str(point_document_id)
-                    if point_document_id
-                    else None,
-                    "parent_document_id": str(point_parent_id)
-                    if point_parent_id
-                    else None,
-                    # "parent_document_id": point_parent_id,
-                    "content_type": payload.get("content_type"),
+                    "document_id": (
+                        str(point_document_id)
+                        if point_document_id
+                        else None
+                    ),
+                    "parent_document_id": (
+                        str(point_parent_id)
+                        if point_parent_id
+                        else None
+                    ),
+                    "content_type": payload.get(
+                        "content_type"
+                    ),
                 }
             )
 
