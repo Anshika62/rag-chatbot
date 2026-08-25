@@ -130,11 +130,13 @@ class Vectorstore:
         user_id: str,
         document_id: str,
         content_type: str = "text",
+        parent_document_id: str | None = None,
     ):
 
         conversation_id = str(conversation_id)
         user_id = str(user_id)
         document_id = str(document_id)
+        parent_document_id = str(parent_document_id) if parent_document_id else document_id
 
         points = []
 
@@ -152,6 +154,7 @@ class Vectorstore:
                         "user_id": user_id,
                         "conversation_id": conversation_id,
                         "document_id": document_id,
+                        "parent_document_id": parent_document_id,
                         "content_type": content_type,
                     }
                 )
@@ -227,21 +230,38 @@ class Vectorstore:
 
         user_id = str(user_id)
 
-        document_filter = Filter(
-            must=[
+        must_conditions = [
+            FieldCondition(
+                key="user_id",
+                match=MatchValue(
+                    value=user_id
+                )
+            ),
+            FieldCondition(
+                key="type",
+                match=MatchValue(
+                    value="document"
+                )
+            )
+        ]
+
+        # Scope search to the current conversation whenever one is
+        # supplied. Without this, KB search pulls chunks from ALL of
+        # the user's conversations/documents, diluting top_k results
+        # with irrelevant chunks — this was the main cause of the
+        # knowledge-base/PDF answer quality regression.
+        if conversation_id:
+            must_conditions.append(
                 FieldCondition(
-                    key="user_id",
+                    key="conversation_id",
                     match=MatchValue(
-                        value=user_id
-                    )
-                ),
-                FieldCondition(
-                    key="type",
-                    match=MatchValue(
-                        value="document"
+                        value=str(conversation_id)
                     )
                 )
-            ]
+            )
+
+        document_filter = Filter(
+            must=must_conditions
         )
 
         results = self.client.query_points(

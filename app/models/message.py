@@ -40,6 +40,16 @@ class Message(Base):
         nullable=False
     )
 
+    # JSON-encoded list of image references
+    # (document_id, parent_document_id, filename, url) attached to
+    # this message, e.g. images surfaced by the knowledge-base tool.
+    # Stored so they survive a page refresh instead of only living
+    # in the live SSE stream / frontend state.
+    images = Column(
+        Text,
+        nullable=True
+    )
+
     created_at = Column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc)

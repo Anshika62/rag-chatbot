@@ -49,11 +49,25 @@ Rules:
 - If the user asks about an uploaded document, PDF, file, policy, manual,
   FAQ, guideline, documentation, or indexed content, search the knowledge
   base before answering.
-- Use the retrieved document content as the source of truth for
+
+- Use retrieved document content as the source of truth for
   document-related questions.
 - Do not invent information from uploaded documents.
-- If the knowledge-base search finds no relevant information, say that the
-  information was not found in the uploaded knowledge base.
+
+- When search_knowledge_base returns an image result, use its
+  caption/text to answer the question and treat the returned
+  image metadata as the related image.
+
+- Do not confuse an image document_id with its parent PDF
+  document_id.
+
+- If the user asks about an image inside a PDF, use the image
+  result whose parent_document_id matches the PDF.
+
+- If the knowledge-base search finds no relevant information,
+  say that the information was not found in the uploaded
+  knowledge base.
+  
 - Use conversation history for follow-up questions.
 - Keep answers clear and concise.
 - Use get_current_datetime when the user asks for the current
@@ -123,6 +137,7 @@ def _create_tools(
     db=None,
     user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    document_id: Optional[str] = None,
 ):
     if (
         db is None
@@ -135,6 +150,11 @@ def _create_tools(
         db=db,
         user_id=str(user_id),
         conversation_id=str(conversation_id),
+        document_id=(
+            str(document_id)
+            if document_id
+            else None
+        ),
     )
 
 
@@ -237,12 +257,19 @@ def _execute_tool_calls(
                     and item.get("content_type") == "image"
                     and item.get("document_id")
                 ):
+                    image_document_id =str(item.get("document_id"))
 
                     collected_images.append(
                         {
                             "document_id": item.get("document_id"),
+                            "parent_document_id": (
+                                item.get("parent_document_id")
+                                or item.get("document_id")
+                            ),
                             "filename": item.get("filename"),
-                            "url": f"/documents/{item.get('document_id')}/file",
+                            "url": (
+                            f"/documents/"
+                            f"{image_document_id}/file"),
                         }
                     )
 
@@ -268,7 +295,19 @@ def generate_answer(
     db=None,
     user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    images_output: Optional[list] = None,
+    document_id: Optional[str] = None,
 ):
+    """
+    images_output: if a list is passed in, it is extended in-place
+    with any image references collected from tool calls, mirroring
+    generate_answer_stream's behaviour.
+
+    document_id: if provided, scopes the knowledge-base search tool
+    to that single uploaded document instead of the whole
+    conversation's knowledge base.
+    """
+
     try:
 
         messages = _build_messages(
@@ -280,6 +319,7 @@ def generate_answer(
             db=db,
             user_id=user_id,
             conversation_id=conversation_id,
+            document_id=document_id,
         )
 
         llm_with_tools = _bind_tools(tools)
@@ -304,13 +344,16 @@ def generate_answer(
             response
         ]
 
-        extra_messages, _images = _execute_tool_calls(
+        extra_messages, collected_images = _execute_tool_calls(
             tools=tools,
             tool_calls=response.tool_calls,
             conversation_id=conversation_id,
         )
 
         tool_messages.extend(extra_messages)
+
+        if images_output is not None:
+            images_output.extend(collected_images)
 
         final_response = llm_with_tools.invoke(
             messages + tool_messages
@@ -420,12 +463,17 @@ def generate_answer_stream(
     user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     images_output: Optional[list] = None,
+    document_id: Optional[str] = None,
 ) -> Generator[str, None, None]:
     """
     images_output: if a list is passed in, it is extended in-place
     with any image references collected from tool calls (e.g.
     knowledge-base image chunks), so the caller can read it after
     the generator is exhausted and attach it to the final response.
+
+    document_id: if provided, scopes the knowledge-base search tool
+    to that single uploaded document instead of the whole
+    conversation's knowledge base.
     """
 
     try:
@@ -439,6 +487,7 @@ def generate_answer_stream(
             db=db,
             user_id=user_id,
             conversation_id=conversation_id,
+            document_id=document_id,
         )
 
         llm_with_tools = _bind_tools(tools)
@@ -635,59 +684,3 @@ Rules:
         )
 
         return question[:50]
-
-def _execute_tool_calls(
-    tools: list,
-    tool_calls: list,
-    conversation_id: Optional[str],
-    log_prefix: str = "",
-):
-    tool_messages = []
-    collected_images = []
-
-    for tool_call in tool_calls:
-
-        tool_name = tool_call["name"]
-        tool_args = tool_call.get("args", {})
-
-        selected_tool = _get_tool(tools=tools, tool_name=tool_name)
-
-        if selected_tool is None:
-            raise RuntimeError(f"Requested tool not found: {tool_name}")
-
-        logger.info(
-            "%sTOOL EXECUTING: tool=%s args=%s conversation_id=%s",
-            log_prefix, tool_name, tool_args, conversation_id,
-        )
-
-        tool_result = selected_tool.invoke(tool_args)
-
-        logger.info(
-            "%sTOOL RESULT: tool=%s conversation_id=%s",
-            log_prefix, tool_name, conversation_id,
-        )
-
-        # collect image references returned by search_knowledge_base
-        if tool_name == "search_knowledge_base" and isinstance(tool_result, list):
-
-            for item in tool_result:
-
-                if isinstance(item, dict) and item.get("content_type") == "image":
-
-                    collected_images.append(
-                        {
-                            "document_id": item.get("document_id"),
-                            "filename": item.get("filename"),
-                            "url": item.get("file_url"),
-                        }
-                    )
-
-        tool_messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": tool_call["id"],
-                "content": str(tool_result),
-            }
-        )
-
-    return tool_messages, collected_images

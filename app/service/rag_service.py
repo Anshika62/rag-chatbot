@@ -23,6 +23,7 @@ def query_documents(
     db: Session,
     user_id: str,
     conversation_id: str,
+    document_id: str | None = None,
 ):
     try:
         if not question or not question.strip():
@@ -65,12 +66,16 @@ def query_documents(
             content=question,
         )
 
+        images_output: list = []
+
         answer = generate_answer(
             question=question,
             chat_history=chat_history,
             db=db,
             user_id=user_id,
             conversation_id=conversation_id,
+            images_output=images_output,
+            document_id=document_id,
         )
 
         assistant_message = create_message(
@@ -78,6 +83,7 @@ def query_documents(
             conversation_id=conversation_id,
             role="assistant",
             content=answer,
+            images=images_output,
         )
 
         return {
@@ -86,6 +92,7 @@ def query_documents(
             "assistant_message_id": assistant_message.id,
             "question": question,
             "answer": answer,
+            "images": images_output,
         }
 
     except HTTPException:
@@ -110,6 +117,7 @@ def query_documents_stream(
     db: Session,
     user_id: str,
     conversation_id: str,
+    document_id: str | None = None,
 ):
     try:
         if not question or not question.strip():
@@ -121,6 +129,7 @@ def query_documents_stream(
                 "message_id": None,
                 "delta": None,
                 "text_content": "Question cannot be empty",
+                "images": [],
             }
             return
 
@@ -141,6 +150,7 @@ def query_documents_stream(
                 "message_id": None,
                 "delta": None,
                 "text_content": "Conversation not found",
+                "images": [],
             }
             return
 
@@ -165,6 +175,7 @@ def query_documents_stream(
             "message_id": None,
             "delta": None,
             "text_content": "",
+            "images": [],
         }
 
         user_message = create_message(
@@ -175,6 +186,7 @@ def query_documents_stream(
         )
 
         full_answer = ""
+        images_output: list = []
 
         for chunk in generate_answer_stream(
             question=question,
@@ -182,6 +194,8 @@ def query_documents_stream(
             db=db,
             user_id=user_id,
             conversation_id=conversation_id,
+            images_output=images_output,
+            document_id=document_id,
         ):
             if not chunk:
                 continue
@@ -196,16 +210,21 @@ def query_documents_stream(
                 "message_id": user_message.id,
                 "delta": chunk,
                 "text_content": full_answer,
+                "images": [],
             }
 
         if not full_answer.strip():
             full_answer = "I was unable to generate a response."
 
+        # Persist images alongside the assistant message so they are
+        # still there after a page refresh (GET /conversation/{id}),
+        # not just during the live SSE stream.
         assistant_message = create_message(
             db=db,
             conversation_id=conversation_id,
             role="assistant",
             content=full_answer,
+            images=images_output,
         )
 
         yield {
@@ -216,6 +235,7 @@ def query_documents_stream(
             "message_id": assistant_message.id,
             "delta": None,
             "text_content": full_answer,
+            "images": images_output,
         }
 
     except HTTPException as exc:
@@ -233,6 +253,7 @@ def query_documents_stream(
             "message_id": None,
             "delta": None,
             "text_content": str(exc.detail),
+            "images": [],
         }
 
     except Exception as exc:
@@ -251,4 +272,5 @@ def query_documents_stream(
             "message_id": None,
             "delta": None,
             "text_content": "Internal server error",
+            "images": [],
         }

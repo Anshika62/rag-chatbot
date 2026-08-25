@@ -20,6 +20,31 @@ client = genai.Client(
 
 
 # ============================================================
+# QUOTA-SPECIFIC EXCEPTION
+#
+# Gemini's free tier enforces a PER-DAY request quota (not
+# per-minute), so once it's hit, retrying the next image in the
+# same run will just fail again immediately. Callers that process
+# many images in a loop (e.g. a PDF with many embedded images)
+# can catch this specifically to stop early instead of hammering
+# the API — and logging — once per remaining image.
+# ============================================================
+
+
+class ImageCaptionQuotaExceededError(RuntimeError):
+    """Raised when the image-captioning provider's quota is exhausted."""
+
+
+def _is_quota_exhausted(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "RESOURCE_EXHAUSTED" in message
+        or "429" in message
+        or "quota" in message.lower()
+    )
+
+
+# ============================================================
 # UNIVERSAL IMAGE LOADING
 #
 # Instead of guessing mime type from file extension (fragile,
@@ -84,6 +109,20 @@ def generate_image_caption(
         return response.text or ""
 
     except Exception as exc:
+
+        if _is_quota_exhausted(exc):
+
+            # Don't log a full traceback for every image — the
+            # caller (doc_service) logs ONE summary warning and
+            # stops trying further images for this run.
+            logger.warning(
+                "IMAGE CAPTION QUOTA EXCEEDED: image_path=%s",
+                image_path,
+            )
+
+            raise ImageCaptionQuotaExceededError(
+                f"Image-captioning quota exhausted: {exc}"
+            ) from exc
 
         logger.exception(
             "IMAGE CAPTION ERROR: image_path=%s error=%s",

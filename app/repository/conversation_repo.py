@@ -1,3 +1,5 @@
+import json
+
 from sqlalchemy.orm import Session
 
 from app.models.conversation import Conversation
@@ -31,11 +33,13 @@ def create_message(
     conversation_id: str,
     role: str,
     content: str,
+    images: list | None = None,
 ):
     message = Message(
         conversation_id=conversation_id,
         role=role,
         content=content,
+        images=json.dumps(images) if images else None,
     )
 
     db.add(message)

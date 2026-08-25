@@ -15,12 +15,13 @@ def create_conversation_tools(
     db,
     user_id: str,
     conversation_id: str,
+    document_id: str | None = None,
 ):
     """
     Create tools available to the current conversation.
 
-    user_id and conversation_id are supplied by the
-    authenticated/validated application context.
+    user_id, conversation_id, and (optionally) document_id are
+    supplied by the authenticated/validated application context.
 
     These values are NOT exposed as LLM tool arguments.
     """
@@ -50,6 +51,11 @@ def create_conversation_tools(
     search_knowledge_base = create_search_knowledge_base_tool(
         user_id=str(user_id),
         conversation_id=str(conversation_id),
+        document_id=(
+            str(document_id)
+            if document_id
+            else None
+        ),
     )
 
     return [

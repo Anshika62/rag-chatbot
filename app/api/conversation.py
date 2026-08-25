@@ -108,6 +108,7 @@ def send_message(
                 db=db,
                 user_id=str(user.id),
                 conversation_id=conversation_id,
+                document_id=request.document_id,
             ):
 
                 event_name = event_data.get(
@@ -137,6 +138,7 @@ def send_message(
                 "message_id": None,
                 "delta": None,
                 "text_content": "Internal server error",
+                "images": [],
             }
 
             yield (
@@ -202,6 +204,20 @@ def get_conversation_detail(
         conversation_id=str(conversation.id),
     )
 
+    def _parse_images(raw_images):
+        if not raw_images:
+            return []
+
+        try:
+            return json.loads(raw_images)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Unable to parse stored images JSON for a message "
+                "in conversation_id=%s",
+                conversation.id,
+            )
+            return []
+
     return success_response(
         message="Conversation fetched successfully",
         data={
@@ -214,6 +230,7 @@ def get_conversation_detail(
                     "message_id": str(message.id),
                     "role": message.role,
                     "content": message.content,
+                    "images": _parse_images(message.images),
                     "created_at": message.created_at.isoformat(),
                 }
                 for message in messages
