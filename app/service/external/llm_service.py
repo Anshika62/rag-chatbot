@@ -254,7 +254,8 @@ def _execute_tool_calls(
 
                 if (
                     isinstance(item, dict)
-                    and item.get("content_type") == "image"
+                    and item.get("content_type") 
+                    and item.get("content_type").startswith("image/")
                     and item.get("document_id")
                 ):
                     image_document_id =str(item.get("document_id"))
