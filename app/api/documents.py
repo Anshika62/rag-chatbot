@@ -1,4 +1,6 @@
 from typing import Optional
+import logging
+import os
 
 from fastapi import (
     APIRouter,
@@ -10,7 +12,6 @@ from fastapi import (
     Form,
     status,
 )
-import os
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -38,6 +39,8 @@ router = APIRouter(
     prefix="/documents",
     tags=["Documents"],
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -92,7 +95,53 @@ def upload_document(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
+    """
+    Upload a document.
+
+    Scope rules:
+
+    1. conversation_id is NULL
+       -> Global document.
+       -> Accessible from all conversations.
+
+    2. conversation_id contains a valid conversation ID
+       -> Conversation-scoped document.
+       -> Accessible only from that conversation.
+
+    parent_id is independent from conversation scope.
+    """
+
+    # --------------------------------------------------------
+    # NORMALIZE EMPTY FORM VALUES
+    # --------------------------------------------------------
+
+    if parent_id is not None:
+        parent_id = parent_id.strip() or None
+
+    if conversation_id is not None:
+        conversation_id = conversation_id.strip() or None
+
+    # --------------------------------------------------------
+    # DEBUG REQUEST
+    # --------------------------------------------------------
+
+    logger.info(
+        "DOCUMENT UPLOAD REQUEST | "
+        "file=%r | "
+        "parent_id=%r | "
+        "conversation_id=%r | "
+        "user_id=%r",
+        file.filename,
+        parent_id,
+        conversation_id,
+        user.id,
+    )
+
     try:
+        # ----------------------------------------------------
+        # SERVICE
+        # ----------------------------------------------------
+
         doc = doc_service.upload_document_service(
             db=db,
             file=file,
@@ -102,16 +151,111 @@ def upload_document(
         )
 
     except PermissionError as exc:
+
+        logger.warning(
+            "DOCUMENT UPLOAD FORBIDDEN | "
+            "file=%r | "
+            "parent_id=%r | "
+            "conversation_id=%r | "
+            "user_id=%r | "
+            "error=%s",
+            file.filename,
+            parent_id,
+            conversation_id,
+            user.id,
+            str(exc),
+        )
+
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=str(exc),
         ) from exc
 
+    except ValueError as exc:
+
+        logger.warning(
+            "DOCUMENT UPLOAD BAD REQUEST | "
+            "file=%r | "
+            "parent_id=%r | "
+            "conversation_id=%r | "
+            "user_id=%r | "
+            "error=%s",
+            file.filename,
+            parent_id,
+            conversation_id,
+            user.id,
+            str(exc),
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+
+        logger.exception(
+            "DOCUMENT UPLOAD FAILED | "
+            "file=%r | "
+            "parent_id=%r | "
+            "conversation_id=%r | "
+            "user_id=%r",
+            file.filename,
+            parent_id,
+            conversation_id,
+            user.id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to upload document",
+        ) from exc
+
+    # --------------------------------------------------------
+    # PARENT FOLDER NOT FOUND
+    # --------------------------------------------------------
+
     if not doc:
+
+        logger.warning(
+            "DOCUMENT UPLOAD | Parent folder not found | "
+            "file=%r | parent_id=%r | user_id=%r",
+            file.filename,
+            parent_id,
+            user.id,
+        )
+
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Parent folder not found",
         )
+
+    # --------------------------------------------------------
+    # DEBUG CREATED DOCUMENT
+    # --------------------------------------------------------
+
+    logger.info(
+        "DOCUMENT CREATED | "
+        "document_id=%r | "
+        "file=%r | "
+        "parent_id=%r | "
+        "conversation_id=%r | "
+        "user_id=%r | "
+        "status=%r",
+        str(doc.id),
+        doc.file_name,
+        doc.parent_id,
+        doc.conversation_id,
+        doc.user_id,
+        doc.status,
+    )
+
+    # --------------------------------------------------------
+    # RESPONSE
+    # --------------------------------------------------------
 
     return success_response(
         message="Document uploaded successfully",
@@ -250,7 +394,15 @@ def delete_document(
         data=None,
     )
 
-@router.get("/{document_id}/file")
+
+# ============================================================
+# DOWNLOAD / VIEW DOCUMENT FILE
+# ============================================================
+
+
+@router.get(
+    "/{document_id}/file",
+)
 def get_document_file(
     document: Document = Depends(get_current_document),
 ):
@@ -267,6 +419,9 @@ def get_document_file(
 
     return FileResponse(
         file_path,
-        media_type=document.mime_type or "application/octet-stream",
+        media_type=(
+            document.mime_type
+            or "application/octet-stream"
+        ),
         filename=document.file_name,
     )

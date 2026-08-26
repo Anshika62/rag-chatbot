@@ -74,7 +74,12 @@ def create_search_knowledge_base_tool(
 
     user_id = str(user_id)
     conversation_id = str(conversation_id)
-    document_id = str(document_id) if document_id else None
+
+    document_id = (
+        str(document_id)
+        if document_id
+        else None
+    )
 
     @tool
     def search_knowledge_base(
@@ -112,6 +117,7 @@ def create_search_knowledge_base_tool(
         #
         # This limit applies to normal vector search.
         # Image retrieval below returns all extracted images.
+
         limit = min(limit, 4)
 
         clean_query = query.strip()
@@ -129,7 +135,7 @@ def create_search_knowledge_base_tool(
         # ====================================================
         # DIRECT PDF IMAGE RETRIEVAL
         # ====================================================
-        #
+
         # If this is a specific document query and the user is
         # asking for images, don't use semantic search.
         #
@@ -142,21 +148,32 @@ def create_search_knowledge_base_tool(
         #   └── ...
         #
         # are retrieved directly using parent_id.
-        # ====================================================
 
         if document_id and _is_image_query(clean_query):
 
             db = SessionLocal()
 
             try:
+
                 # ------------------------------------------------
-                # Verify that the document belongs to the user
+                # Verify that the document is accessible
+                # from the current conversation.
+                #
+                # Access is allowed when:
+                #
+                #   1. document belongs to current user
+                #   2. document is global
+                #      OR
+                #   3. document belongs to current conversation
                 # ------------------------------------------------
 
-                parent_doc = document_repo.get_owned_document_by_id(
-                    db=db,
-                    doc_id=document_id,
-                    user_id=user_id,
+                parent_doc = (
+                    document_repo.get_accessible_document_by_id(
+                        db=db,
+                        doc_id=document_id,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                    )
                 )
 
                 if not parent_doc:
@@ -205,6 +222,7 @@ def create_search_knowledge_base_tool(
                 documents: list[dict[str, Any]] = []
 
                 for image_doc in image_docs:
+
                     documents.append(
                         {
                             "filename": image_doc.file_name,
@@ -254,39 +272,48 @@ def create_search_knowledge_base_tool(
         # Generate query embedding
         # ----------------------------------------------------
 
-        query_embedding = embedding_manager.generate_embedding(
-            [clean_query]
+        query_embedding = (
+            embedding_manager.generate_embedding(
+                [clean_query]
+            )
         )
 
         # ----------------------------------------------------
         # Search Qdrant
+        # ----------------------------------------------------
         #
         # user_id is always enforced.
         #
-        # conversation_id normally scopes the search to the
-        # current conversation.
+        # conversation_id is always passed.
         #
-        # When document_id is provided, conversation_id is not
-        # passed because document_id is already the narrower
-        # scope.
+        # document_id is also passed when a specific document
+        # has been selected.
+        #
+        # vector_store.search() now applies the document_id
+        # filter directly inside Qdrant.
         # ----------------------------------------------------
 
-        search_top_k = (
-            max(limit * 5, 20)
-            if document_id
-            else limit
-        )
+        search_top_k = limit
 
         results = vector_store.search(
             query_embedding=query_embedding,
             user_id=user_id,
-            conversation_id=(
-                None
-                if document_id
-                else conversation_id
-            ),
+            conversation_id=conversation_id,
+            document_id=document_id,
             top_k=search_top_k,
         )
+
+        logger.info(
+            "KB SEARCH RESULTS: count=%s",
+            len(results),
+        )
+
+        for point in results:
+
+            logger.info(
+                "KB RESULT PAYLOAD: %s",
+                point.payload,
+            )
 
         # ----------------------------------------------------
         # Diagnostic logging
@@ -326,17 +353,18 @@ def create_search_knowledge_base_tool(
             )
 
             # ------------------------------------------------
-            # Scope to a single uploaded document
+            # Qdrant has already enforced:
+            #
+            #   current user
+            #   conversation/global scope
+            #
+            # and, when document_id is provided:
+            #
+            #   requested document_id
+            #
+            # Therefore we no longer need to retrieve a broad
+            # result set and filter the document afterward.
             # ------------------------------------------------
-
-            if document_id:
-                if (
-                    str(point_document_id)
-                    != str(document_id)
-                    and str(point_parent_id)
-                    != str(document_id)
-                ):
-                    continue
 
             documents.append(
                 {

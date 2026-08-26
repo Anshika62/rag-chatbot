@@ -3,25 +3,26 @@ import io
 import os
 import logging
 from typing import Optional
+
 from PIL import Image
 import fitz  # PyMuPDF
 import pdfplumber
 import openpyxl
 import docx  # python-docx
+
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.models.document import Document, DocumentStatus
 from app.repository import document_repo
-from app.repository.conversation_repo import (
-    create_conversation,
-    get_conversation,
-)
+from app.repository.conversation_repo import get_conversation
+
 from app.service.rag_clients import (
     embedding_manager,
     vector_store,
 )
+
 from app.service.tools.image_tool import (
     generate_image_caption,
     ImageCaptionQuotaExceededError,
@@ -34,12 +35,10 @@ UPLOAD_DIR = "Uploads"
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+
 # Gemini free tier allows only a small number of image-captioning
-# requests PER DAY (not per-minute). Cap how many embedded images
-# a single PDF will caption so one large document can't burn the
-# entire day's quota by itself. Remaining images are still saved
-# as their own Document rows (viewable/downloadable), just without
-# an AI caption / KB search entry.
+# requests PER DAY. Cap how many embedded images a single PDF
+# will caption.
 MAX_PDF_IMAGES_TO_CAPTION = int(
     os.getenv("MAX_PDF_IMAGES_TO_CAPTION", "15")
 )
@@ -60,8 +59,7 @@ IMAGE_EXTENSIONS = {
     ".gif",
 }
 
-# New: additional data types the RAG pipeline can index as plain
-# searchable text, alongside the existing image/pdf handling.
+
 TEXT_EXTENSIONS = {
     ".md",
     ".txt",
@@ -95,6 +93,7 @@ def generate_gcs_path(
     document_id: str,
     original_filename: str,
 ) -> str:
+
     safe_filename = original_filename.replace(
         "/",
         "_",
@@ -141,55 +140,38 @@ def create_folder_service(
 
 
 # ============================================================
-# GET / CREATE CONVERSATION FOR DOCUMENT
+# VALIDATE DOCUMENT CONVERSATION
 # ============================================================
 
 
-def _get_or_create_document_conversation(
+def _validate_document_conversation(
     db: Session,
     conversation_id: Optional[str],
     user_id: str,
-) -> str:
+) -> Optional[str]:
     """
-    Resolve the conversation that will own the uploaded document.
+    Validate the conversation that will own the uploaded document.
 
     Rules:
-    1. If conversation_id is not provided:
-       create a new conversation for the current user.
 
-    2. If conversation_id is provided:
-       verify that the conversation belongs to the current user.
+    1. conversation_id is None:
+       The document is a GLOBAL document.
 
-    3. A user can never attach a document to another user's
+    2. conversation_id is provided:
+       The conversation must belong to the current user.
+
+    3. A document can never be attached to another user's
        conversation.
     """
 
+    # No conversation means GLOBAL document.
     if not conversation_id:
-
-        conversation = create_conversation(
-            db=db,
-            user_id=user_id,
-            title="Document Upload",
-        )
-
-        if not conversation:
-            raise RuntimeError(
-                "Failed to create conversation for document upload"
-            )
-
-        logger.info(
-            "Created new conversation=%s for document upload "
-            "user_id=%s",
-            conversation.id,
-            user_id,
-        )
-
-        return str(conversation.id)
+        return None
 
     conversation = get_conversation(
         db=db,
         conversation_id=str(conversation_id),
-        user_id=user_id,
+        user_id=str(user_id),
     )
 
     if not conversation:
@@ -214,11 +196,23 @@ def upload_document_service(
     user_id: str,
 ) -> Optional[Document]:
 
+    logger.info(
+    "UPLOAD DEBUG | file=%s | parent_id=%r | conversation_id=%r | user_id=%r",
+    file.filename,
+    parent_id,
+    conversation_id,
+    user_id,
+)
+
     if not parent_id:
         parent_id = None
 
     if not conversation_id:
         conversation_id = None
+
+    # --------------------------------------------------------
+    # Global folder validation
+    # --------------------------------------------------------
 
     if parent_id:
 
@@ -231,24 +225,29 @@ def upload_document_service(
         if not parent:
             return None
 
-    try:
+        # A parent folder belongs to the global document space.
+        #
+        # Therefore a conversation document should not be
+        # inserted inside the global document folder.
+        if conversation_id:
+            raise ValueError(
+                "Conversation documents cannot be uploaded "
+                "inside the global document folder"
+            )
 
-        conversation_id = _get_or_create_document_conversation(
-            db=db,
-            conversation_id=conversation_id,
-            user_id=user_id,
-        )
+    # --------------------------------------------------------
+    # Conversation validation
+    # --------------------------------------------------------
 
-    except PermissionError as exc:
+    conversation_id = _validate_document_conversation(
+        db=db,
+        conversation_id=conversation_id,
+        user_id=user_id,
+    )
 
-        logger.warning(
-            "Unauthorized conversation access attempt: "
-            "user_id=%s conversation_id=%s",
-            user_id,
-            conversation_id,
-        )
-
-        raise exc
+    # --------------------------------------------------------
+    # Create document record
+    # --------------------------------------------------------
 
     doc = document_repo.create_file(
         db=db,
@@ -258,6 +257,10 @@ def upload_document_service(
         mime_type=file.content_type,
         conversation_id=conversation_id,
     )
+
+    # --------------------------------------------------------
+    # Save local upload
+    # --------------------------------------------------------
 
     contents = file.file.read()
 
@@ -269,6 +272,10 @@ def upload_document_service(
     with open(file_path, "wb") as f:
         f.write(contents)
 
+    # --------------------------------------------------------
+    # Generate GCS path
+    # --------------------------------------------------------
+
     gcs_path = generate_gcs_path(
         user_id=user_id,
         document_id=doc.id,
@@ -277,6 +284,10 @@ def upload_document_service(
 
     try:
 
+        # ----------------------------------------------------
+        # RAG processing
+        # ----------------------------------------------------
+
         _process_for_rag(
             db=db,
             doc=doc,
@@ -284,6 +295,10 @@ def upload_document_service(
             conversation_id=conversation_id,
             user_id=user_id,
         )
+
+        # ----------------------------------------------------
+        # Mark document READY
+        # ----------------------------------------------------
 
         doc = document_repo.update_file_storage_info(
             db=db,
@@ -324,20 +339,13 @@ def upload_document_service(
 
 # ============================================================
 # RELIABLE FILE-TYPE DETECTION
-#
-# Client-supplied Content-Type header can be wrong/missing
-# depending on the uploading tool (Swagger, curl, browsers).
-# So we sniff actual file bytes first, and only fall back to
-# mime_type / filename extension if sniffing is inconclusive.
 # ============================================================
+
 
 def _sniff_file_type(file_path: str) -> str:
     """
     Returns "image", "pdf", or "unknown" based on the file's
-    actual content — PDF is checked via header bytes, and any
-    image format (jpg/png/webp/gif/avif/heic/bmp/etc.) is
-    checked by attempting to open it with Pillow. This avoids
-    maintaining a manual list of image magic-byte signatures.
+    actual content.
     """
 
     try:
@@ -351,6 +359,7 @@ def _sniff_file_type(file_path: str) -> str:
         return "unknown"
 
     try:
+
         with Image.open(file_path) as img:
             img.verify()
 
@@ -359,6 +368,7 @@ def _sniff_file_type(file_path: str) -> str:
     except Exception:
         return "unknown"
 
+
 def _detect_file_type(
     file_path: str,
     mime_type: Optional[str],
@@ -366,13 +376,6 @@ def _detect_file_type(
 ) -> str:
     """
     Determine which RAG pipeline should process the uploaded file.
-    Tries, in order:
-
-    1. Binary signature sniffing (image/pdf only — most reliable)
-    2. Content-Type header sent by the client
-    3. File extension
-
-    Returns one of: "image", "pdf", "csv", "excel", "text", "unknown".
     """
 
     file_type = _sniff_file_type(file_path)
@@ -421,21 +424,9 @@ def _process_for_rag(
     db: Session,
     doc: Document,
     file_path: str,
-    conversation_id: str,
+    conversation_id: Optional[str],
     user_id: str,
 ) -> None:
-    """
-    Route to the correct RAG-indexing pipeline based on the
-    file's actual detected type (not just the client-supplied
-    mime_type).
-
-    - Standalone image  -> caption via Gemini vision, index caption
-    - PDF                -> extract text (unchanged) + extract
-                             embedded images, caption them, index
-                             text chunks + image captions together
-    - CSV/Excel/Word/Markdown/Text -> extract as plain text, chunk +
-                             index the same way as PDF text chunks
-    """
 
     file_type = _detect_file_type(
         file_path=file_path,
@@ -498,29 +489,40 @@ def _process_image_for_rag(
     db: Session,
     doc: Document,
     file_path: str,
-    conversation_id: str,
+    conversation_id: Optional[str],
     user_id: str,
 ) -> None:
 
     try:
+
         caption = generate_image_caption(file_path)
 
     except ImageCaptionQuotaExceededError:
+
         logger.warning(
             "Image-captioning quota exhausted for document_id=%s "
             "— document uploaded but not caption-indexed yet.",
             doc.id,
         )
+
         return
 
     except Exception:
+
         logger.exception(
-            "Image captioning failed for document_id=%s", doc.id,
+            "Image captioning failed for document_id=%s",
+            doc.id,
         )
+
         return
 
     if not caption or not caption.strip():
-        logger.warning("Empty caption generated for document_id=%s", doc.id)
+
+        logger.warning(
+            "Empty caption generated for document_id=%s",
+            doc.id,
+        )
+
         return
 
     chunks = [caption.strip()]
@@ -531,28 +533,30 @@ def _process_image_for_rag(
         chunks=chunks,
         embeddings=embeddings,
         filename=doc.file_name,
-        conversation_id=str(conversation_id),
+        conversation_id=conversation_id,
         user_id=str(user_id),
         document_id=str(doc.id),
         content_type="image",
-        # Standalone image upload: it IS its own parent.
         parent_document_id=str(doc.id),
     )
 
-    document_repo.create_chunks(db=db, doc_id=doc.id, chunks=chunks)
+    document_repo.create_chunks(
+        db=db,
+        doc_id=doc.id,
+        chunks=chunks,
+    )
 
     logger.info(
-        "Image RAG indexing completed: document_id=%s user_id=%s "
-        "conversation_id=%s", doc.id, user_id, conversation_id,
+        "Image RAG indexing completed: document_id=%s "
+        "user_id=%s conversation_id=%s",
+        doc.id,
+        user_id,
+        conversation_id,
     )
 
 
 # ============================================================
 # SHARED TEXT CHUNKING + INDEXING
-#
-# Same embed -> Qdrant -> Postgres pattern already used for PDF
-# text chunks, pulled out so CSV/Excel/Markdown/Text can reuse it
-# without duplicating the pattern three more times.
 # ============================================================
 
 
@@ -560,18 +564,25 @@ def _chunk_and_index_text(
     db: Session,
     doc: Document,
     text: str,
-    conversation_id: str,
+    conversation_id: Optional[str],
     user_id: str,
 ) -> int:
 
     if not text or not text.strip():
-        logger.warning("No extractable text for document_id=%s", doc.id)
+
+        logger.warning(
+            "No extractable text for document_id=%s",
+            doc.id,
+        )
+
         return 0
 
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000, chunk_overlap=100,
+        chunk_size=1000,
+        chunk_overlap=100,
         separators=["\n\n", "\n", " ", ""],
     )
+
     chunks = text_splitter.split_text(text)
 
     if not chunks:
@@ -583,14 +594,18 @@ def _chunk_and_index_text(
         chunks=chunks,
         embeddings=embeddings,
         filename=doc.file_name,
-        conversation_id=str(conversation_id),
+        conversation_id=conversation_id,
         user_id=str(user_id),
         document_id=str(doc.id),
         content_type="text",
         parent_document_id=str(doc.id),
     )
 
-    document_repo.create_chunks(db=db, doc_id=doc.id, chunks=chunks)
+    document_repo.create_chunks(
+        db=db,
+        doc_id=doc.id,
+        chunks=chunks,
+    )
 
     return len(chunks)
 
@@ -601,59 +616,75 @@ def _chunk_and_index_text(
 
 
 def _extract_csv_text(file_path: str) -> str:
-    """Read a CSV and render it as 'column: value' rows so it is
-    readable/searchable the same way a text chunk is."""
 
     lines = []
 
-    with open(file_path, newline="", encoding="utf-8", errors="ignore") as f:
+    with open(
+        file_path,
+        newline="",
+        encoding="utf-8",
+        errors="ignore",
+    ) as f:
+
         reader = csv.reader(f)
 
         try:
             header = next(reader)
+
         except StopIteration:
             return ""
 
         for row in reader:
+
             row_text = ", ".join(
                 f"{col}: {val}"
                 for col, val in zip(header, row)
             )
+
             lines.append(row_text)
 
     return "\n".join(lines)
 
 
 def _extract_excel_text(file_path: str) -> str:
-    """Read all sheets of an Excel workbook and render each row as
-    'column: value' text, prefixed with the sheet name."""
 
     workbook = openpyxl.load_workbook(
-        file_path, read_only=True, data_only=True,
+        file_path,
+        read_only=True,
+        data_only=True,
     )
 
     lines = []
 
     try:
+
         for sheet in workbook.worksheets:
 
             rows = sheet.iter_rows(values_only=True)
 
             try:
                 header = next(rows)
+
             except StopIteration:
                 continue
 
-            header = [str(h) if h is not None else "" for h in header]
+            header = [
+                str(h) if h is not None else ""
+                for h in header
+            ]
 
-            lines.append(f"Sheet: {sheet.title}")
+            lines.append(
+                f"Sheet: {sheet.title}"
+            )
 
             for row in rows:
+
                 row_text = ", ".join(
                     f"{col}: {val}"
                     for col, val in zip(header, row)
                     if val is not None
                 )
+
                 if row_text:
                     lines.append(row_text)
 
@@ -664,32 +695,40 @@ def _extract_excel_text(file_path: str) -> str:
 
 
 def _extract_plain_text(file_path: str) -> str:
-    """Read a Markdown/plain-text file as-is."""
 
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+    with open(
+        file_path,
+        "r",
+        encoding="utf-8",
+        errors="ignore",
+    ) as f:
+
         return f.read()
 
 
 def _extract_docx_text(file_path: str) -> str:
-    """Read a Word (.docx) document's paragraphs and table cells
-    and render them as searchable text, the same way CSV/Excel
-    rows are rendered."""
 
     document = docx.Document(file_path)
 
     lines = []
 
     for paragraph in document.paragraphs:
+
         if paragraph.text.strip():
-            lines.append(paragraph.text.strip())
+            lines.append(
+                paragraph.text.strip()
+            )
 
     for table in document.tables:
+
         for row in table.rows:
+
             row_text = ", ".join(
                 cell.text.strip()
                 for cell in row.cells
                 if cell.text.strip()
             )
+
             if row_text:
                 lines.append(row_text)
 
@@ -701,31 +740,37 @@ def _process_tabular_or_text_for_rag(
     doc: Document,
     file_path: str,
     file_type: str,
-    conversation_id: str,
+    conversation_id: Optional[str],
     user_id: str,
 ) -> None:
-    """
-    Extract content from CSV / Excel / Word / Markdown / plain-text
-    files and index it exactly like PDF text chunks (same chunker,
-    same vector_store.add_documents/document_repo.create_chunks
-    calls).
-    """
 
     try:
+
         if file_type == "csv":
+
             text = _extract_csv_text(file_path)
+
         elif file_type == "excel":
+
             text = _extract_excel_text(file_path)
+
         elif file_type == "docx":
+
             text = _extract_docx_text(file_path)
+
         else:
+
             text = _extract_plain_text(file_path)
 
     except Exception:
+
         logger.exception(
-            "Content extraction failed for document_id=%s file_type=%s",
-            doc.id, file_type,
+            "Content extraction failed for document_id=%s "
+            "file_type=%s",
+            doc.id,
+            file_type,
         )
+
         return
 
     chunk_count = _chunk_and_index_text(
@@ -737,9 +782,14 @@ def _process_tabular_or_text_for_rag(
     )
 
     logger.info(
-        "RAG indexing completed: document_id=%s file_type=%s "
-        "text_chunks=%s user_id=%s conversation_id=%s",
-        doc.id, file_type, chunk_count, user_id, conversation_id,
+        "RAG indexing completed: document_id=%s "
+        "file_type=%s text_chunks=%s user_id=%s "
+        "conversation_id=%s",
+        doc.id,
+        file_type,
+        chunk_count,
+        user_id,
+        conversation_id,
     )
 
 
@@ -821,6 +871,10 @@ def _delete_recursive(
     )
 
 
+# ============================================================
+# PDF IMAGE PERSISTENCE
+# ============================================================
+
 
 def _persist_pdf_image(
     db: Session,
@@ -829,18 +883,20 @@ def _persist_pdf_image(
     extension: str,
     page_index: int,
     image_index: int,
-    conversation_id: str,
+    conversation_id: Optional[str],
     user_id: str,
 ) -> Document:
-    """
-    Save an image extracted from a PDF as its own permanent
-    Document row (child of the PDF), so it can be served later
-    via /documents/{id}/file instead of being deleted.
-    """
 
-    mime_ext = "jpeg" if extension.lower() in ("jpg", "jpeg") else extension.lower()
+    mime_ext = (
+        "jpeg"
+        if extension.lower() in ("jpg", "jpeg")
+        else extension.lower()
+    )
 
-    filename = f"{parent_doc.file_name}_p{page_index}_{image_index}.{extension}"
+    filename = (
+        f"{parent_doc.file_name}_p"
+        f"{page_index}_{image_index}.{extension}"
+    )
 
     image_doc = document_repo.create_file(
         db=db,
@@ -851,7 +907,10 @@ def _persist_pdf_image(
         conversation_id=conversation_id,
     )
 
-    file_path = os.path.join(UPLOAD_DIR, f"{image_doc.id}_{filename}")
+    file_path = os.path.join(
+        UPLOAD_DIR,
+        f"{image_doc.id}_{filename}",
+    )
 
     with open(file_path, "wb") as f:
         f.write(image_bytes)
@@ -859,7 +918,11 @@ def _persist_pdf_image(
     image_doc = document_repo.update_file_storage_info(
         db=db,
         doc=image_doc,
-        gcs_path=generate_gcs_path(user_id, image_doc.id, filename),
+        gcs_path=generate_gcs_path(
+            user_id,
+            image_doc.id,
+            filename,
+        ),
         size_bytes=len(image_bytes),
         status=DocumentStatus.READY,
     )
@@ -871,33 +934,42 @@ def _extract_and_persist_pdf_images(
     db: Session,
     parent_doc: Document,
     file_path: str,
-    conversation_id: str,
+    conversation_id: Optional[str],
     user_id: str,
 ) -> list[tuple[Document, str]]:
-    """
-    Extract embedded raster images from a PDF, persist each as
-    its own Document row + file on disk (no deletion), and
-    return [(Document, file_path), ...] pairs.
-    """
 
     results = []
 
     pdf = fitz.open(file_path)
 
     try:
+
         for page_index in range(len(pdf)):
+
             page = pdf[page_index]
 
-            for image_index, img in enumerate(page.get_images(full=True)):
+            for image_index, img in enumerate(
+                page.get_images(full=True)
+            ):
+
                 xref = img[0]
 
                 try:
-                    base_image = pdf.extract_image(xref)
-                except Exception:
-                    logger.warning(
-                        "Unable to extract image xref=%s page=%s "
-                        "document_id=%s", xref, page_index, parent_doc.id,
+
+                    base_image = pdf.extract_image(
+                        xref
                     )
+
+                except Exception:
+
+                    logger.warning(
+                        "Unable to extract image xref=%s "
+                        "page=%s document_id=%s",
+                        xref,
+                        page_index,
+                        parent_doc.id,
+                    )
+
                     continue
 
                 image_doc = _persist_pdf_image(
@@ -912,10 +984,13 @@ def _extract_and_persist_pdf_images(
                 )
 
                 image_path = os.path.join(
-                    UPLOAD_DIR, f"{image_doc.id}_{image_doc.file_name}",
+                    UPLOAD_DIR,
+                    f"{image_doc.id}_{image_doc.file_name}",
                 )
 
-                results.append((image_doc, image_path))
+                results.append(
+                    (image_doc, image_path)
+                )
 
     finally:
         pdf.close()
@@ -923,141 +998,194 @@ def _extract_and_persist_pdf_images(
     return results
 
 
+# ============================================================
+# PDF RAG PROCESSING
+# ============================================================
+
+
 def _process_pdf_for_rag(
     db: Session,
     doc: Document,
     file_path: str,
-    conversation_id: str,
+    conversation_id: Optional[str],
     user_id: str,
 ) -> None:
 
     text = ""
 
     with pdfplumber.open(file_path) as pdf:
+
         for page in pdf.pages:
             text += page.extract_text() or ""
 
     text_chunks = []
 
     if text.strip():
+
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000, chunk_overlap=100,
+            chunk_size=1000,
+            chunk_overlap=100,
             separators=["\n\n", "\n", " ", ""],
         )
-        text_chunks = text_splitter.split_text(text)
-    else:
-        logger.warning("No extractable text for document_id=%s", doc.id)
 
-    # --- text chunks indexed under the PDF's own document_id ---
+        text_chunks = text_splitter.split_text(text)
+
+    else:
+
+        logger.warning(
+            "No extractable text for document_id=%s",
+            doc.id,
+        )
+
+    # --------------------------------------------------------
+    # PDF text chunks
+    # --------------------------------------------------------
 
     if text_chunks:
-        embeddings = embedding_manager.generate_embedding(text_chunks)
+
+        embeddings = embedding_manager.generate_embedding(
+            text_chunks
+        )
 
         vector_store.add_documents(
             chunks=text_chunks,
             embeddings=embeddings,
             filename=doc.file_name,
-            conversation_id=str(conversation_id),
+            conversation_id=conversation_id,
             user_id=str(user_id),
             document_id=str(doc.id),
             content_type="text",
             parent_document_id=str(doc.id),
         )
 
-        document_repo.create_chunks(db=db, doc_id=doc.id, chunks=text_chunks)
+        document_repo.create_chunks(
+            db=db,
+            doc_id=doc.id,
+            chunks=text_chunks,
+        )
 
-    # --- embedded images: persist as child Documents + caption each ---
+    # --------------------------------------------------------
+    # PDF embedded images
+    # --------------------------------------------------------
 
     image_pairs = []
 
     try:
+
         image_pairs = _extract_and_persist_pdf_images(
-            db=db, parent_doc=doc, file_path=file_path,
-            conversation_id=conversation_id, user_id=user_id,
+            db=db,
+            parent_doc=doc,
+            file_path=file_path,
+            conversation_id=conversation_id,
+            user_id=user_id,
         )
+
     except Exception:
+
         logger.exception(
-            "PDF image extraction failed for document_id=%s", doc.id,
+            "PDF image extraction failed for document_id=%s",
+            doc.id,
         )
 
     image_count = 0
     skipped_count = 0
 
-    images_to_caption = image_pairs[:MAX_PDF_IMAGES_TO_CAPTION]
-    skipped_count += max(0, len(image_pairs) - MAX_PDF_IMAGES_TO_CAPTION)
+    images_to_caption = image_pairs[
+        :MAX_PDF_IMAGES_TO_CAPTION
+    ]
+
+    skipped_count += max(
+        0,
+        len(image_pairs) - MAX_PDF_IMAGES_TO_CAPTION,
+    )
 
     if skipped_count:
+
         logger.warning(
-            "PDF has %s embedded images; only captioning the first "
-            "%s (MAX_PDF_IMAGES_TO_CAPTION) for document_id=%s. "
-            "The remaining images are still saved as documents, "
-            "just without an AI caption.",
-            len(image_pairs), MAX_PDF_IMAGES_TO_CAPTION, doc.id,
+            "PDF has %s embedded images; only captioning "
+            "the first %s for document_id=%s.",
+            len(image_pairs),
+            MAX_PDF_IMAGES_TO_CAPTION,
+            doc.id,
         )
 
     for image_doc, image_path in images_to_caption:
 
         try:
-            caption = generate_image_caption(image_path)
+
+            caption = generate_image_caption(
+                image_path
+            )
 
             if not caption or not caption.strip():
                 continue
 
             chunks = [caption.strip()]
 
-            embeddings = embedding_manager.generate_embedding(chunks)
+            embeddings = (
+                embedding_manager.generate_embedding(
+                    chunks
+                )
+            )
 
             vector_store.add_documents(
                 chunks=chunks,
                 embeddings=embeddings,
                 filename=image_doc.file_name,
-                conversation_id=str(conversation_id),
+                conversation_id=conversation_id,
                 user_id=str(user_id),
                 document_id=str(image_doc.id),
                 content_type="image",
-                # The image is its own Document row (so it can be
-                # fetched via /documents/{id}/file), but it still
-                # "belongs" to the PDF the user uploaded. Keeping
-                # parent_document_id lets the frontend correlate the
-                # two instead of seeing the doc_id "change" between
-                # the upload response and later KB search results.
                 parent_document_id=str(doc.id),
             )
 
             document_repo.create_chunks(
-                db=db, doc_id=image_doc.id, chunks=chunks,
+                db=db,
+                doc_id=image_doc.id,
+                chunks=chunks,
             )
 
             image_count += 1
 
         except ImageCaptionQuotaExceededError:
 
-            # Free-tier quota is PER DAY — retrying the remaining
-            # images in this same run will just fail again
-            # immediately. Log once and stop, instead of one noisy
-            # traceback per remaining image.
-            remaining = len(images_to_caption) - image_count - skipped_count
-            skipped_count += max(0, remaining)
+            remaining = (
+                len(images_to_caption)
+                - image_count
+                - skipped_count
+            )
+
+            skipped_count += max(
+                0,
+                remaining,
+            )
 
             logger.warning(
-                "Image-captioning quota exhausted while processing "
-                "document_id=%s — stopping early, %s image(s) left "
-                "uncaptioned for this document.",
-                doc.id, max(0, remaining),
+                "Image-captioning quota exhausted while "
+                "processing document_id=%s",
+                doc.id,
             )
 
             break
 
         except Exception:
+
             logger.exception(
-                "Captioning failed for image_document_id=%s parent=%s",
-                image_doc.id, doc.id,
+                "Captioning failed for image_document_id=%s "
+                "parent=%s",
+                image_doc.id,
+                doc.id,
             )
 
     logger.info(
-        "RAG indexing completed: document_id=%s text_chunks=%s "
-        "image_chunks=%s image_chunks_skipped=%s "
-        "user_id=%s conversation_id=%s",
-        doc.id, len(text_chunks), image_count, skipped_count,
-        user_id, conversation_id,
+        "RAG indexing completed: document_id=%s "
+        "text_chunks=%s image_chunks=%s "
+        "image_chunks_skipped=%s user_id=%s "
+        "conversation_id=%s",
+        doc.id,
+        len(text_chunks),
+        image_count,
+        skipped_count,
+        user_id,
+        conversation_id,
     )
