@@ -7,6 +7,7 @@ from app.service.rag_clients import (
     embedding_manager,
     vector_store,
 )
+<<<<<<< HEAD
 import os
 
 from PIL import Image
@@ -16,6 +17,8 @@ from app.service.tools.image_tool import (
     generate_image_caption,
     ImageCaptionQuotaExceededError,
 )
+=======
+>>>>>>> origin/main
 
 from app.repository import document_repo
 from app.core.database import SessionLocal
@@ -24,6 +27,7 @@ from app.core.database import SessionLocal
 logger = logging.getLogger(__name__)
 
 
+<<<<<<< HEAD
 def _extract_text_from_image(image_path: str) -> str:
     """
     Same OCR approach used at upload time in doc_service.py's
@@ -211,6 +215,43 @@ def _retrieve_document_images(
 
     return documents
 
+=======
+def _is_image_query(query: str) -> bool:
+    """
+    Detect whether the user is asking for images,
+    pictures, photos, figures, diagrams, charts, etc.
+    """
+
+    image_keywords = [
+        "image",
+        "images",
+        "picture",
+        "pictures",
+        "photo",
+        "photos",
+        "figure",
+        "figures",
+        "diagram",
+        "diagrams",
+        "chart",
+        "charts",
+        "illustration",
+        "illustrations",
+        "चित्र",
+        "तस्वीर",
+        "फोटो",
+        "इमेज",
+        "डायग्राम",
+    ]
+
+    query_lower = query.lower()
+
+    return any(
+        keyword in query_lower
+        for keyword in image_keywords
+    )
+
+>>>>>>> origin/main
 
 def create_search_knowledge_base_tool(
     user_id: str,
@@ -235,45 +276,49 @@ def create_search_knowledge_base_tool(
 
     user_id = str(user_id)
     conversation_id = str(conversation_id)
-    document_id = str(document_id) if document_id else None
+
+    document_id = (
+        str(document_id)
+        if document_id
+        else None
+    )
 
     @tool
     def search_knowledge_base(
         query: str,
         limit: int = 4,
-        content_type: str = "any",
     ) -> list[dict[str, Any]]:
         """
         Search uploaded documents and indexed knowledge base
         for relevant information.
 
-        Args:
-            query: The search text describing what to look for.
-            limit: Max number of results to return.
-            content_type: Set to "image" whenever the user is
-                asking about an image, picture, photo, figure,
-                diagram, chart, illustration, screenshot, or
-                asking what something "looks like" / what is
-                "shown"/"visible" in an uploaded file — in ANY
-                language or phrasing, including indirect ones
-                like "iska content kya hai" or "ismein kya hai".
-                Set to "text" when the user is clearly asking
-                about textual/written content only. Use "any"
-                (default) only when genuinely unclear.
-                When "image" is passed for a specific document,
-                the extracted image(s) are returned directly
-                instead of running semantic text search.
+        For image-related queries on a specific document,
+        returns the extracted image documents directly.
         """
+
+        # ----------------------------------------------------
+        # Validate query
+        # ----------------------------------------------------
 
         if not query or not query.strip():
             raise ValueError(
                 "Knowledge-base search query cannot be empty."
             )
 
+        # ----------------------------------------------------
+        # Validate limit
+        # ----------------------------------------------------
+
         if limit < 1:
             raise ValueError(
                 "Search result limit must be at least 1."
             )
+
+        # Never allow the LLM to request an excessive number
+        # of vector-search results.
+        #
+        # This limit applies to normal vector search.
+        # Image retrieval below returns all extracted images.
 
         limit = min(limit, 4)
 
@@ -289,15 +334,48 @@ def create_search_knowledge_base_tool(
             document_id,
         )
 
-        if document_id and content_type == "image":
+        # ====================================================
+        # DIRECT PDF IMAGE RETRIEVAL
+        # ====================================================
+
+        # If this is a specific document query and the user is
+        # asking for images, don't use semantic search.
+        #
+        # Instead:
+        #
+        # PDF
+        #   ├── image 1
+        #   ├── image 2
+        #   ├── image 3
+        #   └── ...
+        #
+        # are retrieved directly using parent_id.
+
+        if document_id and _is_image_query(clean_query):
 
             db = SessionLocal()
 
             try:
-                parent_doc = document_repo.get_owned_document_by_id(
-                    db=db,
-                    doc_id=document_id,
-                    user_id=user_id,
+
+                # ------------------------------------------------
+                # Verify that the document is accessible
+                # from the current conversation.
+                #
+                # Access is allowed when:
+                #
+                #   1. document belongs to current user
+                #   2. document is global
+                #      OR
+                #   3. document belongs to current conversation
+                # ------------------------------------------------
+
+                parent_doc = (
+                    document_repo.get_accessible_document_by_id(
+                        db=db,
+                        doc_id=document_id,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                    )
                 )
 
                 if not parent_doc:
@@ -309,13 +387,74 @@ def create_search_knowledge_base_tool(
                         }
                     ]
 
+<<<<<<< HEAD
                 documents = _retrieve_document_images(
+=======
+                # ------------------------------------------------
+                # Get all children of the PDF
+                # ------------------------------------------------
+
+                children = document_repo.get_children(
+>>>>>>> origin/main
                     db=db,
                     parent_doc=parent_doc,
                     user_id=user_id,
                     conversation_id=conversation_id,
                 )
 
+<<<<<<< HEAD
+=======
+                # ------------------------------------------------
+                # Keep only image documents
+                # ------------------------------------------------
+
+                image_docs = [
+                    doc
+                    for doc in children
+                    if (
+                        not doc.is_folder
+                        and doc.mime_type
+                        and doc.mime_type.startswith("image/")
+                    )
+                ]
+
+                logger.info(
+                    "PDF IMAGE RETRIEVAL: "
+                    "document_id=%s image_count=%s",
+                    document_id,
+                    len(image_docs),
+                )
+
+                # ------------------------------------------------
+                # Format image results
+                # ------------------------------------------------
+
+                documents: list[dict[str, Any]] = []
+
+                for image_doc in image_docs:
+
+                    documents.append(
+                        {
+                            "filename": image_doc.file_name,
+                            "chunk_index": None,
+                            "text": (
+                                f"Image extracted from "
+                                f"{parent_doc.file_name}"
+                            ),
+                            "document_id": str(image_doc.id),
+                            "parent_document_id": str(
+                                parent_doc.id
+                            ),
+                            "content_type": image_doc.mime_type,
+                            "gcs_path": image_doc.gcs_path,
+                        }
+                    )
+
+                # ------------------------------------------------
+                # No images found
+                # ------------------------------------------------
+
+>>>>>>> origin/main
                 if not documents:
                     return [
                         {
@@ -327,31 +466,69 @@ def create_search_knowledge_base_tool(
                         }
                     ]
 
+                # ------------------------------------------------
+                # Return ALL images
+                # ------------------------------------------------
+
                 return documents
 
             finally:
                 db.close()
 
-        query_embedding = embedding_manager.generate_embedding(
-            [clean_query]
+        # ====================================================
+        # NORMAL SEMANTIC / VECTOR SEARCH
+        # ====================================================
+
+        # ----------------------------------------------------
+        # Generate query embedding
+        # ----------------------------------------------------
+
+        query_embedding = (
+            embedding_manager.generate_embedding(
+                [clean_query]
+            )
         )
 
-        search_top_k = (
-            max(limit * 5, 20)
-            if document_id
-            else limit
-        )
+        # ----------------------------------------------------
+        # Search Qdrant
+        # ----------------------------------------------------
+        #
+        # user_id is always enforced.
+        #
+        # conversation_id is always passed.
+        #
+        # document_id is also passed when a specific document
+        # has been selected.
+        #
+        # vector_store.search() now applies the document_id
+        # filter directly inside Qdrant.
+        # ----------------------------------------------------
+
+        search_top_k = limit
 
         results = vector_store.search(
             query_embedding=query_embedding,
             user_id=user_id,
-            conversation_id=(
-                None
-                if document_id
-                else conversation_id
-            ),
+            conversation_id=conversation_id,
+            document_id=document_id,
             top_k=search_top_k,
         )
+
+        logger.info(
+            "KB SEARCH RESULTS: count=%s",
+            len(results),
+        )
+
+        for point in results:
+
+            logger.info(
+                "KB RESULT PAYLOAD: %s",
+                point.payload,
+            )
+
+        # ----------------------------------------------------
+        # Diagnostic logging
+        # ----------------------------------------------------
 
         logger.info(
             "KB SEARCH RAW: raw_count=%s sample_payload=%s",
@@ -362,6 +539,10 @@ def create_search_knowledge_base_tool(
                 else None
             ),
         )
+
+        # ----------------------------------------------------
+        # Format search results
+        # ----------------------------------------------------
 
         documents: list[dict[str, Any]] = []
 
@@ -382,14 +563,19 @@ def create_search_knowledge_base_tool(
                 "parent_document_id"
             )
 
-            if document_id:
-                if (
-                    str(point_document_id)
-                    != str(document_id)
-                    and str(point_parent_id)
-                    != str(document_id)
-                ):
-                    continue
+            # ------------------------------------------------
+            # Qdrant has already enforced:
+            #
+            #   current user
+            #   conversation/global scope
+            #
+            # and, when document_id is provided:
+            #
+            #   requested document_id
+            #
+            # Therefore we no longer need to retrieve a broad
+            # result set and filter the document afterward.
+            # ------------------------------------------------
 
             documents.append(
                 {
@@ -419,6 +605,10 @@ def create_search_knowledge_base_tool(
             if len(documents) >= limit:
                 break
 
+        # ----------------------------------------------------
+        # Logging
+        # ----------------------------------------------------
+
         logger.info(
             "KB SEARCH COMPLETE: count=%s, filenames=%s",
             len(documents),
@@ -429,6 +619,7 @@ def create_search_knowledge_base_tool(
         )
 
         # ----------------------------------------------------
+<<<<<<< HEAD
         # Fallback: if this search was scoped to a specific
         # document and semantic search found nothing (e.g. the
         # document is an image whose caption/embedding was never
@@ -485,6 +676,11 @@ def create_search_knowledge_base_tool(
             finally:
                 db.close()
 
+=======
+        # No results
+        # ----------------------------------------------------
+
+>>>>>>> origin/main
         if not documents:
             return [
                 {
