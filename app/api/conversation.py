@@ -27,10 +27,11 @@ from app.repository.conversation_repo import (
 
 from app.schemas.conversation_schema import (
     ConversationTitleUpdate,
-    QueryRequest,
 )
 
-from app.service.external.llm_service import generate_title
+from app.schemas.query_schema import QueryRequest
+
+from app.service.external.LLM_service import generate_title
 from app.service.rag_service import query_documents_stream
 
 
@@ -94,6 +95,34 @@ def send_message(
             )
 
         conversation_id = str(conversation.id)
+
+    # --------------------------------------------------------
+    # Debug request scope
+    # --------------------------------------------------------
+    #
+    # This confirms exactly which document_id is coming
+    # from the client/Swagger request.
+    #
+    # document_id=None means:
+    #
+    #     Global documents
+    #     +
+    #     Current conversation documents
+    #
+    # document_id=<UUID> means:
+    #
+    #     Search that specific accessible document.
+    # --------------------------------------------------------
+
+    logger.info(
+        "CONVERSATION REQUEST | "
+        "question=%s | "
+        "conversation_id=%s | "
+        "document_id=%s",
+        request.question,
+        conversation_id,
+        request.document_id,
+    )
 
     # --------------------------------------------------------
     # SSE event generator
@@ -210,12 +239,15 @@ def get_conversation_detail(
 
         try:
             return json.loads(raw_images)
+
         except (TypeError, ValueError):
+
             logger.warning(
                 "Unable to parse stored images JSON for a message "
                 "in conversation_id=%s",
                 conversation.id,
             )
+
             return []
 
     return success_response(
@@ -230,8 +262,12 @@ def get_conversation_detail(
                     "message_id": str(message.id),
                     "role": message.role,
                     "content": message.content,
-                    "images": _parse_images(message.images),
-                    "created_at": message.created_at.isoformat(),
+                    "images": _parse_images(
+                        message.images
+                    ),
+                    "created_at": (
+                        message.created_at.isoformat()
+                    ),
                 }
                 for message in messages
             ],

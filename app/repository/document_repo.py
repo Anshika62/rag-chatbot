@@ -2,8 +2,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
-from app.repository import document_repo
-from app.core.database import SessionLocal
+
 from app.models.document import Document, DocumentStatus
 from app.models.document_chunks import Docs_chunks
 
@@ -81,6 +80,7 @@ def create_folder(
             parent_id=parent_id,
             is_folder=True,
             user_id=user_id,
+            conversation_id=None,
         )
 
         db.add(folder)
@@ -157,7 +157,10 @@ def get_owned_document_by_id(
     user_id: str,
 ):
     """
-    Fetch document only if it belongs to the current user.
+    Fetch a document only if it belongs to the current user.
+
+    This is the basic ownership check and does not apply
+    conversation-scope rules.
     """
 
     try:
@@ -169,6 +172,57 @@ def get_owned_document_by_id(
             )
             .first()
         )
+
+    except SQLAlchemyError:
+        db.rollback()
+        raise
+
+
+def get_accessible_document_by_id(
+    db: Session,
+    doc_id: str,
+    user_id: str,
+    conversation_id: Optional[str] = None,
+):
+    """
+    Fetch a document that the current user is allowed to access.
+
+    Access rules:
+
+    1. The document must belong to the current user.
+    2. Global documents (conversation_id IS NULL) are accessible
+       from every conversation.
+    3. Conversation documents are accessible only from their
+       owning conversation.
+
+    If conversation_id is None, only global documents are returned.
+    """
+
+    try:
+        query = (
+            db.query(Document)
+            .filter(
+                Document.id == str(doc_id),
+                Document.user_id == str(user_id),
+            )
+        )
+
+        if conversation_id is None:
+            query = query.filter(
+                Document.conversation_id.is_(None)
+            )
+        else:
+            query = query.filter(
+                (
+                    Document.conversation_id.is_(None)
+                )
+                | (
+                    Document.conversation_id
+                    == str(conversation_id)
+                )
+            )
+
+        return query.first()
 
     except SQLAlchemyError:
         db.rollback()
@@ -187,6 +241,7 @@ def get_owned_folder_by_id(
                 Document.id == folder_id,
                 Document.is_folder == True,
                 Document.user_id == user_id,
+                Document.conversation_id.is_(None),
             )
             .first()
         )
@@ -197,7 +252,7 @@ def get_owned_folder_by_id(
 
 
 # ============================================================
-# LIST DOCUMENTS
+# LIST GLOBAL DOCUMENTS
 # ============================================================
 
 
@@ -209,7 +264,14 @@ def list_documents_by_parent(
     limit: int = 20,
 ):
     """
-    Returns (items, total_count) for the given folder.
+    Returns global documents for the given folder.
+
+    The Document Folder represents the user's global
+    document space, therefore only documents with:
+
+        conversation_id IS NULL
+
+    are returned.
 
     Folders are listed before files,
     both alphabetically.
@@ -221,6 +283,7 @@ def list_documents_by_parent(
             .filter(
                 Document.parent_id == parent_id,
                 Document.user_id == user_id,
+                Document.conversation_id.is_(None),
             )
         )
 
@@ -252,17 +315,43 @@ def list_documents_by_parent(
 def get_children(
     db: Session,
     parent_id: str,
+    conversation_id: Optional[str] = None,
 ):
     """
-    Parent ownership is already verified by caller.
+    Return children belonging to the specified parent.
+
+    If conversation_id is provided:
+        - global children are allowed
+        - children belonging to the current conversation are allowed
+
+    If conversation_id is None:
+        - only global children are returned
     """
 
     try:
-        return (
+        query = (
             db.query(Document)
-            .filter(Document.parent_id == parent_id)
-            .all()
+            .filter(
+                Document.parent_id == parent_id,
+            )
         )
+
+        if conversation_id is None:
+            query = query.filter(
+                Document.conversation_id.is_(None)
+            )
+        else:
+            query = query.filter(
+                (
+                    Document.conversation_id.is_(None)
+                )
+                | (
+                    Document.conversation_id
+                    == str(conversation_id)
+                )
+            )
+
+        return query.all()
 
     except SQLAlchemyError:
         db.rollback()
