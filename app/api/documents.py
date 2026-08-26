@@ -13,7 +13,8 @@ from fastapi import (
 import os
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
-
+import json
+from fastapi.responses import FileResponse, StreamingResponse
 from app.core.database import get_db
 from app.core.response import success_response
 from app.core.dependency import (
@@ -81,10 +82,7 @@ def create_folder(
 # ============================================================
 
 
-@router.post(
-    "/upload",
-    response_model=DocumentOut,
-)
+@router.post("/upload")
 def upload_document(
     file: UploadFile = File(...),
     parent_id: Optional[str] = Form(None),
@@ -93,9 +91,8 @@ def upload_document(
     user=Depends(get_current_user),
 ):
     try:
-        doc = doc_service.upload_document_service(
+        resolved = doc_service.resolve_upload_context(
             db=db,
-            file=file,
             parent_id=parent_id,
             conversation_id=conversation_id,
             user_id=user.id,
@@ -107,20 +104,27 @@ def upload_document(
             detail=str(exc),
         ) from exc
 
-    if not doc:
+    if resolved is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Parent folder not found",
         )
 
-    return success_response(
-        message="Document uploaded successfully",
-        data=DocumentOut.model_validate(
-            doc
-        ).model_dump(mode="json"),
-        status_code=status.HTTP_201_CREATED,
-    )
+    resolved_parent_id, resolved_conversation_id = resolved
 
+    def event_stream():
+        for event in doc_service.upload_document_stream_service(
+            file=file,
+            parent_id=resolved_parent_id,
+            conversation_id=resolved_conversation_id,
+            user_id=user.id,
+        ):
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+    )
 
 # ============================================================
 # LIST DOCUMENTS

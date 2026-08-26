@@ -1,5 +1,6 @@
 from typing import List
 import os
+import time
 
 import numpy as np
 from huggingface_hub import InferenceClient
@@ -56,10 +57,26 @@ class EmbeddingManager:
 
             for text in cleaned_texts:
 
-                result = self.client.feature_extraction(
-                    text,
-                    model=self.model_name
-                )
+                result = None
+                last_error = None
+
+                for attempt in range(3):
+                    try:
+                        result = self.client.feature_extraction(
+                            text,
+                            model=self.model_name
+                        )
+                        break
+
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt < 2:
+                            time.sleep(1.5 * (attempt + 1))
+
+                if result is None:
+                    raise RuntimeError(
+                        f"Unable to generate embeddings after retries: {last_error}"
+                    ) from last_error
 
                 embedding = np.asarray(
                     result,

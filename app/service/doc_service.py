@@ -11,7 +11,8 @@ import docx  # python-docx
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-
+from app.core.database import SessionLocal
+from app.schemas.document import DocumentOut
 from app.models.document import Document, DocumentStatus
 from app.repository import document_repo
 from app.repository.conversation_repo import (
@@ -1061,3 +1062,187 @@ def _process_pdf_for_rag(
         doc.id, len(text_chunks), image_count, skipped_count,
         user_id, conversation_id,
     )
+
+# ============================================================
+# UPLOAD DOCUMENT — SSE STREAMED VERSION
+#
+# Same logic as upload_document_service, but yields progress
+# events instead of returning once at the end. Split into two
+# parts:
+#   1. resolve_upload_context() — parent/conversation validation.
+#      Runs BEFORE the SSE stream opens, so 404/403 still come
+#      back as normal HTTP errors, not as SSE events.
+#   2. upload_document_stream_service() — the actual save + RAG
+#      processing, run as a generator. Opens its OWN DB session
+#      (SessionLocal) instead of reusing the request's Depends(db)
+#      session, because that session gets closed by FastAPI as
+#      soon as the endpoint returns — before a StreamingResponse
+#      generator actually runs.
+# ============================================================
+
+
+def resolve_upload_context(
+    db: Session,
+    parent_id: Optional[str],
+    conversation_id: Optional[str],
+    user_id: str,
+):
+    """
+    Same validation upload_document_service already does, pulled
+    out so it can run before the SSE connection opens.
+
+    Returns (parent_id, conversation_id) on success,
+    None if parent folder not found (-> caller raises 404).
+    Raises PermissionError if conversation doesn't belong to user
+    (-> caller raises 403), same as before.
+    """
+
+    if not parent_id:
+        parent_id = None
+
+    if not conversation_id:
+        conversation_id = None
+
+    if parent_id:
+
+        parent = document_repo.get_owned_folder_by_id(
+            db,
+            parent_id,
+            user_id,
+        )
+
+        if not parent:
+            return None
+
+    conversation_id = _get_or_create_document_conversation(
+        db=db,
+        conversation_id=conversation_id,
+        user_id=user_id,
+    )
+
+    return parent_id, conversation_id
+
+
+def upload_document_stream_service(
+    file: UploadFile,
+    parent_id: Optional[str],
+    conversation_id: str,
+    user_id: str,
+):
+    """
+    Generator: yields SSE-ready dicts as upload/RAG processing
+    progresses. Uses its own DB session (see note above).
+    """
+
+    db = SessionLocal()
+
+    try:
+        yield {
+            "status": DocumentStatus.UPLOADING.value,
+            "message": "Uploading file...",
+        }
+
+        doc = document_repo.create_file(
+            db=db,
+            file_name=file.filename,
+            parent_id=parent_id,
+            user_id=user_id,
+            mime_type=file.content_type,
+            conversation_id=conversation_id,
+        )
+
+        contents = file.file.read()
+
+        file_path = os.path.join(
+            UPLOAD_DIR,
+            f"{doc.id}_{file.filename}",
+        )
+
+        with open(file_path, "wb") as f:
+            f.write(contents)
+
+        gcs_path = generate_gcs_path(
+            user_id=user_id,
+            document_id=doc.id,
+            original_filename=file.filename,
+        )
+
+        doc = document_repo.update_document_status(
+            db=db,
+            doc=doc,
+            status=DocumentStatus.PROCESSING,
+        )
+
+        yield {
+            "status": DocumentStatus.PROCESSING.value,
+            "document_id": doc.id,
+            "file_name": doc.file_name,
+            "message": "Processing document for knowledge base...",
+        }
+
+        try:
+            _process_for_rag(
+                db=db,
+                doc=doc,
+                file_path=file_path,
+                conversation_id=conversation_id,
+                user_id=user_id,
+            )
+
+            doc = document_repo.update_file_storage_info(
+                db=db,
+                doc=doc,
+                gcs_path=gcs_path,
+                size_bytes=len(contents),
+                status=DocumentStatus.READY,
+            )
+
+            logger.info(
+                "Document upload and RAG processing completed: "
+                "document_id=%s user_id=%s conversation_id=%s",
+                doc.id,
+                user_id,
+                conversation_id,
+            )
+
+            yield {
+                "status": DocumentStatus.READY.value,
+                "document": DocumentOut.model_validate(doc).model_dump(mode="json"),
+            }
+
+        except Exception:
+
+            logger.exception(
+                "RAG processing failed for document_id=%s "
+                "user_id=%s conversation_id=%s",
+                doc.id,
+                user_id,
+                conversation_id,
+            )
+
+            doc = document_repo.update_file_storage_info(
+                db=db,
+                doc=doc,
+                gcs_path=gcs_path,
+                size_bytes=len(contents),
+                status=DocumentStatus.FAILED,
+            )
+
+            yield {
+                "status": DocumentStatus.FAILED.value,
+                "document": DocumentOut.model_validate(doc).model_dump(mode="json"),
+                "message": "Document processing failed",
+            }
+
+    except Exception as exc:
+        logger.exception(
+            "Unexpected error during streamed upload for user_id=%s",
+            user_id,
+        )
+        yield {
+            "status": DocumentStatus.FAILED.value,
+            "message": f"Upload failed: {exc}",
+        }
+
+    finally:
+        db.close()
