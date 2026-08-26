@@ -146,6 +146,32 @@ def update_file_storage_info(
         raise
 
 
+def update_document_status(
+    db: Session,
+    doc: Document,
+    status: DocumentStatus,
+):
+    """
+    Update only the status field of a document.
+
+    Added specifically for the streamed-upload flow so the
+    document can be marked PROCESSING as soon as the file is
+    saved and RAG indexing begins (before gcs_path/size_bytes
+    are known, which update_file_storage_info requires).
+    """
+    try:
+        doc.status = status
+
+        db.commit()
+        db.refresh(doc)
+
+        return doc
+
+    except SQLAlchemyError:
+        db.rollback()
+        raise
+
+
 # ============================================================
 # OWNERSHIP
 # ============================================================
@@ -410,31 +436,6 @@ def delete_document_row(
     try:
         db.delete(doc)
         db.commit()
-
-    except SQLAlchemyError:
-        db.rollback()
-        raise
-
-def update_document_status(
-    db: Session,
-    doc: Document,
-    status: DocumentStatus,
-):
-    """
-    Update only the status field of a document.
-
-    Added specifically for the streamed-upload flow so the
-    document can be marked PROCESSING as soon as the file is
-    saved and RAG indexing begins (before gcs_path/size_bytes
-    are known, which update_file_storage_info requires).
-    """
-    try:
-        doc.status = status
-
-        db.commit()
-        db.refresh(doc)
-
-        return doc
 
     except SQLAlchemyError:
         db.rollback()

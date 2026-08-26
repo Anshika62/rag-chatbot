@@ -25,7 +25,11 @@ class Vectorstore:
 
     def __init__(
         self,
+<<<<<<< HEAD
+        collection_name: str = "pdf_documents",
+=======
         collection_name: str = "documents",
+>>>>>>> origin/main
     ):
         self.collection_name = collection_name
 
@@ -81,6 +85,15 @@ class Vectorstore:
     def _ensure_indexes(self):
 
         indexes = [
+<<<<<<< HEAD
+            ("conversation_id", PayloadSchemaType.KEYWORD),
+            ("user_id", PayloadSchemaType.KEYWORD),
+            ("message_id", PayloadSchemaType.KEYWORD),
+            ("type", PayloadSchemaType.KEYWORD),
+            ("document_id", PayloadSchemaType.KEYWORD),
+            ("parent_document_id", PayloadSchemaType.KEYWORD),
+            ("content_type", PayloadSchemaType.KEYWORD),
+=======
             (
                 "conversation_id",
                 PayloadSchemaType.KEYWORD,
@@ -105,6 +118,7 @@ class Vectorstore:
                 "parent_document_id",
                 PayloadSchemaType.KEYWORD,
             ),
+>>>>>>> origin/main
         ]
 
         for field_name, field_schema in indexes:
@@ -117,15 +131,19 @@ class Vectorstore:
                     field_schema=field_schema,
                 )
 
-                print(
-                    f"Qdrant index created: "
-                    f"{field_name} -> {field_schema}"
-                )
+                print(f"Qdrant index created: {field_name} -> {field_schema}")
 
             except Exception as exc:
 
                 error_message = str(exc).lower()
 
+<<<<<<< HEAD
+                if "already exists" in error_message or "already exist" in error_message:
+                    print(f"Qdrant index already exists: {field_name}")
+                else:
+                    print(f"Failed to create Qdrant index for '{field_name}': {e}")
+                    raise
+=======
                 if (
                     "already exists" in error_message
                     or "already exist" in error_message
@@ -141,6 +159,7 @@ class Vectorstore:
     # ============================================================
     # ADD DOCUMENTS
     # ============================================================
+>>>>>>> origin/main
 
     def add_documents(
         self,
@@ -157,6 +176,13 @@ class Vectorstore:
         user_id = str(user_id)
         document_id = str(document_id)
 
+<<<<<<< HEAD
+        parent_document_id = (
+            str(parent_document_id)
+            if parent_document_id
+            else document_id
+        )
+=======
         # IMPORTANT:
         #
         # Global document:
@@ -178,6 +204,7 @@ class Vectorstore:
             )
         else:
             parent_document_id = document_id
+>>>>>>> origin/main
 
         points = []
 
@@ -185,14 +212,22 @@ class Vectorstore:
             zip(chunks, embeddings)
         ):
 
+            if not chunk or not str(chunk).strip():
+                continue
+
             points.append(
                 PointStruct(
                     id=str(uuid.uuid4()),
                     vector=embedding.tolist(),
                     payload={
                         "filename": filename,
+<<<<<<< HEAD
+                        "chunk_index": i,
+                        "text": str(chunk),
+=======
                         "chunk_index": index,
                         "text": chunk,
+>>>>>>> origin/main
                         "type": "document",
                         "user_id": user_id,
                         "conversation_id": conversation_id,
@@ -234,22 +269,18 @@ class Vectorstore:
 
         points = []
 
+<<<<<<< HEAD
+        for message, embedding in zip(messages, embeddings):
+=======
         for message, embedding in zip(
             messages,
             embeddings,
         ):
+>>>>>>> origin/main
 
-            conversation_id = str(
-                message["conversation_id"]
-            )
-
-            user_id = str(
-                message["user_id"]
-            )
-
-            message_id = str(
-                message["message_id"]
-            )
+            conversation_id = str(message["conversation_id"])
+            user_id = str(message["user_id"])
+            message_id = str(message["message_id"])
 
             points.append(
                 PointStruct(
@@ -267,27 +298,62 @@ class Vectorstore:
             )
 
         if not points:
+<<<<<<< HEAD
+            raise ValueError("No conversation messages available to store")
+=======
             raise ValueError(
                 "No conversation messages available "
                 "to index"
             )
+>>>>>>> origin/main
 
         self.client.upsert(
             collection_name=self.collection_name,
             points=points,
         )
 
+<<<<<<< HEAD
+    def _to_flat_vector(self, query_embedding):
+        """
+        embedding_manager.generate_embedding() always returns a 2D
+        numpy array (shape (1, 384)) even for a single query text.
+        Qdrant's query_points needs a flat 384-float list for this
+        collection (regular, non-multi vector config). This always
+        extracts a single flat vector regardless of input shape.
+        """
+
+        if hasattr(query_embedding, "ndim"):
+            if query_embedding.ndim == 2:
+                return query_embedding[0].tolist()
+            return query_embedding.tolist()
+
+        if isinstance(query_embedding, list) and query_embedding:
+            first = query_embedding[0]
+            if hasattr(first, "tolist"):
+                return first.tolist()
+            if isinstance(first, (list, tuple)):
+                return list(first)
+
+        return query_embedding
+=======
     # ============================================================
     # DOCUMENT SEARCH
     # ============================================================
+>>>>>>> origin/main
 
     def search(
         self,
         query_embedding,
         user_id: str,
         conversation_id: Optional[str] = None,
+<<<<<<< HEAD
+        top_k: int = 5,
+        document_id: Optional[str] = None,
+        content_type: Optional[str] = None,
+=======
         document_id: Optional[str] = None,
         top_k: int = 3,
+>>>>>>> origin/main
     ):
 
         user_id = str(user_id)
@@ -307,6 +373,13 @@ class Vectorstore:
         # --------------------------------------------------------
 
         must_conditions = [
+<<<<<<< HEAD
+            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+            FieldCondition(key="type", match=MatchValue(value="document")),
+        ]
+
+        if conversation_id:
+=======
             FieldCondition(
                 key="user_id",
                 match=MatchValue(
@@ -341,6 +414,7 @@ class Vectorstore:
 
         if document_id is not None:
 
+>>>>>>> origin/main
             must_conditions.append(
                 FieldCondition(
                     key="document_id",
@@ -372,6 +446,37 @@ class Vectorstore:
             conversation_scope = [
                 FieldCondition(
                     key="conversation_id",
+<<<<<<< HEAD
+                    match=MatchValue(value=str(conversation_id)),
+                )
+            )
+
+        if content_type:
+            must_conditions.append(
+                FieldCondition(
+                    key="content_type",
+                    match=MatchValue(value=str(content_type)),
+                )
+            )
+
+        if document_id:
+
+            document_id = str(document_id)
+
+            document_filter = Filter(
+                must=must_conditions,
+                should=[
+                    FieldCondition(key="document_id", match=MatchValue(value=document_id)),
+                    FieldCondition(key="parent_document_id", match=MatchValue(value=document_id)),
+                ],
+            )
+
+        else:
+
+            document_filter = Filter(must=must_conditions)
+
+        query_vector = self._to_flat_vector(query_embedding)
+=======
                     match=MatchValue(
                         value=conversation_id,
                     ),
@@ -412,6 +517,7 @@ class Vectorstore:
             f"document_id={document_id} | "
             f"top_k={top_k}"
         )
+>>>>>>> origin/main
 
         # --------------------------------------------------------
         # VECTOR SEARCH
@@ -419,9 +525,14 @@ class Vectorstore:
 
         results = self.client.query_points(
             collection_name=self.collection_name,
-            query=query_embedding[0].tolist(),
+            query=query_vector,
             query_filter=document_filter,
             limit=top_k,
+<<<<<<< HEAD
+        )
+
+        return results.points or []
+=======
         )
 
         print(
@@ -594,6 +705,7 @@ class Vectorstore:
     # ============================================================
     # CONVERSATION HISTORY SEARCH
     # ============================================================
+>>>>>>> origin/main
 
     def search_conversation_history(
         self,
@@ -610,6 +722,12 @@ class Vectorstore:
 
         history_filter = Filter(
             must=[
+<<<<<<< HEAD
+                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                FieldCondition(key="conversation_id", match=MatchValue(value=conversation_id)),
+                FieldCondition(key="type", match=MatchValue(value="conversation")),
+            ]
+=======
                 FieldCondition(
                     key="user_id",
                     match=MatchValue(
@@ -629,13 +747,16 @@ class Vectorstore:
                     ),
                 ),
             ],
+>>>>>>> origin/main
         )
+
+        query_vector = self._to_flat_vector(query_embedding)
 
         results = self.client.query_points(
             collection_name=self.collection_name,
-            query=query_embedding[0].tolist(),
+            query=query_vector,
             query_filter=history_filter,
             limit=top_k,
         )
 
-        return results.points
+        return results.points or []
