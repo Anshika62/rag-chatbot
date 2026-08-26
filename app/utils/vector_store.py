@@ -1,11 +1,10 @@
 import os
 import uuid
-from typing import List
+from typing import List, Optional
 
 from dotenv import load_dotenv
 
 from qdrant_client import QdrantClient
-
 from qdrant_client.models import (
     Distance,
     VectorParams,
@@ -24,7 +23,7 @@ class Vectorstore:
 
     def __init__(
         self,
-        collection_name: str = "pdf_documents"
+        collection_name: str = "pdf_documents",
     ):
         self.collection_name = collection_name
 
@@ -38,7 +37,7 @@ class Vectorstore:
 
         self.client = QdrantClient(
             url=qdrant_url,
-            api_key=qdrant_api_key
+            api_key=qdrant_api_key,
         )
 
         self._create_collection()
@@ -58,8 +57,8 @@ class Vectorstore:
                 collection_name=self.collection_name,
                 vectors_config=VectorParams(
                     size=384,
-                    distance=Distance.COSINE
-                )
+                    distance=Distance.COSINE,
+                ),
             )
 
         self._ensure_indexes()
@@ -67,22 +66,13 @@ class Vectorstore:
     def _ensure_indexes(self):
 
         indexes = [
-            (
-                "conversation_id",
-                PayloadSchemaType.KEYWORD
-            ),
-            (
-                "user_id",
-                PayloadSchemaType.KEYWORD
-            ),
-            (
-                "message_id",
-                PayloadSchemaType.KEYWORD
-            ),
-            (
-                "type",
-                PayloadSchemaType.KEYWORD
-            )
+            ("conversation_id", PayloadSchemaType.KEYWORD),
+            ("user_id", PayloadSchemaType.KEYWORD),
+            ("message_id", PayloadSchemaType.KEYWORD),
+            ("type", PayloadSchemaType.KEYWORD),
+            ("document_id", PayloadSchemaType.KEYWORD),
+            ("parent_document_id", PayloadSchemaType.KEYWORD),
+            ("content_type", PayloadSchemaType.KEYWORD),
         ]
 
         for field_name, field_schema in indexes:
@@ -92,33 +82,19 @@ class Vectorstore:
                 self.client.create_payload_index(
                     collection_name=self.collection_name,
                     field_name=field_name,
-                    field_schema=field_schema
+                    field_schema=field_schema,
                 )
 
-                print(
-                    f"Qdrant index created: "
-                    f"{field_name} -> {field_schema}"
-                )
+                print(f"Qdrant index created: {field_name} -> {field_schema}")
 
             except Exception as e:
 
                 error_message = str(e).lower()
 
-                if (
-                    "already exists" in error_message
-                    or "already exist" in error_message
-                ):
-                    print(
-                        f"Qdrant index already exists: "
-                        f"{field_name}"
-                    )
-
+                if "already exists" in error_message or "already exist" in error_message:
+                    print(f"Qdrant index already exists: {field_name}")
                 else:
-                    print(
-                        f"Failed to create Qdrant index "
-                        f"for '{field_name}': {e}"
-                    )
-
+                    print(f"Failed to create Qdrant index for '{field_name}': {e}")
                     raise
 
     def add_documents(
@@ -130,17 +106,25 @@ class Vectorstore:
         user_id: str,
         document_id: str,
         content_type: str = "text",
-        parent_document_id: str | None = None,
+        parent_document_id: Optional[str] = None,
     ):
 
         conversation_id = str(conversation_id)
         user_id = str(user_id)
         document_id = str(document_id)
-        parent_document_id = str(parent_document_id) if parent_document_id else document_id
+
+        parent_document_id = (
+            str(parent_document_id)
+            if parent_document_id
+            else document_id
+        )
 
         points = []
 
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+
+            if not chunk or not str(chunk).strip():
+                continue
 
             points.append(
                 PointStruct(
@@ -149,14 +133,14 @@ class Vectorstore:
                     payload={
                         "filename": filename,
                         "chunk_index": i,
-                        "text": chunk,
+                        "text": str(chunk),
                         "type": "document",
                         "user_id": user_id,
                         "conversation_id": conversation_id,
                         "document_id": document_id,
                         "parent_document_id": parent_document_id,
                         "content_type": content_type,
-                    }
+                    },
                 )
             )
 
@@ -165,33 +149,22 @@ class Vectorstore:
 
         self.client.upsert(
             collection_name=self.collection_name,
-            points=points
+            points=points,
         )
 
     def add_conversation_messages(
         self,
         messages,
-        embeddings
+        embeddings,
     ):
 
         points = []
 
-        for message, embedding in zip(
-            messages,
-            embeddings
-        ):
+        for message, embedding in zip(messages, embeddings):
 
-            conversation_id = str(
-                message["conversation_id"]
-            )
-
-            user_id = str(
-                message["user_id"]
-            )
-
-            message_id = str(
-                message["message_id"]
-            )
+            conversation_id = str(message["conversation_id"])
+            user_id = str(message["user_id"])
+            message_id = str(message["message_id"])
 
             points.append(
                 PointStruct(
@@ -203,83 +176,108 @@ class Vectorstore:
                         "message_id": message_id,
                         "role": message["role"],
                         "content": message["content"],
-                        "type": "conversation"
-                    }
+                        "type": "conversation",
+                    },
                 )
             )
 
         if not points:
-            raise ValueError(
-                "No conversation messages available to store"
-            )
+            raise ValueError("No conversation messages available to store")
 
         self.client.upsert(
             collection_name=self.collection_name,
-            points=points
+            points=points,
         )
 
+    def _to_flat_vector(self, query_embedding):
+        """
+        embedding_manager.generate_embedding() always returns a 2D
+        numpy array (shape (1, 384)) even for a single query text.
+        Qdrant's query_points needs a flat 384-float list for this
+        collection (regular, non-multi vector config). This always
+        extracts a single flat vector regardless of input shape.
+        """
 
+        if hasattr(query_embedding, "ndim"):
+            if query_embedding.ndim == 2:
+                return query_embedding[0].tolist()
+            return query_embedding.tolist()
+
+        if isinstance(query_embedding, list) and query_embedding:
+            first = query_embedding[0]
+            if hasattr(first, "tolist"):
+                return first.tolist()
+            if isinstance(first, (list, tuple)):
+                return list(first)
+
+        return query_embedding
 
     def search(
         self,
         query_embedding,
         user_id: str,
-        conversation_id: str | None = None,
-        top_k: int = 3
+        conversation_id: Optional[str] = None,
+        top_k: int = 5,
+        document_id: Optional[str] = None,
+        content_type: Optional[str] = None,
     ):
 
         user_id = str(user_id)
 
         must_conditions = [
-            FieldCondition(
-                key="user_id",
-                match=MatchValue(
-                    value=user_id
-                )
-            ),
-            FieldCondition(
-                key="type",
-                match=MatchValue(
-                    value="document"
-                )
-            )
+            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+            FieldCondition(key="type", match=MatchValue(value="document")),
         ]
 
-        # Scope search to the current conversation whenever one is
-        # supplied. Without this, KB search pulls chunks from ALL of
-        # the user's conversations/documents, diluting top_k results
-        # with irrelevant chunks — this was the main cause of the
-        # knowledge-base/PDF answer quality regression.
         if conversation_id:
             must_conditions.append(
                 FieldCondition(
                     key="conversation_id",
-                    match=MatchValue(
-                        value=str(conversation_id)
-                    )
+                    match=MatchValue(value=str(conversation_id)),
                 )
             )
 
-        document_filter = Filter(
-            must=must_conditions
-        )
+        if content_type:
+            must_conditions.append(
+                FieldCondition(
+                    key="content_type",
+                    match=MatchValue(value=str(content_type)),
+                )
+            )
+
+        if document_id:
+
+            document_id = str(document_id)
+
+            document_filter = Filter(
+                must=must_conditions,
+                should=[
+                    FieldCondition(key="document_id", match=MatchValue(value=document_id)),
+                    FieldCondition(key="parent_document_id", match=MatchValue(value=document_id)),
+                ],
+            )
+
+        else:
+
+            document_filter = Filter(must=must_conditions)
+
+        query_vector = self._to_flat_vector(query_embedding)
 
         results = self.client.query_points(
             collection_name=self.collection_name,
-            query=query_embedding[0].tolist(),
+            query=query_vector,
             query_filter=document_filter,
-            limit=top_k
+            limit=top_k,
         )
 
-        return results.points
-
+        return results.points or []
 
     def search_conversation_history(
         self,
         query_embedding,
         user_id: str,
         conversation_id: str,
-        top_k: int = 5
+        top_k: int = 5,
     ):
 
         user_id = str(user_id)
@@ -287,32 +285,19 @@ class Vectorstore:
 
         history_filter = Filter(
             must=[
-                FieldCondition(
-                    key="user_id",
-                    match=MatchValue(
-                        value=user_id
-                    )
-                ),
-                FieldCondition(
-                    key="conversation_id",
-                    match=MatchValue(
-                        value=conversation_id
-                    )
-                ),
-                FieldCondition(
-                    key="type",
-                    match=MatchValue(
-                        value="conversation"
-                    )
-                )
+                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                FieldCondition(key="conversation_id", match=MatchValue(value=conversation_id)),
+                FieldCondition(key="type", match=MatchValue(value="conversation")),
             ]
         )
 
+        query_vector = self._to_flat_vector(query_embedding)
+
         results = self.client.query_points(
             collection_name=self.collection_name,
-            query=query_embedding[0].tolist(),
+            query=query_vector,
             query_filter=history_filter,
-            limit=top_k
+            limit=top_k,
         )
 
-        return results.points
+        return results.points or []
