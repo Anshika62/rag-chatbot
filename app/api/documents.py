@@ -1,6 +1,7 @@
 from typing import Optional
 import logging
 import os
+import json
 
 from fastapi import (
     APIRouter,
@@ -12,7 +13,7 @@ from fastapi import (
     Form,
     status,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -80,13 +81,12 @@ def create_folder(
 
 
 # ============================================================
-# UPLOAD DOCUMENT
+# UPLOAD DOCUMENT — SSE STREAMED
 # ============================================================
 
 
 @router.post(
     "/upload",
-    response_model=DocumentOut,
 )
 def upload_document(
     file: UploadFile = File(...),
@@ -96,7 +96,7 @@ def upload_document(
     user=Depends(get_current_user),
 ):
     """
-    Upload a document.
+    Upload a document using Server-Sent Events.
 
     Scope rules:
 
@@ -108,7 +108,19 @@ def upload_document(
        -> Conversation-scoped document.
        -> Accessible only from that conversation.
 
-    parent_id is independent from conversation scope.
+    parent_id is independent from conversation scope, except that
+    conversation-scoped documents cannot be placed inside a
+    global folder.
+
+    SSE events emitted by the service:
+
+        uploading
+        processing
+        ready
+
+    or:
+
+        failed
     """
 
     # --------------------------------------------------------
@@ -137,17 +149,16 @@ def upload_document(
         user.id,
     )
 
-    try:
-        # ----------------------------------------------------
-        # SERVICE
-        # ----------------------------------------------------
+    # --------------------------------------------------------
+    # VALIDATE BEFORE OPENING SSE STREAM
+    # --------------------------------------------------------
 
-        doc = doc_service.upload_document_service(
+    try:
+        resolved_context = doc_service.resolve_upload_context(
             db=db,
-            file=file,
             parent_id=parent_id,
             conversation_id=conversation_id,
-            user_id=user.id,
+            user_id=str(user.id),
         )
 
     except PermissionError as exc:
@@ -192,13 +203,10 @@ def upload_document(
             detail=str(exc),
         ) from exc
 
-    except HTTPException:
-        raise
-
     except Exception as exc:
 
         logger.exception(
-            "DOCUMENT UPLOAD FAILED | "
+            "DOCUMENT UPLOAD VALIDATION FAILED | "
             "file=%r | "
             "parent_id=%r | "
             "conversation_id=%r | "
@@ -211,14 +219,14 @@ def upload_document(
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Unable to upload document",
+            detail="Unable to validate document upload",
         ) from exc
 
     # --------------------------------------------------------
     # PARENT FOLDER NOT FOUND
     # --------------------------------------------------------
 
-    if not doc:
+    if not resolved_context:
 
         logger.warning(
             "DOCUMENT UPLOAD | Parent folder not found | "
@@ -233,36 +241,59 @@ def upload_document(
             detail="Parent folder not found",
         )
 
-    # --------------------------------------------------------
-    # DEBUG CREATED DOCUMENT
-    # --------------------------------------------------------
-
-    logger.info(
-        "DOCUMENT CREATED | "
-        "document_id=%r | "
-        "file=%r | "
-        "parent_id=%r | "
-        "conversation_id=%r | "
-        "user_id=%r | "
-        "status=%r",
-        str(doc.id),
-        doc.file_name,
-        doc.parent_id,
-        doc.conversation_id,
-        doc.user_id,
-        doc.status,
+    resolved_parent_id, resolved_conversation_id = (
+        resolved_context
     )
 
     # --------------------------------------------------------
-    # RESPONSE
+    # SSE EVENT ENCODER
     # --------------------------------------------------------
 
-    return success_response(
-        message="Document uploaded successfully",
-        data=DocumentOut.model_validate(
-            doc
-        ).model_dump(mode="json"),
-        status_code=status.HTTP_201_CREATED,
+    def event_stream():
+
+        try:
+
+            for event in doc_service.upload_document_stream_service(
+                file=file,
+                parent_id=resolved_parent_id,
+                conversation_id=resolved_conversation_id,
+                user_id=str(user.id),
+            ):
+
+                yield (
+                    f"data: {json.dumps(event, default=str)}\n\n"
+                )
+
+        except Exception as exc:
+
+            logger.exception(
+                "DOCUMENT SSE STREAM FAILED | "
+                "file=%r | user_id=%r",
+                file.filename,
+                user.id,
+            )
+
+            error_event = {
+                "status": "failed",
+                "message": "Document upload failed",
+            }
+
+            yield (
+                f"data: {json.dumps(error_event)}\n\n"
+            )
+
+    # --------------------------------------------------------
+    # STREAM RESPONSE
+    # --------------------------------------------------------
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
