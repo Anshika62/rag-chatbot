@@ -29,7 +29,7 @@ from app.service.tools.image_tool import (
 def create_conversation_tools(
     db,
     user_id: str,
-    conversation_id: str,
+    conversation_id: str | None,
     document_id: str | None = None,
     image_paths: list[str] | None = None,
 ):
@@ -62,16 +62,19 @@ def create_conversation_tools(
 
     5. analyze_image (only when image_paths is provided)
        -> Vision analysis of image(s) attached directly to the
-          CURRENT chat message (not a previously uploaded/indexed
-          document). Used for "what's in this picture I just
-          sent" style questions, answered live against the actual
-          image bytes instead of a stored caption.
+          CURRENT chat message.
     """
 
     user_id = str(user_id)
-    conversation_id = str(conversation_id)
+
+    conversation_id = (
+        str(conversation_id)
+        if conversation_id is not None
+        else None
+    )
 
     if document_id:
+
         document_id = str(document_id)
 
     # ========================================================
@@ -90,12 +93,20 @@ def create_conversation_tools(
         must never be supplied by the LLM.
         """
 
+        if conversation_id is None:
+
+            return (
+                "No conversation ID is available, so previous "
+                "conversation history cannot be retrieved."
+            )
+
         messages = get_last_10_messages(
             db=db,
             conversation_id=conversation_id,
         )
 
         if not messages:
+
             return (
                 "No previous conversation history found."
             )
@@ -119,9 +130,6 @@ def create_conversation_tools(
 
     # ========================================================
     # RETURN ALL TOOLS
-    #
-    # Each responsibility remains a separate tool.
-    # The LLM decides which tool is required.
     # ========================================================
 
     tools = [
@@ -132,8 +140,7 @@ def create_conversation_tools(
     ]
 
     # ========================================================
-    # IMAGE ANALYSIS TOOL (only when an image is attached to
-    # THIS message)
+    # IMAGE ANALYSIS TOOL
     # ========================================================
 
     valid_image_paths = [

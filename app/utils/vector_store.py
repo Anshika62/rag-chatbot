@@ -166,9 +166,6 @@ class Vectorstore:
         parent_document_id: Optional[str] = None,
     ):
 
-        conversation_id = str(conversation_id)
-        user_id = str(user_id)
-        document_id = str(document_id)
 
         # IMPORTANT:
         #
@@ -184,6 +181,9 @@ class Vectorstore:
 
         if conversation_id is not None:
             conversation_id = str(conversation_id)
+            
+        user_id = str(user_id)
+        document_id = str(document_id)
 
         if parent_document_id is not None:
             parent_document_id = str(

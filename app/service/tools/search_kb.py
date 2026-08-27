@@ -58,7 +58,7 @@ def _retrieve_document_images(
     db,
     parent_doc,
     user_id: str,
-    conversation_id: str,
+    conversation_id: str | None,
 ) -> list[dict[str, Any]]:
 
     image_docs = []
@@ -94,6 +94,7 @@ def _retrieve_document_images(
     documents: list[dict[str, Any]] = []
 
     for image_doc in image_docs:
+
         is_standalone = image_doc.id == parent_doc.id
 
         stored_chunks = document_repo.get_chunks_by_document_id(
@@ -112,13 +113,18 @@ def _retrieve_document_images(
         )
 
         if not caption_text:
+
             image_path = os.path.join(
                 "Uploads",
                 f"{image_doc.id}_{image_doc.file_name}",
             )
 
             try:
-                live_caption = generate_image_caption(image_path)
+
+                live_caption = generate_image_caption(
+                    image_path
+                )
+
                 live_caption = (
                     live_caption.strip()
                     if live_caption
@@ -132,11 +138,13 @@ def _retrieve_document_images(
                 searchable_parts = []
 
                 if live_caption:
+
                     searchable_parts.append(
                         f"Image description:\n{live_caption}"
                     )
 
                 if live_ocr_text:
+
                     searchable_parts.append(
                         f"Text extracted from image:\n{live_ocr_text}"
                     )
@@ -146,6 +154,7 @@ def _retrieve_document_images(
                 ).strip()
 
                 if combined_text:
+
                     caption_text = combined_text
 
                     document_repo.create_chunks(
@@ -154,8 +163,10 @@ def _retrieve_document_images(
                         chunks=[caption_text],
                     )
 
-                    caption_embedding = embedding_manager.generate_embedding(
-                        [caption_text]
+                    caption_embedding = (
+                        embedding_manager.generate_embedding(
+                            [caption_text]
+                        )
                     )
 
                     vector_store.add_documents(
@@ -170,12 +181,14 @@ def _retrieve_document_images(
                     )
 
             except ImageCaptionQuotaExceededError:
+
                 caption_text = (
                     "Image captioning quota is currently "
                     "exhausted. Please try again later."
                 )
 
             except Exception:
+
                 logger.exception(
                     "Live caption/OCR generation failed for "
                     "document_id=%s",
@@ -183,6 +196,7 @@ def _retrieve_document_images(
                 )
 
         if not caption_text:
+
             caption_text = (
                 "No AI-generated description is available "
                 "for this image yet."
@@ -249,7 +263,7 @@ def _is_image_query(query: str) -> bool:
 
 def create_search_knowledge_base_tool(
     user_id: str,
-    conversation_id: str,
+    conversation_id: str | None,
     document_id: str | None = None,
 ):
     """
@@ -269,8 +283,18 @@ def create_search_knowledge_base_tool(
     """
 
     user_id = str(user_id)
-    conversation_id = str(conversation_id)
-    document_id = str(document_id) if document_id else None
+
+    conversation_id = (
+        str(conversation_id)
+        if conversation_id is not None
+        else None
+    )
+
+    document_id = (
+        str(document_id)
+        if document_id
+        else None
+    )
 
     def _search_knowledge_base_impl(
         query: str,
@@ -279,11 +303,13 @@ def create_search_knowledge_base_tool(
     ) -> list[dict[str, Any]]:
 
         if not query or not query.strip():
+
             raise ValueError(
                 "Knowledge-base search query cannot be empty."
             )
 
         if limit < 1:
+
             raise ValueError(
                 "Search result limit must be at least 1."
             )
@@ -302,18 +328,26 @@ def create_search_knowledge_base_tool(
             document_id,
         )
 
+        # ========================================================
+        # DIRECT IMAGE RETRIEVAL
+        # ========================================================
+
         if document_id and content_type == "image":
 
             db = SessionLocal()
 
             try:
-                parent_doc = document_repo.get_owned_document_by_id(
-                    db=db,
-                    doc_id=document_id,
-                    user_id=user_id,
+
+                parent_doc = (
+                    document_repo.get_owned_document_by_id(
+                        db=db,
+                        doc_id=document_id,
+                        user_id=user_id,
+                    )
                 )
 
                 if not parent_doc:
+
                     return [
                         {
                             "filename": None,
@@ -329,11 +363,8 @@ def create_search_knowledge_base_tool(
                     conversation_id=conversation_id,
                 )
 
-                # ------------------------------------------------
-                # No images found
-                # ------------------------------------------------
-
                 if not documents:
+
                     return [
                         {
                             "filename": None,
@@ -353,9 +384,6 @@ def create_search_knowledge_base_tool(
                     document_id,
                 )
 
-                # Never let an image-lookup failure kill the whole
-                # streamed answer — hand the LLM a normal tool
-                # result it can talk about instead of an exception.
                 return [
                     {
                         "filename": None,
@@ -368,10 +396,17 @@ def create_search_knowledge_base_tool(
                 ]
 
             finally:
+
                 db.close()
 
-        query_embedding = embedding_manager.generate_embedding(
-            [clean_query]
+        # ========================================================
+        # SEMANTIC SEARCH
+        # ========================================================
+
+        query_embedding = (
+            embedding_manager.generate_embedding(
+                [clean_query]
+            )
         )
 
         search_top_k = (
@@ -412,7 +447,10 @@ def create_search_knowledge_base_tool(
 
             payload = point.payload or {}
 
-            text = payload.get("text", "")
+            text = payload.get(
+                "text",
+                "",
+            )
 
             if not text:
                 continue
@@ -426,6 +464,7 @@ def create_search_knowledge_base_tool(
             )
 
             if document_id:
+
                 if (
                     str(point_document_id)
                     != str(document_id)
@@ -471,47 +510,58 @@ def create_search_knowledge_base_tool(
             ],
         )
 
-        # ----------------------------------------------------
-        # Fallback: if this search was scoped to a specific
-        # document and semantic search found nothing (e.g. the
-        # document is an image whose caption/embedding was never
-        # created because the LLM did not send content_type=
-        # "image"), check whether it's image-based and retrieve
-        # it directly instead of reporting "not found".
-        # ----------------------------------------------------
+        # ========================================================
+        # IMAGE FALLBACK
+        # ========================================================
 
         if not documents and document_id:
 
             db = SessionLocal()
 
             try:
-                parent_doc = document_repo.get_owned_document_by_id(
-                    db=db,
-                    doc_id=document_id,
-                    user_id=user_id,
+
+                parent_doc = (
+                    document_repo.get_owned_document_by_id(
+                        db=db,
+                        doc_id=document_id,
+                        user_id=user_id,
+                    )
                 )
 
                 if parent_doc:
 
-                    is_image_related = (
-                        parent_doc.mime_type
-                        and parent_doc.mime_type.startswith("image/")
-                    ) or any(
-                        child.mime_type
-                        and child.mime_type.startswith("image/")
-                        for child in document_repo.get_children(
+                    children = (
+                        document_repo.get_children(
                             db=db,
                             parent_id=parent_doc.id,
                         )
                     )
 
+                    is_image_related = (
+                        (
+                            parent_doc.mime_type
+                            and parent_doc.mime_type.startswith(
+                                "image/"
+                            )
+                        )
+                        or any(
+                            child.mime_type
+                            and child.mime_type.startswith(
+                                "image/"
+                            )
+                            for child in children
+                        )
+                    )
+
                     if is_image_related:
 
-                        fallback_documents = _retrieve_document_images(
-                            db=db,
-                            parent_doc=parent_doc,
-                            user_id=user_id,
-                            conversation_id=conversation_id,
+                        fallback_documents = (
+                            _retrieve_document_images(
+                                db=db,
+                                parent_doc=parent_doc,
+                                user_id=user_id,
+                                conversation_id=conversation_id,
+                            )
                         )
 
                         if fallback_documents:
@@ -526,13 +576,15 @@ def create_search_knowledge_base_tool(
                             return fallback_documents
 
             finally:
+
                 db.close()
 
-        # ----------------------------------------------------
-        # No results
-        # ----------------------------------------------------
+        # ========================================================
+        # NO RESULTS
+        # ========================================================
 
         if not documents:
+
             return [
                 {
                     "filename": None,
@@ -548,13 +600,6 @@ def create_search_knowledge_base_tool(
 
     # ============================================================
     # PUBLIC TOOL WRAPPER
-    #
-    # Keeps _search_knowledge_base_impl free of try/except noise
-    # while guaranteeing that ANY failure inside it (Qdrant down,
-    # embedding API error, a bad document, etc.) turns into a
-    # normal tool result the LLM can talk about — instead of an
-    # exception that kills the entire streamed answer. This is
-    # what makes "one thing failing" not take down the whole chat.
     # ============================================================
 
     @tool
@@ -569,23 +614,27 @@ def create_search_knowledge_base_tool(
 
         Args:
             query: The search text describing what to look for.
+
             limit: Max number of results to return.
+
             content_type: Set to "image" whenever the user is
                 asking about an image, picture, photo, figure,
                 diagram, chart, illustration, screenshot, or
                 asking what something "looks like" / what is
-                "shown"/"visible" in an uploaded file — in ANY
-                language or phrasing, including indirect ones
-                like "iska content kya hai" or "ismein kya hai".
+                "shown"/"visible" in an uploaded file.
+
                 Set to "text" when the user is clearly asking
-                about textual/written content only. Use "any"
-                (default) only when genuinely unclear.
+                about textual/written content only.
+
+                Use "any" when genuinely unclear.
+
                 When "image" is passed for a specific document,
                 the extracted image(s) are returned directly
                 instead of running semantic text search.
         """
 
         try:
+
             return _search_knowledge_base_impl(
                 query=query,
                 limit=limit,
@@ -593,11 +642,11 @@ def create_search_knowledge_base_tool(
             )
 
         except ValueError:
-            # Bad input from the LLM (empty query, bad limit) —
-            # let it surface normally, the LLM can correct itself.
+
             raise
 
         except Exception:
+
             logger.exception(
                 "KNOWLEDGE BASE SEARCH FAILED: query=%s "
                 "user_id=%s conversation_id=%s document_id=%s",
