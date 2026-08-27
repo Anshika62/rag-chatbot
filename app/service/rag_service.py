@@ -118,6 +118,7 @@ def query_documents_stream(
     user_id: str,
     conversation_id: str,
     document_id: str | None = None,
+    image_paths: list[str] | None = None,
 ):
     try:
         if not question or not question.strip():
@@ -196,6 +197,7 @@ def query_documents_stream(
             conversation_id=conversation_id,
             images_output=images_output,
             document_id=document_id,
+            image_paths=image_paths,
         ):
             if not chunk:
                 continue

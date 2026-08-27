@@ -1,13 +1,15 @@
 import logging
+import os
 from typing import Any
 
+from PIL import Image
+import pytesseract
 from langchain_core.tools import tool
 
 from app.service.rag_clients import (
     embedding_manager,
     vector_store,
 )
-import os
 
 from app.service.tools.image_tool import (
     generate_image_caption,
@@ -270,33 +272,11 @@ def create_search_knowledge_base_tool(
     conversation_id = str(conversation_id)
     document_id = str(document_id) if document_id else None
 
-    @tool
-    def search_knowledge_base(
+    def _search_knowledge_base_impl(
         query: str,
         limit: int = 4,
         content_type: str = "any",
     ) -> list[dict[str, Any]]:
-        """
-        Search uploaded documents and indexed knowledge base
-        for relevant information.
-
-        Args:
-            query: The search text describing what to look for.
-            limit: Max number of results to return.
-            content_type: Set to "image" whenever the user is
-                asking about an image, picture, photo, figure,
-                diagram, chart, illustration, screenshot, or
-                asking what something "looks like" / what is
-                "shown"/"visible" in an uploaded file — in ANY
-                language or phrasing, including indirect ones
-                like "iska content kya hai" or "ismein kya hai".
-                Set to "text" when the user is clearly asking
-                about textual/written content only. Use "any"
-                (default) only when genuinely unclear.
-                When "image" is passed for a specific document,
-                the extracted image(s) are returned directly
-                instead of running semantic text search.
-        """
 
         if not query or not query.strip():
             raise ValueError(
@@ -344,7 +324,9 @@ def create_search_knowledge_base_tool(
 
                 documents = _retrieve_document_images(
                     db=db,
-                    parent_id=parent_doc.id,
+                    parent_doc=parent_doc,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
                 )
 
                 # ------------------------------------------------
@@ -363,6 +345,27 @@ def create_search_knowledge_base_tool(
                     ]
 
                 return documents
+
+            except Exception:
+
+                logger.exception(
+                    "IMAGE RETRIEVAL FAILED: document_id=%s",
+                    document_id,
+                )
+
+                # Never let an image-lookup failure kill the whole
+                # streamed answer — hand the LLM a normal tool
+                # result it can talk about instead of an exception.
+                return [
+                    {
+                        "filename": None,
+                        "chunk_index": None,
+                        "text": (
+                            "Unable to retrieve images from this "
+                            "document right now. Please try again."
+                        ),
+                    }
+                ]
 
             finally:
                 db.close()
@@ -384,6 +387,11 @@ def create_search_knowledge_base_tool(
                 None
                 if document_id
                 else conversation_id
+            ),
+            content_type=(
+                content_type
+                if content_type in ("text", "image")
+                else None
             ),
             top_k=search_top_k,
         )
@@ -537,5 +545,77 @@ def create_search_knowledge_base_tool(
             ]
 
         return documents
+
+    # ============================================================
+    # PUBLIC TOOL WRAPPER
+    #
+    # Keeps _search_knowledge_base_impl free of try/except noise
+    # while guaranteeing that ANY failure inside it (Qdrant down,
+    # embedding API error, a bad document, etc.) turns into a
+    # normal tool result the LLM can talk about — instead of an
+    # exception that kills the entire streamed answer. This is
+    # what makes "one thing failing" not take down the whole chat.
+    # ============================================================
+
+    @tool
+    def search_knowledge_base(
+        query: str,
+        limit: int = 4,
+        content_type: str = "any",
+    ) -> list[dict[str, Any]]:
+        """
+        Search uploaded documents and indexed knowledge base
+        for relevant information.
+
+        Args:
+            query: The search text describing what to look for.
+            limit: Max number of results to return.
+            content_type: Set to "image" whenever the user is
+                asking about an image, picture, photo, figure,
+                diagram, chart, illustration, screenshot, or
+                asking what something "looks like" / what is
+                "shown"/"visible" in an uploaded file — in ANY
+                language or phrasing, including indirect ones
+                like "iska content kya hai" or "ismein kya hai".
+                Set to "text" when the user is clearly asking
+                about textual/written content only. Use "any"
+                (default) only when genuinely unclear.
+                When "image" is passed for a specific document,
+                the extracted image(s) are returned directly
+                instead of running semantic text search.
+        """
+
+        try:
+            return _search_knowledge_base_impl(
+                query=query,
+                limit=limit,
+                content_type=content_type,
+            )
+
+        except ValueError:
+            # Bad input from the LLM (empty query, bad limit) —
+            # let it surface normally, the LLM can correct itself.
+            raise
+
+        except Exception:
+            logger.exception(
+                "KNOWLEDGE BASE SEARCH FAILED: query=%s "
+                "user_id=%s conversation_id=%s document_id=%s",
+                query,
+                user_id,
+                conversation_id,
+                document_id,
+            )
+
+            return [
+                {
+                    "filename": None,
+                    "chunk_index": None,
+                    "text": (
+                        "The knowledge base search is temporarily "
+                        "unavailable. Please try again in a moment."
+                    ),
+                }
+            ]
 
     return search_knowledge_base

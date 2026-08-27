@@ -125,6 +125,20 @@ def generate_gcs_path(
     )
 
 
+def get_local_file_path(doc: Document) -> str:
+    """
+    The on-disk path convention used everywhere a document's raw
+    file is saved/read (upload, PDF image extraction, download,
+    live captioning). Centralised here so every caller stays in
+    sync instead of re-building the same string independently.
+    """
+
+    return os.path.join(
+        UPLOAD_DIR,
+        f"{doc.id}_{doc.file_name}",
+    )
+
+
 # ============================================================
 # CREATE FOLDER
 # ============================================================
@@ -505,12 +519,68 @@ def _process_for_rag(
 
         return
 
-    logger.warning(
-        "Unsupported file type for RAG processing: "
-        "document_id=%s mime_type=%s file_name=%s",
+    # --------------------------------------------------------
+    # UNKNOWN EXTENSION FALLBACK
+    #
+    # Any file type not explicitly recognised (.json, .yaml,
+    # .log, .py, .html, .xml, source code, config files, etc.)
+    # is still worth indexing if it's readable as plain text.
+    # Only files that are genuinely binary/undecodable are
+    # skipped. This is what lets the user upload "any type of
+    # file" and still be able to query it.
+    # --------------------------------------------------------
+
+    logger.info(
+        "No specific handler for file type — attempting "
+        "generic text fallback: document_id=%s mime_type=%s "
+        "file_name=%s",
         doc.id,
         doc.mime_type,
         doc.file_name,
+    )
+
+    try:
+        text = _extract_plain_text(file_path)
+
+    except Exception:
+
+        logger.exception(
+            "Generic text fallback failed for document_id=%s "
+            "— file is likely binary/unsupported.",
+            doc.id,
+        )
+
+        return
+
+    if not text or not text.strip():
+
+        logger.warning(
+            "Unsupported file type for RAG processing "
+            "(no extractable text): document_id=%s "
+            "mime_type=%s file_name=%s",
+            doc.id,
+            doc.mime_type,
+            doc.file_name,
+        )
+
+        return
+
+    chunk_count = _chunk_and_index_text(
+        db=db,
+        doc=doc,
+        text=text,
+        conversation_id=conversation_id,
+        user_id=user_id,
+    )
+
+    logger.info(
+        "RAG indexing completed via generic text fallback: "
+        "document_id=%s text_chunks=%s user_id=%s "
+        "conversation_id=%s",
+        doc.id,
+        chunk_count,
+        user_id,
+        conversation_id,
     )
 
 

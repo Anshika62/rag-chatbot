@@ -39,6 +39,8 @@ You have access to:
 3. Uploaded-document knowledge-base search tool
 4. Current date and time tool
 5. Weather tool
+6. Image analysis tool (analyze_image) — only present when the
+   user has attached an image directly to their CURRENT message
 
 Rules:
 
@@ -49,6 +51,13 @@ Rules:
 - If the user asks about an uploaded document, PDF, file, policy, manual,
   FAQ, guideline, documentation, or indexed content, search the knowledge
   base before answering.
+
+- If an image was attached directly to the current message (the
+  analyze_image tool is available), use analyze_image to answer
+  questions about THAT image — it looks at the actual image, so
+  prefer it over search_knowledge_base for a just-attached image.
+  Only fall back to search_knowledge_base for images that were
+  uploaded previously as part of the document knowledge base.
 
 - Use retrieved document content as the source of truth for
   document-related questions.
@@ -138,6 +147,7 @@ def _create_tools(
     user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     document_id: Optional[str] = None,
+    image_paths: Optional[list[str]] = None,
 ):
     if (
         db is None
@@ -155,6 +165,7 @@ def _create_tools(
             if document_id
             else None
         ),
+        image_paths=image_paths,
     )
 
 
@@ -237,9 +248,41 @@ def _execute_tool_calls(
             conversation_id,
         )
 
-        tool_result = selected_tool.invoke(
-            tool_args
-        )
+        try:
+            tool_result = selected_tool.invoke(
+                tool_args
+            )
+
+        except Exception:
+
+            # A single failing tool (KB search down, weather API
+            # timeout, bad image, etc.) must never kill the whole
+            # streamed response. Hand the model a normal tool
+            # result describing the failure instead of letting the
+            # exception propagate and abort the entire answer.
+            logger.exception(
+                "%sTOOL FAILED: tool=%s args=%s "
+                "conversation_id=%s",
+                log_prefix,
+                tool_name,
+                tool_args,
+                conversation_id,
+            )
+
+            tool_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": (
+                        f"The '{tool_name}' tool failed and is "
+                        "temporarily unavailable. Let the user "
+                        "know and answer with whatever other "
+                        "information is available."
+                    ),
+                }
+            )
+
+            continue
 
         logger.info(
             "%sTOOL RESULT: tool=%s conversation_id=%s",
@@ -298,6 +341,7 @@ def generate_answer(
     conversation_id: Optional[str] = None,
     images_output: Optional[list] = None,
     document_id: Optional[str] = None,
+    image_paths: Optional[list[str]] = None,
 ):
     """
     images_output: if a list is passed in, it is extended in-place
@@ -307,6 +351,12 @@ def generate_answer(
     document_id: if provided, scopes the knowledge-base search tool
     to that single uploaded document instead of the whole
     conversation's knowledge base.
+
+    image_paths: local file path(s) of image(s) attached directly
+    to THIS message (not previously uploaded/indexed documents).
+    When provided, an analyze_image tool is bound for this turn so
+    the model can answer questions about the attached image(s)
+    directly from the image bytes.
     """
 
     try:
@@ -321,6 +371,7 @@ def generate_answer(
             user_id=user_id,
             conversation_id=conversation_id,
             document_id=document_id,
+            image_paths=image_paths,
         )
 
         llm_with_tools = _bind_tools(tools)
@@ -465,6 +516,7 @@ def generate_answer_stream(
     conversation_id: Optional[str] = None,
     images_output: Optional[list] = None,
     document_id: Optional[str] = None,
+    image_paths: Optional[list[str]] = None,
 ) -> Generator[str, None, None]:
     """
     images_output: if a list is passed in, it is extended in-place
@@ -475,6 +527,11 @@ def generate_answer_stream(
     document_id: if provided, scopes the knowledge-base search tool
     to that single uploaded document instead of the whole
     conversation's knowledge base.
+
+    image_paths: local file path(s) of image(s) attached directly
+    to THIS message. When provided, an analyze_image tool is bound
+    for this turn so the model can answer questions about the
+    attached image(s) directly from the image bytes.
     """
 
     try:
@@ -489,6 +546,7 @@ def generate_answer_stream(
             user_id=user_id,
             conversation_id=conversation_id,
             document_id=document_id,
+            image_paths=image_paths,
         )
 
         llm_with_tools = _bind_tools(tools)
