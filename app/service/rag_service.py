@@ -9,7 +9,7 @@ from app.repository.conversation_repo import (
     create_message,
 )
 
-from app.service.external.LLM_service import (
+from app.service.external.llm_service import (
     generate_answer,
     generate_answer_stream,
 )
