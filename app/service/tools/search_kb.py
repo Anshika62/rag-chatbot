@@ -9,9 +9,6 @@ from app.service.rag_clients import (
 )
 import os
 
-from PIL import Image
-import pytesseract
-
 from app.service.tools.image_tool import (
     generate_image_caption,
     ImageCaptionQuotaExceededError,
@@ -271,49 +268,45 @@ def create_search_knowledge_base_tool(
 
     user_id = str(user_id)
     conversation_id = str(conversation_id)
-
-    document_id = (
-        str(document_id)
-        if document_id
-        else None
-    )
+    document_id = str(document_id) if document_id else None
 
     @tool
     def search_knowledge_base(
         query: str,
         limit: int = 4,
+        content_type: str = "any",
     ) -> list[dict[str, Any]]:
         """
         Search uploaded documents and indexed knowledge base
         for relevant information.
 
-        For image-related queries on a specific document,
-        returns the extracted image documents directly.
+        Args:
+            query: The search text describing what to look for.
+            limit: Max number of results to return.
+            content_type: Set to "image" whenever the user is
+                asking about an image, picture, photo, figure,
+                diagram, chart, illustration, screenshot, or
+                asking what something "looks like" / what is
+                "shown"/"visible" in an uploaded file — in ANY
+                language or phrasing, including indirect ones
+                like "iska content kya hai" or "ismein kya hai".
+                Set to "text" when the user is clearly asking
+                about textual/written content only. Use "any"
+                (default) only when genuinely unclear.
+                When "image" is passed for a specific document,
+                the extracted image(s) are returned directly
+                instead of running semantic text search.
         """
-
-        # ----------------------------------------------------
-        # Validate query
-        # ----------------------------------------------------
 
         if not query or not query.strip():
             raise ValueError(
                 "Knowledge-base search query cannot be empty."
             )
 
-        # ----------------------------------------------------
-        # Validate limit
-        # ----------------------------------------------------
-
         if limit < 1:
             raise ValueError(
                 "Search result limit must be at least 1."
             )
-
-        # Never allow the LLM to request an excessive number
-        # of vector-search results.
-        #
-        # This limit applies to normal vector search.
-        # Image retrieval below returns all extracted images.
 
         limit = min(limit, 4)
 
@@ -329,48 +322,15 @@ def create_search_knowledge_base_tool(
             document_id,
         )
 
-        # ====================================================
-        # DIRECT PDF IMAGE RETRIEVAL
-        # ====================================================
-
-        # If this is a specific document query and the user is
-        # asking for images, don't use semantic search.
-        #
-        # Instead:
-        #
-        # PDF
-        #   ├── image 1
-        #   ├── image 2
-        #   ├── image 3
-        #   └── ...
-        #
-        # are retrieved directly using parent_id.
-
-        if document_id and _is_image_query(clean_query):
+        if document_id and content_type == "image":
 
             db = SessionLocal()
 
             try:
-
-                # ------------------------------------------------
-                # Verify that the document is accessible
-                # from the current conversation.
-                #
-                # Access is allowed when:
-                #
-                #   1. document belongs to current user
-                #   2. document is global
-                #      OR
-                #   3. document belongs to current conversation
-                # ------------------------------------------------
-
-                parent_doc = (
-                    document_repo.get_accessible_document_by_id(
-                        db=db,
-                        doc_id=document_id,
-                        user_id=user_id,
-                        conversation_id=conversation_id,
-                    )
+                parent_doc = document_repo.get_owned_document_by_id(
+                    db=db,
+                    doc_id=document_id,
+                    user_id=user_id,
                 )
 
                 if not parent_doc:
@@ -384,9 +344,7 @@ def create_search_knowledge_base_tool(
 
                 documents = _retrieve_document_images(
                     db=db,
-                    parent_doc=parent_doc,
-                    user_id=user_id,
-                    conversation_id=conversation_id,
+                    parent_id=parent_doc.id,
                 )
 
                 # ------------------------------------------------
@@ -404,69 +362,31 @@ def create_search_knowledge_base_tool(
                         }
                     ]
 
-                # ------------------------------------------------
-                # Return ALL images
-                # ------------------------------------------------
-
                 return documents
 
             finally:
                 db.close()
 
-        # ====================================================
-        # NORMAL SEMANTIC / VECTOR SEARCH
-        # ====================================================
-
-        # ----------------------------------------------------
-        # Generate query embedding
-        # ----------------------------------------------------
-
-        query_embedding = (
-            embedding_manager.generate_embedding(
-                [clean_query]
-            )
+        query_embedding = embedding_manager.generate_embedding(
+            [clean_query]
         )
 
-        # ----------------------------------------------------
-        # Search Qdrant
-        # ----------------------------------------------------
-        #
-        # user_id is always enforced.
-        #
-        # conversation_id is always passed.
-        #
-        # document_id is also passed when a specific document
-        # has been selected.
-        #
-        # vector_store.search() now applies the document_id
-        # filter directly inside Qdrant.
-        # ----------------------------------------------------
-
-        search_top_k = limit
+        search_top_k = (
+            max(limit * 5, 20)
+            if document_id
+            else limit
+        )
 
         results = vector_store.search(
             query_embedding=query_embedding,
             user_id=user_id,
-            conversation_id=conversation_id,
-            document_id=document_id,
+            conversation_id=(
+                None
+                if document_id
+                else conversation_id
+            ),
             top_k=search_top_k,
         )
-
-        logger.info(
-            "KB SEARCH RESULTS: count=%s",
-            len(results),
-        )
-
-        for point in results:
-
-            logger.info(
-                "KB RESULT PAYLOAD: %s",
-                point.payload,
-            )
-
-        # ----------------------------------------------------
-        # Diagnostic logging
-        # ----------------------------------------------------
 
         logger.info(
             "KB SEARCH RAW: raw_count=%s sample_payload=%s",
@@ -477,10 +397,6 @@ def create_search_knowledge_base_tool(
                 else None
             ),
         )
-
-        # ----------------------------------------------------
-        # Format search results
-        # ----------------------------------------------------
 
         documents: list[dict[str, Any]] = []
 
@@ -501,19 +417,14 @@ def create_search_knowledge_base_tool(
                 "parent_document_id"
             )
 
-            # ------------------------------------------------
-            # Qdrant has already enforced:
-            #
-            #   current user
-            #   conversation/global scope
-            #
-            # and, when document_id is provided:
-            #
-            #   requested document_id
-            #
-            # Therefore we no longer need to retrieve a broad
-            # result set and filter the document afterward.
-            # ------------------------------------------------
+            if document_id:
+                if (
+                    str(point_document_id)
+                    != str(document_id)
+                    and str(point_parent_id)
+                    != str(document_id)
+                ):
+                    continue
 
             documents.append(
                 {
@@ -542,10 +453,6 @@ def create_search_knowledge_base_tool(
 
             if len(documents) >= limit:
                 break
-
-        # ----------------------------------------------------
-        # Logging
-        # ----------------------------------------------------
 
         logger.info(
             "KB SEARCH COMPLETE: count=%s, filenames=%s",

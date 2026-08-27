@@ -13,8 +13,6 @@ from qdrant_client.models import (
     FieldCondition,
     MatchValue,
     PayloadSchemaType,
-    IsNullCondition,
-    PayloadField,
 )
 
 
@@ -32,14 +30,9 @@ class Vectorstore:
         qdrant_url = os.getenv("QDRANT_URL")
         qdrant_api_key = os.getenv("QDRANT_API_KEY")
 
-        if not qdrant_url:
+        if not qdrant_url or not qdrant_api_key:
             raise ValueError(
-                "QDRANT_URL is not configured"
-            )
-
-        if not qdrant_api_key:
-            raise ValueError(
-                "QDRANT_API_KEY is not configured"
+                "QDRANT_URL or QDRANT_API_KEY is not configured"
             )
 
         self.client = QdrantClient(
@@ -48,10 +41,6 @@ class Vectorstore:
         )
 
         self._create_collection()
-
-    # ============================================================
-    # COLLECTION
-    # ============================================================
 
     def _create_collection(self):
 
@@ -73,10 +62,6 @@ class Vectorstore:
             )
 
         self._ensure_indexes()
-
-    # ============================================================
-    # PAYLOAD INDEXES
-    # ============================================================
 
     def _ensure_indexes(self):
 
@@ -119,9 +104,9 @@ class Vectorstore:
 
                 print(f"Qdrant index created: {field_name} -> {field_schema}")
 
-            except Exception as exc:
+            except Exception as e:
 
-                error_message = str(exc).lower()
+                error_message = str(e).lower()
 
                 if (
                     "already exists" in error_message
@@ -172,13 +157,14 @@ class Vectorstore:
         chunks: List[str],
         embeddings,
         filename: str,
-        conversation_id: Optional[str],
+        conversation_id: str,
         user_id: str,
         document_id: str,
         content_type: str = "text",
         parent_document_id: Optional[str] = None,
     ):
 
+        conversation_id = str(conversation_id)
         user_id = str(user_id)
         document_id = str(document_id)
 
@@ -206,9 +192,7 @@ class Vectorstore:
 
         points = []
 
-        for index, (chunk, embedding) in enumerate(
-            zip(chunks, embeddings)
-        ):
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
 
             if not chunk or not str(chunk).strip():
                 continue
@@ -232,27 +216,12 @@ class Vectorstore:
             )
 
         if not points:
-            raise ValueError(
-                "No document chunks available to index"
-            )
+            raise ValueError("No document points available to store")
 
         self.client.upsert(
             collection_name=self.collection_name,
             points=points,
         )
-
-        print(
-            "QDRANT DOCUMENT INDEXED | "
-            f"document_id={document_id} | "
-            f"conversation_id={conversation_id} | "
-            f"user_id={user_id} | "
-            f"filename={filename} | "
-            f"chunks={len(points)}"
-        )
-
-    # ============================================================
-    # ADD CONVERSATION MESSAGES
-    # ============================================================
 
     def add_conversation_messages(
         self,
@@ -312,20 +281,6 @@ class Vectorstore:
 
         user_id = str(user_id)
 
-        if conversation_id is not None:
-            conversation_id = str(
-                conversation_id
-            )
-
-        if document_id is not None:
-            document_id = str(
-                document_id
-            )
-
-        # --------------------------------------------------------
-        # BASE SECURITY FILTER
-        # --------------------------------------------------------
-
         must_conditions = [
             FieldCondition(
                 key="user_id",
@@ -362,34 +317,6 @@ class Vectorstore:
         if document_id is not None:
 
             must_conditions.append(
-                FieldCondition(
-                    key="document_id",
-                    match=MatchValue(
-                        value=document_id,
-                    ),
-                )
-            )
-
-            document_filter = Filter(
-                must=must_conditions,
-            )
-
-        # --------------------------------------------------------
-        # NORMAL CONVERSATION SEARCH
-        # --------------------------------------------------------
-        #
-        # No document selected:
-        #
-        #     Global documents
-        #             +
-        #     Current conversation documents
-        #
-        # Other conversation documents are excluded.
-        # --------------------------------------------------------
-
-        elif conversation_id is not None:
-
-            conversation_scope = [
                 FieldCondition(
                     key="conversation_id",
                     match=MatchValue(
@@ -626,9 +553,7 @@ class Vectorstore:
     ):
 
         user_id = str(user_id)
-        conversation_id = str(
-            conversation_id
-        )
+        conversation_id = str(conversation_id)
 
         history_filter = Filter(
             must=[
