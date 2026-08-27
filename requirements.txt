@@ -109,4 +109,4 @@ google-genai
 openpyxl
 python-docx
 pytesseract
-tesseract-ocr
+
