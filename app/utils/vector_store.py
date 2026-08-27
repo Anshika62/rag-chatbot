@@ -13,6 +13,8 @@ from qdrant_client.models import (
     FieldCondition,
     MatchValue,
     PayloadSchemaType,
+    IsNullCondition,
+    PayloadField,
 )
 
 
@@ -203,7 +205,7 @@ class Vectorstore:
                     vector=embedding.tolist(),
                     payload={
                         "filename": filename,
-                        "chunk_index": index,
+                        "chunk_index": i,
                         "text": chunk,
                         "type": "document",
                         "user_id": user_id,
@@ -275,9 +277,28 @@ class Vectorstore:
         query_embedding,
         user_id: str,
         conversation_id: Optional[str] = None,
-        document_id: Optional[str] = None,
+        content_type: Optional[str] = None,
         top_k: int = 3,
     ):
+        """
+        conversation_id=None:
+            Only global documents (conversation_id IS NULL) are
+            returned — used for document_id-scoped searches, where
+            the caller (search_kb.py) does its own per-document
+            filtering afterwards on a wider candidate set.
+
+        conversation_id=<id>:
+            Both this conversation's own documents AND global
+            documents are returned (a global doc must be usable
+            from any conversation).
+
+        content_type:
+            Optional filter ("text" or "image"). When set, only
+            chunks indexed with that content_type are returned —
+            lets an image-focused question skip straight to
+            image-caption/OCR chunks instead of competing with
+            text chunks on pure vector similarity.
+        """
 
         user_id = str(user_id)
 
@@ -296,67 +317,55 @@ class Vectorstore:
             ),
         ]
 
-        # --------------------------------------------------------
-        # SPECIFIC DOCUMENT
-        # --------------------------------------------------------
-        #
-        # When document_id is explicitly supplied:
-        #
-        #     user_id
-        #     +
-        #     type=document
-        #     +
-        #     document_id
-        #
-        # We intentionally do NOT apply conversation_id here.
-        #
-        # This allows a global document to be selected from
-        # any conversation.
-        # --------------------------------------------------------
-
-        if document_id is not None:
-
+        if content_type:
             must_conditions.append(
                 FieldCondition(
-                    key="conversation_id",
+                    key="content_type",
                     match=MatchValue(
-                        value=conversation_id,
+                        value=content_type,
                     ),
                 ),
-                IsNullCondition(
-                    is_null=PayloadField(
-                        key="conversation_id",
-                    ),
-                ),
-            ]
-
-            document_filter = Filter(
-                must=must_conditions,
-                should=conversation_scope,
             )
 
-        # --------------------------------------------------------
-        # GLOBAL ONLY
-        # --------------------------------------------------------
+        is_global_condition = IsNullCondition(
+            is_null=PayloadField(
+                key="conversation_id",
+            ),
+        )
+
+        if conversation_id is not None:
+
+            conversation_id = str(conversation_id)
+
+            # AND(user_id, type[, content_type], OR(this conversation, global))
+            must_conditions.append(
+                Filter(
+                    should=[
+                        FieldCondition(
+                            key="conversation_id",
+                            match=MatchValue(
+                                value=conversation_id,
+                            ),
+                        ),
+                        is_global_condition,
+                    ],
+                )
+            )
 
         else:
 
-            document_filter = Filter(
-                must=[
-                    *must_conditions,
-                    IsNullCondition(
-                        is_null=PayloadField(
-                            key="conversation_id",
-                        ),
-                    ),
-                ],
-            )
+            # Global-only: conversation_id must be null.
+            must_conditions.append(is_global_condition)
+
+        document_filter = Filter(
+            must=must_conditions,
+        )
 
         print(
             "QDRANT SEARCH | "
             f"user_id={user_id} | "
             f"conversation_id={conversation_id} | "
-            f"document_id={document_id} | "
+            f"content_type={content_type} | "
             f"top_k={top_k}"
         )
 
