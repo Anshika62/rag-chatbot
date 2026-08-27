@@ -7,7 +7,6 @@ from app.service.rag_clients import (
     embedding_manager,
     vector_store,
 )
-<<<<<<< HEAD
 import os
 
 from PIL import Image
@@ -17,8 +16,6 @@ from app.service.tools.image_tool import (
     generate_image_caption,
     ImageCaptionQuotaExceededError,
 )
-=======
->>>>>>> origin/main
 
 from app.repository import document_repo
 from app.core.database import SessionLocal
@@ -27,7 +24,6 @@ from app.core.database import SessionLocal
 logger = logging.getLogger(__name__)
 
 
-<<<<<<< HEAD
 def _extract_text_from_image(image_path: str) -> str:
     """
     Same OCR approach used at upload time in doc_service.py's
@@ -215,7 +211,7 @@ def _retrieve_document_images(
 
     return documents
 
-=======
+
 def _is_image_query(query: str) -> bool:
     """
     Detect whether the user is asking for images,
@@ -251,7 +247,6 @@ def _is_image_query(query: str) -> bool:
         for keyword in image_keywords
     )
 
->>>>>>> origin/main
 
 def create_search_knowledge_base_tool(
     user_id: str,
@@ -387,74 +382,17 @@ def create_search_knowledge_base_tool(
                         }
                     ]
 
-<<<<<<< HEAD
                 documents = _retrieve_document_images(
-=======
-                # ------------------------------------------------
-                # Get all children of the PDF
-                # ------------------------------------------------
-
-                children = document_repo.get_children(
->>>>>>> origin/main
                     db=db,
                     parent_doc=parent_doc,
                     user_id=user_id,
                     conversation_id=conversation_id,
                 )
 
-<<<<<<< HEAD
-=======
-                # ------------------------------------------------
-                # Keep only image documents
-                # ------------------------------------------------
-
-                image_docs = [
-                    doc
-                    for doc in children
-                    if (
-                        not doc.is_folder
-                        and doc.mime_type
-                        and doc.mime_type.startswith("image/")
-                    )
-                ]
-
-                logger.info(
-                    "PDF IMAGE RETRIEVAL: "
-                    "document_id=%s image_count=%s",
-                    document_id,
-                    len(image_docs),
-                )
-
-                # ------------------------------------------------
-                # Format image results
-                # ------------------------------------------------
-
-                documents: list[dict[str, Any]] = []
-
-                for image_doc in image_docs:
-
-                    documents.append(
-                        {
-                            "filename": image_doc.file_name,
-                            "chunk_index": None,
-                            "text": (
-                                f"Image extracted from "
-                                f"{parent_doc.file_name}"
-                            ),
-                            "document_id": str(image_doc.id),
-                            "parent_document_id": str(
-                                parent_doc.id
-                            ),
-                            "content_type": image_doc.mime_type,
-                            "gcs_path": image_doc.gcs_path,
-                        }
-                    )
-
                 # ------------------------------------------------
                 # No images found
                 # ------------------------------------------------
 
->>>>>>> origin/main
                 if not documents:
                     return [
                         {
@@ -619,7 +557,6 @@ def create_search_knowledge_base_tool(
         )
 
         # ----------------------------------------------------
-<<<<<<< HEAD
         # Fallback: if this search was scoped to a specific
         # document and semantic search found nothing (e.g. the
         # document is an image whose caption/embedding was never
@@ -676,11 +613,10 @@ def create_search_knowledge_base_tool(
             finally:
                 db.close()
 
-=======
+        # ----------------------------------------------------
         # No results
         # ----------------------------------------------------
 
->>>>>>> origin/main
         if not documents:
             return [
                 {
