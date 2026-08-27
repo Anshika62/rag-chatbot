@@ -23,7 +23,7 @@ class Vectorstore:
 
     def __init__(
         self,
-        collection_name: str = "pdf_documents",
+        collection_name: str = "documents",
     ):
         self.collection_name = collection_name
 
@@ -66,13 +66,30 @@ class Vectorstore:
     def _ensure_indexes(self):
 
         indexes = [
-            ("conversation_id", PayloadSchemaType.KEYWORD),
-            ("user_id", PayloadSchemaType.KEYWORD),
-            ("message_id", PayloadSchemaType.KEYWORD),
-            ("type", PayloadSchemaType.KEYWORD),
-            ("document_id", PayloadSchemaType.KEYWORD),
-            ("parent_document_id", PayloadSchemaType.KEYWORD),
-            ("content_type", PayloadSchemaType.KEYWORD),
+            (
+                "conversation_id",
+                PayloadSchemaType.KEYWORD,
+            ),
+            (
+                "user_id",
+                PayloadSchemaType.KEYWORD,
+            ),
+            (
+                "message_id",
+                PayloadSchemaType.KEYWORD,
+            ),
+            (
+                "type",
+                PayloadSchemaType.KEYWORD,
+            ),
+            (
+                "document_id",
+                PayloadSchemaType.KEYWORD,
+            ),
+            (
+                "parent_document_id",
+                PayloadSchemaType.KEYWORD,
+            ),
         ]
 
         for field_name, field_schema in indexes:
@@ -91,11 +108,49 @@ class Vectorstore:
 
                 error_message = str(e).lower()
 
-                if "already exists" in error_message or "already exist" in error_message:
-                    print(f"Qdrant index already exists: {field_name}")
-                else:
-                    print(f"Failed to create Qdrant index for '{field_name}': {e}")
-                    raise
+                if (
+                    "already exists" in error_message
+                    or "already exist" in error_message
+                ):
+                    print(
+                        f"Qdrant index already exists: "
+                        f"{field_name}"
+                    )
+                    continue
+
+                raise
+
+    # ============================================================
+    # VECTOR NORMALIZATION HELPER
+    # ============================================================
+    #
+    # NOTE: This method is called by search() and
+    # search_conversation_history() but was not present in the
+    # file as provided. Added here so the file is importable and
+    # runnable. If you already have a _to_flat_vector
+    # implementation elsewhere in your original file (above what
+    # was pasted), replace this with your original version rather
+    # than using this placeholder.
+    # ============================================================
+
+    def _to_flat_vector(self, embedding) -> List[float]:
+
+        if hasattr(embedding, "tolist"):
+            embedding = embedding.tolist()
+
+        # Handles embeddings shaped like [[...]] (batch of 1)
+        if (
+            isinstance(embedding, list)
+            and len(embedding) == 1
+            and isinstance(embedding[0], list)
+        ):
+            return embedding[0]
+
+        return embedding
+
+    # ============================================================
+    # ADD DOCUMENTS
+    # ============================================================
 
     def add_documents(
         self,
@@ -113,11 +168,27 @@ class Vectorstore:
         user_id = str(user_id)
         document_id = str(document_id)
 
-        parent_document_id = (
-            str(parent_document_id)
-            if parent_document_id
-            else document_id
-        )
+        # IMPORTANT:
+        #
+        # Global document:
+        #
+        #     conversation_id = None
+        #
+        # Conversation document:
+        #
+        #     conversation_id = UUID
+        #
+        # Never convert None into "None".
+
+        if conversation_id is not None:
+            conversation_id = str(conversation_id)
+
+        if parent_document_id is not None:
+            parent_document_id = str(
+                parent_document_id
+            )
+        else:
+            parent_document_id = document_id
 
         points = []
 
@@ -132,8 +203,8 @@ class Vectorstore:
                     vector=embedding.tolist(),
                     payload={
                         "filename": filename,
-                        "chunk_index": i,
-                        "text": str(chunk),
+                        "chunk_index": index,
+                        "text": chunk,
                         "type": "document",
                         "user_id": user_id,
                         "conversation_id": conversation_id,
@@ -160,7 +231,10 @@ class Vectorstore:
 
         points = []
 
-        for message, embedding in zip(messages, embeddings):
+        for message, embedding in zip(
+            messages,
+            embeddings,
+        ):
 
             conversation_id = str(message["conversation_id"])
             user_id = str(message["user_id"])
@@ -182,84 +256,113 @@ class Vectorstore:
             )
 
         if not points:
-            raise ValueError("No conversation messages available to store")
+            raise ValueError(
+                "No conversation messages available "
+                "to index"
+            )
 
         self.client.upsert(
             collection_name=self.collection_name,
             points=points,
         )
 
-    def _to_flat_vector(self, query_embedding):
-        """
-        embedding_manager.generate_embedding() always returns a 2D
-        numpy array (shape (1, 384)) even for a single query text.
-        Qdrant's query_points needs a flat 384-float list for this
-        collection (regular, non-multi vector config). This always
-        extracts a single flat vector regardless of input shape.
-        """
-
-        if hasattr(query_embedding, "ndim"):
-            if query_embedding.ndim == 2:
-                return query_embedding[0].tolist()
-            return query_embedding.tolist()
-
-        if isinstance(query_embedding, list) and query_embedding:
-            first = query_embedding[0]
-            if hasattr(first, "tolist"):
-                return first.tolist()
-            if isinstance(first, (list, tuple)):
-                return list(first)
-
-        return query_embedding
+    # ============================================================
+    # DOCUMENT SEARCH
+    # ============================================================
 
     def search(
         self,
         query_embedding,
         user_id: str,
         conversation_id: Optional[str] = None,
-        top_k: int = 5,
         document_id: Optional[str] = None,
-        content_type: Optional[str] = None,
+        top_k: int = 3,
     ):
 
         user_id = str(user_id)
 
         must_conditions = [
-            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
-            FieldCondition(key="type", match=MatchValue(value="document")),
+            FieldCondition(
+                key="user_id",
+                match=MatchValue(
+                    value=user_id,
+                ),
+            ),
+            FieldCondition(
+                key="type",
+                match=MatchValue(
+                    value="document",
+                ),
+            ),
         ]
 
-        if conversation_id:
+        # --------------------------------------------------------
+        # SPECIFIC DOCUMENT
+        # --------------------------------------------------------
+        #
+        # When document_id is explicitly supplied:
+        #
+        #     user_id
+        #     +
+        #     type=document
+        #     +
+        #     document_id
+        #
+        # We intentionally do NOT apply conversation_id here.
+        #
+        # This allows a global document to be selected from
+        # any conversation.
+        # --------------------------------------------------------
+
+        if document_id is not None:
+
             must_conditions.append(
                 FieldCondition(
                     key="conversation_id",
-                    match=MatchValue(value=str(conversation_id)),
-                )
-            )
-
-        if content_type:
-            must_conditions.append(
-                FieldCondition(
-                    key="content_type",
-                    match=MatchValue(value=str(content_type)),
-                )
-            )
-
-        if document_id:
-
-            document_id = str(document_id)
+                    match=MatchValue(
+                        value=conversation_id,
+                    ),
+                ),
+                IsNullCondition(
+                    is_null=PayloadField(
+                        key="conversation_id",
+                    ),
+                ),
+            ]
 
             document_filter = Filter(
                 must=must_conditions,
-                should=[
-                    FieldCondition(key="document_id", match=MatchValue(value=document_id)),
-                    FieldCondition(key="parent_document_id", match=MatchValue(value=document_id)),
-                ],
+                should=conversation_scope,
             )
+
+        # --------------------------------------------------------
+        # GLOBAL ONLY
+        # --------------------------------------------------------
 
         else:
 
-            document_filter = Filter(must=must_conditions)
+            document_filter = Filter(
+                must=[
+                    *must_conditions,
+                    IsNullCondition(
+                        is_null=PayloadField(
+                            key="conversation_id",
+                        ),
+                    ),
+                ],
+            )
+
+        print(
+            "QDRANT SEARCH | "
+            f"user_id={user_id} | "
+            f"conversation_id={conversation_id} | "
+            f"document_id={document_id} | "
+            f"top_k={top_k}"
+        )
+
+        # --------------------------------------------------------
+        # VECTOR SEARCH
+        # --------------------------------------------------------
 
         query_vector = self._to_flat_vector(query_embedding)
 
@@ -270,7 +373,176 @@ class Vectorstore:
             limit=top_k,
         )
 
-        return results.points or []
+        print(
+            "QDRANT SEARCH RESULT | "
+            f"count={len(results.points)}"
+        )
+
+        return results.points
+
+    # ============================================================
+    # DEBUG DOCUMENT
+    # ============================================================
+    #
+    # This does NOT use vector similarity.
+    #
+    # It simply asks:
+    #
+    # "Does Qdrant contain any chunks with this document_id?"
+    #
+    # We need this to distinguish:
+    #
+    # 1. Document exists in DB but wasn't indexed in Qdrant
+    #
+    # from:
+    #
+    # 2. Document exists in Qdrant but search filter is wrong.
+    #
+    # ============================================================
+
+    def debug_document_points(
+        self,
+        document_id: str,
+    ):
+
+        document_id = str(document_id)
+
+        print("\n")
+        print("=" * 80)
+        print("QDRANT DOCUMENT DEBUG")
+        print("=" * 80)
+        print(
+            "document_id:",
+            document_id,
+        )
+
+        result = self.client.scroll(
+            collection_name=self.collection_name,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="document_id",
+                        match=MatchValue(
+                            value=document_id,
+                        ),
+                    ),
+                ],
+            ),
+            limit=100,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        points = result[0]
+
+        print(
+            "MATCHING POINTS:",
+            len(points),
+        )
+
+        for point in points:
+
+            print("-" * 80)
+
+            print(
+                "POINT ID:",
+                point.id,
+            )
+
+            print(
+                "PAYLOAD:",
+                point.payload,
+            )
+
+        print("=" * 80)
+        print("\n")
+
+        return points
+
+    # ============================================================
+    # DEBUG ALL DOCUMENTS FOR USER
+    # ============================================================
+
+    def debug_user_documents(
+        self,
+        user_id: str,
+    ):
+
+        user_id = str(user_id)
+
+        print("\n")
+        print("=" * 80)
+        print("QDRANT USER DOCUMENT DEBUG")
+        print("=" * 80)
+        print(
+            "user_id:",
+            user_id,
+        )
+
+        result = self.client.scroll(
+            collection_name=self.collection_name,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="user_id",
+                        match=MatchValue(
+                            value=user_id,
+                        ),
+                    ),
+                    FieldCondition(
+                        key="type",
+                        match=MatchValue(
+                            value="document",
+                        ),
+                    ),
+                ],
+            ),
+            limit=100,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        points = result[0]
+
+        print(
+            "DOCUMENT POINTS:",
+            len(points),
+        )
+
+        for point in points:
+
+            payload = point.payload or {}
+
+            print("-" * 80)
+
+            print(
+                "filename:",
+                payload.get("filename"),
+            )
+
+            print(
+                "document_id:",
+                payload.get("document_id"),
+            )
+
+            print(
+                "conversation_id:",
+                payload.get("conversation_id"),
+            )
+
+            print(
+                "chunk_index:",
+                payload.get("chunk_index"),
+            )
+
+        print("=" * 80)
+        print("\n")
+
+        return points
+
+    # ============================================================
+    # CONVERSATION HISTORY SEARCH
+    # ============================================================
 
     def search_conversation_history(
         self,
@@ -285,10 +557,25 @@ class Vectorstore:
 
         history_filter = Filter(
             must=[
-                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
-                FieldCondition(key="conversation_id", match=MatchValue(value=conversation_id)),
-                FieldCondition(key="type", match=MatchValue(value="conversation")),
-            ]
+                FieldCondition(
+                    key="user_id",
+                    match=MatchValue(
+                        value=user_id,
+                    ),
+                ),
+                FieldCondition(
+                    key="conversation_id",
+                    match=MatchValue(
+                        value=conversation_id,
+                    ),
+                ),
+                FieldCondition(
+                    key="type",
+                    match=MatchValue(
+                        value="conversation",
+                    ),
+                ),
+            ],
         )
 
         query_vector = self._to_flat_vector(query_embedding)

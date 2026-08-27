@@ -108,3 +108,5 @@ PyMuPDF
 google-genai
 openpyxl
 python-docx
+pytesseract
+
