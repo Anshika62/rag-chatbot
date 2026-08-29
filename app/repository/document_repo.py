@@ -342,6 +342,7 @@ def get_children(
     db: Session,
     parent_id: str,
     conversation_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ):
     """
     Return children belonging to the specified parent.
@@ -352,6 +353,17 @@ def get_children(
 
     If conversation_id is None:
         - only global children are returned
+
+    If user_id is provided:
+        - only children owned by that user are returned.
+
+    user_id is optional (defaults to None / unfiltered) so existing
+    internal callers that have already verified ownership of the
+    parent (and therefore of its children, since children are
+    always created with the same user_id as their parent) keep
+    working unchanged. New/external callers should always pass
+    user_id explicitly as a defense-in-depth measure against
+    cross-user access.
     """
 
     try:
@@ -361,6 +373,11 @@ def get_children(
                 Document.parent_id == parent_id,
             )
         )
+
+        if user_id is not None:
+            query = query.filter(
+                Document.user_id == str(user_id),
+            )
 
         if conversation_id is None:
             query = query.filter(

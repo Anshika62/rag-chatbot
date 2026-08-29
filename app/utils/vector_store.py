@@ -283,9 +283,13 @@ class Vectorstore:
         """
         conversation_id=None:
             Only global documents (conversation_id IS NULL) are
-            returned — used for document_id-scoped searches, where
-            the caller (search_kb.py) does its own per-document
-            filtering afterwards on a wider candidate set.
+            returned. Callers should only pass None here when there
+            genuinely is no conversation context — NOT as a way to
+            widen/narrow a document_id-scoped search. (A
+            document_id-scoped search must still pass the real
+            conversation_id, otherwise a conversation-scoped
+            document's own chunks would be filtered out entirely
+            before the caller's document_id post-filter ever runs.)
 
         conversation_id=<id>:
             Both this conversation's own documents AND global

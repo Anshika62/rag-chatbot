@@ -73,6 +73,8 @@ def _retrieve_document_images(
     children = document_repo.get_children(
         db=db,
         parent_id=parent_doc.id,
+        conversation_id=conversation_id,
+        user_id=user_id,
     )
 
     image_docs.extend(
@@ -418,11 +420,7 @@ def create_search_knowledge_base_tool(
         results = vector_store.search(
             query_embedding=query_embedding,
             user_id=user_id,
-            conversation_id=(
-                None
-                if document_id
-                else conversation_id
-            ),
+            conversation_id=conversation_id,
             content_type=(
                 content_type
                 if content_type in ("text", "image")

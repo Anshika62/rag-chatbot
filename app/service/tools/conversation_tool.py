@@ -18,6 +18,7 @@ from app.service.tools.weather_tool import (
 
 from app.service.tools.image_tool import (
     create_image_tool,
+    create_document_image_analysis_tool,
 )
 
 
@@ -54,13 +55,19 @@ def create_conversation_tools(
        -> Uploaded documents / PDFs / images / CSV / Excel /
           DOCX / TXT / Markdown knowledge-base search.
 
-    3. get_current_datetime
+    3. analyze_document_image
+       -> Vision analysis of a SPECIFIC image previously extracted
+          from an uploaded document/PDF, identified by document_id
+          (as returned by search_knowledge_base). Always available,
+          since it looks up images already stored for this user.
+
+    4. get_current_datetime
        -> Current date and time.
 
-    4. get_weather
+    5. get_weather
        -> Current weather information.
 
-    5. analyze_image (only when image_paths is provided)
+    6. analyze_image (only when image_paths is provided)
        -> Vision analysis of image(s) attached directly to the
           CURRENT chat message.
     """
@@ -129,12 +136,28 @@ def create_conversation_tools(
     )
 
     # ========================================================
+    # DOCUMENT IMAGE ANALYSIS TOOL
+    #
+    # Unlike analyze_image (below), this is always available —
+    # it looks up a previously-uploaded image by document_id
+    # rather than depending on an image attached to THIS message.
+    # ========================================================
+
+    analyze_document_image = (
+        create_document_image_analysis_tool(
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+    )
+
+    # ========================================================
     # RETURN ALL TOOLS
     # ========================================================
 
     tools = [
         get_conversation_history,
         search_knowledge_base,
+        analyze_document_image,
         get_current_datetime,
         get_weather,
     ]

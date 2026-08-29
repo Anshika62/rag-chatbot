@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import Generator, Optional
 
 from fastapi import HTTPException, status
@@ -17,12 +18,60 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # LLM CONFIGURATION
 # ============================================================
+#
+# Both models are configurable via environment variables instead
+# of being hard-coded, per the "environment variables for
+# model/API configuration" requirement. Defaults preserve the
+# existing behavior for the main LLM.
+#
+# MAIN LLM (llm):
+#   Handles normal conversation + decides which tool(s) to call.
+#   Used for everything by default.
+#
+# REASONING LLM (reasoning_llm):
+#   A separate, reasoning-capable model used ONLY for the final
+#   answer-synthesis step, and only when the tool results are
+#   non-trivial (multiple tools, multiple retrieved chunks, or
+#   text+image combined — see _should_use_reasoning below).
+#   Simple chat ("Hello", "What is Python?") and simple single-
+#   tool calls (weather, datetime, a single short KB hit) never
+#   reach this model, so they stay fast and cheap.
+#
+#   The default model (deepseek-r1-distill-llama-70b, hosted on
+#   Groq) natively emits its chain-of-thought wrapped in
+#   <think>...</think> before its actual answer. generate_answer_
+#   stream() below splits that stream into separate "thinking"
+#   and "answer" events so the frontend can show a live
+#   "thinking..." trace (like other reasoning-model chat UIs)
+#   without that reasoning text being saved as the final answer.
+# ============================================================
+
+
+LLM_MODEL_NAME = os.getenv(
+    "LLM_MODEL",
+    "openai/gpt-oss-20b",
+)
+
+REASONING_MODEL_NAME = os.getenv(
+    "REASONING_MODEL",
+    "deepseek-r1-distill-llama-70b",
+)
 
 
 llm = ChatGroq(
-    model="openai/gpt-oss-20b",
+    model=LLM_MODEL_NAME,
     temperature=0.2,
 )
+
+
+reasoning_llm = ChatGroq(
+    model=REASONING_MODEL_NAME,
+    temperature=0.3,
+)
+
+
+THINK_START_TAG = "<think>"
+THINK_END_TAG = "</think>"
 
 
 # ============================================================
@@ -37,9 +86,12 @@ You have access to:
 1. Conversation history
 2. Conversation history tool
 3. Uploaded-document knowledge-base search tool
-4. Current date and time tool
-5. Weather tool
-6. Image analysis tool (analyze_image) — only present when the
+4. Document image analysis tool (analyze_document_image) — for
+   analyzing a SPECIFIC image already extracted from an uploaded
+   document/PDF, identified by document_id
+5. Current date and time tool
+6. Weather tool
+7. Image analysis tool (analyze_image) — only present when the
    user has attached an image directly to their CURRENT message
 
 Rules:
@@ -97,6 +149,20 @@ Rules:
 
 - If the user asks about an image inside a PDF, use the image
   result whose parent_document_id matches the PDF.
+
+- When the user asks you to explain, interpret, or describe what
+  an already-uploaded image/diagram/chart/figure actually shows
+  (not just "is there an image"), first use search_knowledge_base
+  (content_type="image") to find the relevant image and its
+  document_id, then call analyze_document_image with that
+  document_id and the user's specific question. Do not answer
+  such questions using only the cached caption/OCR text if
+  analyze_document_image is available — the actual image should
+  be analyzed for the user's specific question.
+
+- Do not guess a document_id for analyze_document_image. Only use
+  a document_id that was actually returned by search_knowledge_base
+  in this conversation.
 
 - If the knowledge-base search finds no relevant information,
   say that the information was not found in the uploaded
@@ -394,6 +460,40 @@ def _execute_tool_calls(
                         }
                     )
 
+        elif (
+            tool_name == "analyze_document_image"
+            and isinstance(tool_result, dict)
+            and tool_result.get("success")
+            and tool_result.get("document_id")
+        ):
+
+            image_document_id = str(
+                tool_result.get("document_id")
+            )
+
+            collected_images.append(
+                {
+                    "document_id": tool_result.get(
+                        "document_id"
+                    ),
+                    "parent_document_id": (
+                        tool_result.get(
+                            "parent_document_id"
+                        )
+                        or tool_result.get(
+                            "document_id"
+                        )
+                    ),
+                    "filename": tool_result.get(
+                        "filename"
+                    ),
+                    "url": (
+                        f"/documents/"
+                        f"{image_document_id}/file"
+                    ),
+                }
+            )
+
         tool_messages.append(
             {
                 "role": "tool",
@@ -406,6 +506,209 @@ def _execute_tool_calls(
         tool_messages,
         collected_images,
     )
+
+
+# ============================================================
+# REASONING DECISION (Section 16)
+#
+# Keep simple questions simple: "Hello", "What is Python?", a
+# single short knowledge-base hit, or a single weather/datetime
+# call never reach the reasoning model. Reasoning is only used
+# when the tool results actually need to be compared/combined —
+# multiple tools used together, an image analyzed alongside other
+# content, or a substantial amount of retrieved text to reason
+# over.
+# ============================================================
+
+
+REASONING_MIN_TOOL_CONTENT_CHARS = int(
+    os.getenv(
+        "REASONING_MIN_TOOL_CONTENT_CHARS",
+        "600",
+    )
+)
+
+
+def _should_use_reasoning(
+    tool_calls: list,
+    collected_images: list,
+    extra_messages: list,
+) -> bool:
+
+    if not tool_calls:
+        return False
+
+    tool_names = {
+        tool_call["name"]
+        for tool_call in tool_calls
+    }
+
+    # Multiple different tools used together -> results need to
+    # be combined/synthesized.
+    if len(tool_names) > 1:
+        return True
+
+    # An image was analyzed alongside other tool output -> combining
+    # vision output with text is exactly the case Section 16 calls
+    # out for reasoning.
+    if collected_images:
+        return True
+
+    # A single search_knowledge_base call that returned a
+    # substantial amount of text (multiple/long chunks) benefits
+    # from a reasoning pass to compare and synthesize across them.
+    if "search_knowledge_base" in tool_names:
+
+        combined_length = sum(
+            len(str(message.get("content", "")))
+            for message in extra_messages
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "tool"
+            )
+        )
+
+        if combined_length > REASONING_MIN_TOOL_CONTENT_CHARS:
+            return True
+
+    return False
+
+
+# ============================================================
+# THINKING/ANSWER STREAM SPLITTER
+#
+# The reasoning model emits a single continuous token stream that
+# looks like:
+#
+#     <think> ...chain of thought... </think> ...final answer...
+#
+# This splits that stream into separate "thinking" and "answer"
+# events as it arrives, so the caller can show live "thinking..."
+# output (like other reasoning-model chat UIs) without it ending
+# up as part of the saved/displayed final answer. A small tail of
+# text is always held back while scanning for a tag, in case a
+# tag like "<think>" is split across two streamed chunks.
+# ============================================================
+
+
+def _stream_with_thinking_split(
+    model_stream,
+):
+
+    state = "answer"
+    pending = ""
+
+    for chunk in model_stream:
+
+        content = getattr(
+            chunk,
+            "content",
+            "",
+        ) or ""
+
+        if not content:
+            continue
+
+        pending += content
+
+        while pending:
+
+            if state == "answer":
+
+                tag_index = pending.find(
+                    THINK_START_TAG
+                )
+
+                if tag_index == -1:
+
+                    safe_length = max(
+                        0,
+                        len(pending)
+                        - len(THINK_START_TAG),
+                    )
+
+                    if safe_length:
+
+                        yield {
+                            "type": "answer",
+                            "content": pending[
+                                :safe_length
+                            ],
+                        }
+
+                        pending = pending[
+                            safe_length:
+                        ]
+
+                    break
+
+                if tag_index:
+
+                    yield {
+                        "type": "answer",
+                        "content": pending[
+                            :tag_index
+                        ],
+                    }
+
+                pending = pending[
+                    tag_index
+                    + len(THINK_START_TAG):
+                ]
+
+                state = "thinking"
+
+            else:
+
+                tag_index = pending.find(
+                    THINK_END_TAG
+                )
+
+                if tag_index == -1:
+
+                    safe_length = max(
+                        0,
+                        len(pending)
+                        - len(THINK_END_TAG),
+                    )
+
+                    if safe_length:
+
+                        yield {
+                            "type": "thinking",
+                            "content": pending[
+                                :safe_length
+                            ],
+                        }
+
+                        pending = pending[
+                            safe_length:
+                        ]
+
+                    break
+
+                if tag_index:
+
+                    yield {
+                        "type": "thinking",
+                        "content": pending[
+                            :tag_index
+                        ],
+                    }
+
+                pending = pending[
+                    tag_index
+                    + len(THINK_END_TAG):
+                ]
+
+                state = "answer"
+
+    if pending:
+
+        yield {
+            "type": state,
+            "content": pending,
+        }
 
 
 # ============================================================
