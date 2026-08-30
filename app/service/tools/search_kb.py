@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 from PIL import Image
 import pytesseract
@@ -59,7 +59,14 @@ def _retrieve_document_images(
     parent_doc,
     user_id: str,
     conversation_id: str | None,
+    page_number: Optional[int] = None,
 ) -> list[dict[str, Any]]:
+    """
+    page_number:
+        If provided, only images belonging to that exact
+        1-based page/slide are returned (§19 — direct metadata
+        filter, no semantic search).
+    """
 
     image_docs = []
 
@@ -67,6 +74,10 @@ def _retrieve_document_images(
         not parent_doc.is_folder
         and parent_doc.mime_type
         and parent_doc.mime_type.startswith("image/")
+        and (
+            page_number is None
+            or parent_doc.page_number == page_number
+        )
     ):
         image_docs.append(parent_doc)
 
@@ -75,6 +86,7 @@ def _retrieve_document_images(
         parent_id=parent_doc.id,
         conversation_id=conversation_id,
         user_id=user_id,
+        page_number=page_number,
     )
 
     image_docs.extend(
@@ -88,8 +100,10 @@ def _retrieve_document_images(
     )
 
     logger.info(
-        "IMAGE RETRIEVAL: document_id=%s image_count=%s",
+        "IMAGE RETRIEVAL: document_id=%s page_number=%s "
+        "image_count=%s",
         parent_doc.id,
+        page_number,
         len(image_docs),
     )
 
@@ -180,6 +194,7 @@ def _retrieve_document_images(
                         document_id=str(image_doc.id),
                         content_type="image",
                         parent_document_id=str(parent_doc.id),
+                        page_number=image_doc.page_number,
                     )
 
             except ImageCaptionQuotaExceededError:
@@ -220,6 +235,7 @@ def _retrieve_document_images(
                 "document_id": str(image_doc.id),
                 "parent_document_id": str(parent_doc.id),
                 "content_type": image_doc.mime_type,
+                "page_number": image_doc.page_number,
                 "gcs_path": image_doc.gcs_path,
             }
         )
@@ -231,6 +247,12 @@ def _is_image_query(query: str) -> bool:
     """
     Detect whether the user is asking for images,
     pictures, photos, figures, diagrams, charts, etc.
+
+    This is intentionally a SECONDARY signal (§24) — the LLM's own
+    `content_type` tool argument is the primary routing mechanism.
+    This is only consulted as a fallback when the LLM passes
+    content_type="any" and the raw query text is unambiguous, so a
+    plain keyword match never overrides an explicit LLM decision.
     """
 
     image_keywords = [
@@ -279,7 +301,7 @@ def create_search_knowledge_base_tool(
     When document_id is provided, results are scoped to that
     uploaded document.
 
-    For image-related queries on a specific PDF, the tool
+    For image-related queries on a specific PDF/PPTX, the tool
     directly retrieves image child documents instead of relying
     on semantic/vector search.
     """
@@ -302,6 +324,7 @@ def create_search_knowledge_base_tool(
         query: str,
         limit: int = 4,
         content_type: str = "any",
+        page_number: Optional[int] = None,
     ) -> list[dict[str, Any]]:
 
         if not query or not query.strip():
@@ -320,11 +343,31 @@ def create_search_knowledge_base_tool(
 
         clean_query = query.strip()
 
+        # ========================================================
+        # SECONDARY KEYWORD SIGNAL (§24)
+        #
+        # Only used to fill in an ambiguous "any" — never
+        # overrides an explicit "text" or "image" decision made
+        # by the LLM itself.
+        # ========================================================
+
+        effective_content_type = content_type
+
+        if (
+            content_type == "any"
+            and _is_image_query(clean_query)
+        ):
+            effective_content_type = "image"
+
         logger.info(
             "KB SEARCH START: query=%s, limit=%s, "
+            "content_type=%s (effective=%s), page_number=%s, "
             "user_id=%s, conversation_id=%s, document_id=%s",
             clean_query,
             limit,
+            content_type,
+            effective_content_type,
+            page_number,
             user_id,
             conversation_id,
             document_id,
@@ -332,19 +375,24 @@ def create_search_knowledge_base_tool(
 
         # ========================================================
         # DIRECT IMAGE RETRIEVAL
+        #
+        # Triggered by content_type="image" on a specific document,
+        # optionally narrowed to a single page/slide via
+        # page_number (§19). No semantic search involved.
         # ========================================================
 
-        if document_id and content_type == "image":
+        if document_id and effective_content_type == "image":
 
             db = SessionLocal()
 
             try:
 
                 parent_doc = (
-                    document_repo.get_owned_document_by_id(
+                    document_repo.get_accessible_document_by_id(
                         db=db,
                         doc_id=document_id,
                         user_id=user_id,
+                        conversation_id=conversation_id,
                     )
                 )
 
@@ -354,7 +402,10 @@ def create_search_knowledge_base_tool(
                         {
                             "filename": None,
                             "chunk_index": None,
-                            "text": "Document not found.",
+                            "text": (
+                                "Document not found, or is not "
+                                "accessible from this conversation."
+                            ),
                         }
                     ]
 
@@ -363,6 +414,7 @@ def create_search_knowledge_base_tool(
                     parent_doc=parent_doc,
                     user_id=user_id,
                     conversation_id=conversation_id,
+                    page_number=page_number,
                 )
 
                 if not documents:
@@ -372,7 +424,11 @@ def create_search_knowledge_base_tool(
                             "filename": None,
                             "chunk_index": None,
                             "text": (
-                                "No images were found in this PDF."
+                                f"No images were found on page "
+                                f"{page_number} of this document."
+                                if page_number is not None
+                                else "No images were found in "
+                                "this document."
                             ),
                         }
                     ]
@@ -403,6 +459,10 @@ def create_search_knowledge_base_tool(
 
         # ========================================================
         # SEMANTIC SEARCH
+        #
+        # document_id (and page_number, when set) are now applied
+        # as Qdrant payload filters directly — not a client-side
+        # post-filter over an artificially widened top_k window.
         # ========================================================
 
         query_embedding = (
@@ -411,22 +471,18 @@ def create_search_knowledge_base_tool(
             )
         )
 
-        search_top_k = (
-            max(limit * 5, 20)
-            if document_id
-            else limit
-        )
-
         results = vector_store.search(
             query_embedding=query_embedding,
             user_id=user_id,
             conversation_id=conversation_id,
             content_type=(
-                content_type
-                if content_type in ("text", "image")
+                effective_content_type
+                if effective_content_type in ("text", "image")
                 else None
             ),
-            top_k=search_top_k,
+            document_id=document_id,
+            page_number=page_number,
+            top_k=limit,
         )
 
         logger.info(
@@ -461,16 +517,6 @@ def create_search_knowledge_base_tool(
                 "parent_document_id"
             )
 
-            if document_id:
-
-                if (
-                    str(point_document_id)
-                    != str(document_id)
-                    and str(point_parent_id)
-                    != str(document_id)
-                ):
-                    continue
-
             documents.append(
                 {
                     "filename": payload.get(
@@ -493,6 +539,9 @@ def create_search_knowledge_base_tool(
                     "content_type": payload.get(
                         "content_type"
                     ),
+                    "page_number": payload.get(
+                        "page_number"
+                    ),
                 }
             )
 
@@ -510,6 +559,10 @@ def create_search_knowledge_base_tool(
 
         # ========================================================
         # IMAGE FALLBACK
+        #
+        # If a document-scoped semantic search comes back empty,
+        # but the document itself is image-related, fall back to
+        # direct image retrieval rather than reporting "not found".
         # ========================================================
 
         if not documents and document_id:
@@ -519,10 +572,11 @@ def create_search_knowledge_base_tool(
             try:
 
                 parent_doc = (
-                    document_repo.get_owned_document_by_id(
+                    document_repo.get_accessible_document_by_id(
                         db=db,
                         doc_id=document_id,
                         user_id=user_id,
+                        conversation_id=conversation_id,
                     )
                 )
 
@@ -532,6 +586,8 @@ def create_search_knowledge_base_tool(
                         document_repo.get_children(
                             db=db,
                             parent_id=parent_doc.id,
+                            conversation_id=conversation_id,
+                            user_id=user_id,
                         )
                     )
 
@@ -559,6 +615,7 @@ def create_search_knowledge_base_tool(
                                 parent_doc=parent_doc,
                                 user_id=user_id,
                                 conversation_id=conversation_id,
+                                page_number=page_number,
                             )
                         )
 
@@ -605,6 +662,7 @@ def create_search_knowledge_base_tool(
         query: str,
         limit: int = 4,
         content_type: str = "any",
+        page_number: Optional[int] = None,
     ) -> list[dict[str, Any]]:
         """
         Search uploaded documents and indexed knowledge base
@@ -629,6 +687,13 @@ def create_search_knowledge_base_tool(
                 When "image" is passed for a specific document,
                 the extracted image(s) are returned directly
                 instead of running semantic text search.
+
+            page_number: Set this to a specific 1-based page or
+                slide number when the user names an exact page,
+                e.g. "show me the image on page 4" or "what's on
+                slide 4". Leave unset otherwise. Only meaningful
+                together with a specific document (a document_id
+                is already scoped for this conversation turn).
         """
 
         try:
@@ -637,6 +702,7 @@ def create_search_knowledge_base_tool(
                 query=query,
                 limit=limit,
                 content_type=content_type,
+                page_number=page_number,
             )
 
         except ValueError:

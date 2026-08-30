@@ -101,7 +101,14 @@ def create_file(
     user_id: str,
     mime_type: Optional[str],
     conversation_id: Optional[str] = None,
+    page_number: Optional[int] = None,
 ):
+    """
+    page_number:
+        1-based page/slide number for a document extracted from a
+        paginated parent (a PDF page image, a PPTX slide image).
+        None for top-level documents and standalone uploads.
+    """
     try:
         doc = Document(
             file_name=file_name,
@@ -111,6 +118,7 @@ def create_file(
             status=DocumentStatus.UPLOADING,
             conversation_id=conversation_id,
             user_id=user_id,
+            page_number=page_number,
         )
 
         db.add(doc)
@@ -186,7 +194,9 @@ def get_owned_document_by_id(
     Fetch a document only if it belongs to the current user.
 
     This is the basic ownership check and does not apply
-    conversation-scope rules.
+    conversation-scope rules. Prefer get_accessible_document_by_id
+    for any lookup that should also respect conversation scoping
+    (i.e. almost every LLM-tool-triggered lookup).
     """
 
     try:
@@ -343,6 +353,7 @@ def get_children(
     parent_id: str,
     conversation_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    page_number: Optional[int] = None,
 ):
     """
     Return children belonging to the specified parent.
@@ -356,6 +367,11 @@ def get_children(
 
     If user_id is provided:
         - only children owned by that user are returned.
+
+    If page_number is provided:
+        - only children with that exact page_number are returned.
+        Lets a caller ask for "the image(s) on page 4" as a direct
+        metadata filter instead of semantic search (see search_kb.py).
 
     user_id is optional (defaults to None / unfiltered) so existing
     internal callers that have already verified ownership of the
@@ -377,6 +393,11 @@ def get_children(
         if user_id is not None:
             query = query.filter(
                 Document.user_id == str(user_id),
+            )
+
+        if page_number is not None:
+            query = query.filter(
+                Document.page_number == page_number,
             )
 
         if conversation_id is None:

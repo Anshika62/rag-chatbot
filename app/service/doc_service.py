@@ -9,6 +9,7 @@ import pdfplumber
 import pytesseract
 import openpyxl
 import docx  # python-docx
+from pptx import Presentation  # python-pptx
 
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
@@ -43,13 +44,33 @@ os.makedirs(
 
 
 # ============================================================
-# PDF IMAGE CAPTION LIMIT
+# PDF / PPTX IMAGE CAPTION LIMIT
 # ============================================================
 
 MAX_PDF_IMAGES_TO_CAPTION = int(
     os.getenv(
         "MAX_PDF_IMAGES_TO_CAPTION",
         "15",
+    )
+)
+
+
+# ============================================================
+# PER-PAGE RENDERED FALLBACK THRESHOLD (§12)
+#
+# A PDF page whose extracted text is shorter than this (in
+# characters) is treated as "mostly visual" — a diagram, chart,
+# or screenshot that isn't exposed as a normal embedded image
+# object. Such pages are rendered and processed as images IN
+# ADDITION to whatever embedded images/text that page already
+# has, as long as that specific page had zero embedded images
+# extracted (to avoid duplicating a page that's already covered).
+# ============================================================
+
+PDF_PAGE_TEXT_FALLBACK_THRESHOLD = int(
+    os.getenv(
+        "PDF_PAGE_TEXT_FALLBACK_THRESHOLD",
+        "40",
     )
 )
 
@@ -102,6 +123,16 @@ DOCX_MIME_TYPES = {
 }
 
 
+PPTX_EXTENSIONS = {
+    ".pptx",
+}
+
+
+PPTX_MIME_TYPES = {
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+
+
 # ============================================================
 # GCS PATH
 # ============================================================
@@ -128,9 +159,10 @@ def generate_gcs_path(
 def get_local_file_path(doc: Document) -> str:
     """
     The on-disk path convention used everywhere a document's raw
-    file is saved/read (upload, PDF image extraction, download,
-    live captioning). Centralised here so every caller stays in
-    sync instead of re-building the same string independently.
+    file is saved/read (upload, PDF/PPTX image extraction,
+    download, live captioning). Centralised here so every caller
+    stays in sync instead of re-building the same string
+    independently.
     """
 
     return os.path.join(
@@ -414,6 +446,7 @@ def _detect_file_type(
         excel
         text
         docx
+        pptx
         unknown
     """
 
@@ -433,6 +466,9 @@ def _detect_file_type(
     if mime_type in DOCX_MIME_TYPES:
         return "docx"
 
+    if mime_type in PPTX_MIME_TYPES:
+        return "pptx"
+
     extension = os.path.splitext(
         file_name or ""
     )[1].lower()
@@ -451,6 +487,9 @@ def _detect_file_type(
 
     if extension in DOCX_EXTENSIONS:
         return "docx"
+
+    if extension in PPTX_EXTENSIONS:
+        return "pptx"
 
     if extension in TEXT_EXTENSIONS:
         return "text"
@@ -501,6 +540,18 @@ def _process_for_rag(
 
         return
 
+    if file_type == "pptx":
+
+        _process_pptx_for_rag(
+            db=db,
+            doc=doc,
+            file_path=file_path,
+            conversation_id=conversation_id,
+            user_id=user_id,
+        )
+
+        return
+
     if file_type in (
         "csv",
         "excel",
@@ -527,7 +578,11 @@ def _process_for_rag(
     # is still worth indexing if it's readable as plain text.
     # Only files that are genuinely binary/undecodable are
     # skipped. This is what lets the user upload "any type of
-    # file" and still be able to query it.
+    # file" and still be able to query it. Genuinely unsupported
+    # binary formats (.doc, .rtf) fall through to this branch
+    # and will not produce searchable content — that is a real
+    # gap, not a silent false-positive: no fabricated content is
+    # ever indexed for them.
     # --------------------------------------------------------
 
     logger.info(
@@ -649,6 +704,7 @@ def _process_image_for_rag(
         document_id=str(doc.id),
         content_type="image",
         parent_document_id=str(doc.id),
+        page_number=None,
     )
 
     document_repo.create_chunks(
@@ -719,6 +775,7 @@ def _chunk_and_index_text(
         document_id=str(doc.id),
         content_type="text",
         parent_document_id=str(doc.id),
+        page_number=None,
     )
 
     document_repo.create_chunks(
@@ -1051,11 +1108,15 @@ def _delete_recursive(
 
 
 # ============================================================
-# PDF IMAGE PERSISTENCE
+# PAGE-TAGGED IMAGE PERSISTENCE
+#
+# page_index is 0-based (as produced by PyMuPDF / python-pptx
+# enumeration); the stored page_number is always the 1-based
+# human-facing number ("page 4" / "slide 4").
 # ============================================================
 
 
-def _persist_pdf_image(
+def _persist_page_image(
     db: Session,
     parent_doc: Document,
     image_bytes: bytes,
@@ -1091,6 +1152,7 @@ def _persist_pdf_image(
         user_id=user_id,
         mime_type=f"image/{mime_ext}",
         conversation_id=conversation_id,
+        page_number=page_index + 1,
     )
 
     file_path = os.path.join(
@@ -1120,8 +1182,13 @@ def _persist_pdf_image(
     return image_doc
 
 
+# Backward-compatible alias — some earlier internal callers may
+# still reference the old name.
+_persist_pdf_image = _persist_page_image
+
+
 # ============================================================
-# EXTRACT + PERSIST PDF IMAGES
+# EXTRACT + PERSIST PDF IMAGES (embedded XObject images)
 # ============================================================
 
 
@@ -1131,7 +1198,14 @@ def _extract_and_persist_pdf_images(
     file_path: str,
     conversation_id: Optional[str],
     user_id: str,
-) -> list[tuple[Document, str]]:
+) -> list[tuple[Document, str, int]]:
+    """
+    Returns a list of (image_doc, image_path, page_index) tuples,
+    one per persisted embedded image. page_index is 0-based and
+    is used by the caller to know which pages already have at
+    least one embedded image (to avoid re-rendering them in the
+    per-page fallback below).
+    """
 
     results = []
 
@@ -1172,7 +1246,7 @@ def _extract_and_persist_pdf_images(
 
                     continue
 
-                image_doc = _persist_pdf_image(
+                image_doc = _persist_page_image(
                     db=db,
                     parent_doc=parent_doc,
                     image_bytes=base_image["image"],
@@ -1192,6 +1266,7 @@ def _extract_and_persist_pdf_images(
                     (
                         image_doc,
                         image_path,
+                        page_index,
                     )
                 )
 
@@ -1203,214 +1278,27 @@ def _extract_and_persist_pdf_images(
 
 
 # ============================================================
-# PDF RAG
+# SHARED CAPTION + OCR + EMBED + INDEX FOR A LIST OF IMAGES
+#
+# Used by both PDF and PPTX processing so the caption/OCR/embed
+# logic exists in exactly one place (per your instruction not to
+# duplicate functions when the same behavior is needed twice).
 # ============================================================
 
 
-def _process_pdf_for_rag(
+def _caption_and_index_image_pairs(
     db: Session,
-    doc: Document,
-    file_path: str,
+    parent_doc: Document,
+    image_pairs: list[tuple[Document, str]],
     conversation_id: Optional[str],
     user_id: str,
-) -> None:
+) -> tuple[int, int]:
     """
-    PDF processing:
+    image_pairs: list of (image_doc, image_path) — the page_index
+    is not needed here since image_doc.page_number is already set.
 
-    1. Normal PDF text -> chunks -> embeddings -> Qdrant
-
-    2. Embedded PDF images ->
-       child Document ->
-       Gemini caption ->
-       OCR ->
-       combined searchable content ->
-       embeddings -> Qdrant
-
-    3. If no embedded images are found and no text exists,
-       render PDF pages as images and process them.
+    Returns (image_count_indexed, image_count_skipped_due_to_limit).
     """
-
-    # ========================================================
-    # 1. NORMAL PDF TEXT
-    # ========================================================
-
-    text = ""
-
-    try:
-
-        with pdfplumber.open(
-            file_path
-        ) as pdf:
-
-            for page in pdf.pages:
-
-                page_text = (
-                    page.extract_text()
-                    or ""
-                )
-
-                if page_text:
-                    text += (
-                        page_text
-                        + "\n"
-                    )
-
-    except Exception:
-
-        logger.exception(
-            "PDF text extraction failed "
-            "for document_id=%s",
-            doc.id,
-        )
-
-    text_chunks = []
-
-    if text.strip():
-
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=100,
-            separators=[
-                "\n\n",
-                "\n",
-                " ",
-                "",
-            ],
-        )
-
-        text_chunks = text_splitter.split_text(
-            text
-        )
-
-    else:
-
-        logger.warning(
-            "No extractable text for document_id=%s",
-            doc.id,
-        )
-
-    # ========================================================
-    # 2. INDEX NORMAL PDF TEXT
-    # ========================================================
-
-    if text_chunks:
-
-        embeddings = (
-            embedding_manager.generate_embedding(
-                text_chunks
-            )
-        )
-
-        vector_store.add_documents(
-            chunks=text_chunks,
-            embeddings=embeddings,
-            filename=doc.file_name,
-            conversation_id=conversation_id,
-            user_id=str(user_id),
-            document_id=str(doc.id),
-            content_type="text",
-            parent_document_id=str(doc.id),
-        )
-
-        document_repo.create_chunks(
-            db=db,
-            doc_id=doc.id,
-            chunks=text_chunks,
-        )
-
-    # ========================================================
-    # 3. EXTRACT EMBEDDED IMAGES
-    # ========================================================
-
-    image_pairs = []
-
-    try:
-
-        image_pairs = (
-            _extract_and_persist_pdf_images(
-                db=db,
-                parent_doc=doc,
-                file_path=file_path,
-                conversation_id=conversation_id,
-                user_id=user_id,
-            )
-        )
-
-    except Exception:
-
-        logger.exception(
-            "PDF image extraction failed "
-            "for document_id=%s",
-            doc.id,
-        )
-
-    # ========================================================
-    # 4. SCANNED / IMAGE-ONLY PDF FALLBACK
-    # ========================================================
-
-    if not image_pairs and not text_chunks:
-
-        logger.info(
-            "PDF has no extractable text or embedded "
-            "images. Rendering pages as images: "
-            "document_id=%s",
-            doc.id,
-        )
-
-        pdf = fitz.open(
-            file_path
-        )
-
-        try:
-
-            for page_index in range(
-                len(pdf)
-            ):
-
-                page = pdf[page_index]
-
-                pix = page.get_pixmap(
-                    matrix=fitz.Matrix(
-                        2,
-                        2,
-                    ),
-                    alpha=False,
-                )
-
-                image_bytes = pix.tobytes(
-                    "png"
-                )
-
-                image_doc = _persist_pdf_image(
-                    db=db,
-                    parent_doc=doc,
-                    image_bytes=image_bytes,
-                    extension="png",
-                    page_index=page_index,
-                    image_index=0,
-                    conversation_id=conversation_id,
-                    user_id=user_id,
-                )
-
-                image_path = os.path.join(
-                    UPLOAD_DIR,
-                    f"{image_doc.id}_{image_doc.file_name}",
-                )
-
-                image_pairs.append(
-                    (
-                        image_doc,
-                        image_path,
-                    )
-                )
-
-        finally:
-
-            pdf.close()
-
-    # ========================================================
-    # 5. CAPTION LIMIT
-    # ========================================================
 
     image_count = 0
     skipped_count = 0
@@ -1428,18 +1316,14 @@ def _process_pdf_for_rag(
     if skipped_count:
 
         logger.warning(
-            "PDF has %s images; only captioning "
+            "Document has %s images; only captioning "
             "the first %s for document_id=%s. "
             "Remaining images are saved but "
             "not AI-caption indexed.",
             len(image_pairs),
             MAX_PDF_IMAGES_TO_CAPTION,
-            doc.id,
+            parent_doc.id,
         )
-
-    # ========================================================
-    # 6. PROCESS EACH IMAGE
-    # ========================================================
 
     for image_doc, image_path in images_to_process:
 
@@ -1551,7 +1435,8 @@ def _process_pdf_for_rag(
                 user_id=str(user_id),
                 document_id=str(image_doc.id),
                 content_type="image",
-                parent_document_id=str(doc.id),
+                parent_document_id=str(parent_doc.id),
+                page_number=image_doc.page_number,
             )
 
             # ------------------------------------------------
@@ -1567,13 +1452,15 @@ def _process_pdf_for_rag(
             image_count += 1
 
             logger.info(
-                "PDF image indexed successfully: "
+                "Image indexed successfully: "
                 "image_document_id=%s "
                 "parent_document_id=%s "
+                "page_number=%s "
                 "caption=%s "
                 "ocr_chars=%s",
                 image_doc.id,
-                doc.id,
+                parent_doc.id,
+                image_doc.page_number,
                 bool(caption),
                 len(ocr_text),
             )
@@ -1594,7 +1481,7 @@ def _process_pdf_for_rag(
                 "Image-captioning quota exhausted "
                 "while processing document_id=%s. "
                 "Stopping image processing.",
-                doc.id,
+                parent_doc.id,
             )
 
             break
@@ -1606,8 +1493,277 @@ def _process_pdf_for_rag(
                 "image_document_id=%s "
                 "parent_document_id=%s",
                 image_doc.id,
-                doc.id,
+                parent_doc.id,
             )
+
+    return image_count, skipped_count
+
+
+# ============================================================
+# PDF RAG
+# ============================================================
+
+
+def _process_pdf_for_rag(
+    db: Session,
+    doc: Document,
+    file_path: str,
+    conversation_id: Optional[str],
+    user_id: str,
+) -> None:
+    """
+    PDF processing:
+
+    1. Normal PDF text (per page) -> chunks -> embeddings -> Qdrant
+
+    2. Embedded PDF images ->
+       child Document ->
+       Gemini caption ->
+       OCR ->
+       combined searchable content ->
+       embeddings -> Qdrant
+
+    3. Per-page rendered fallback (§12): any page whose extracted
+       text is very short (likely mostly a diagram/chart/
+       screenshot) AND that produced zero embedded images is
+       rendered and processed as an image in addition to whatever
+       else that page has. This covers both the "fully scanned
+       PDF" case (every page qualifies) and the narrower "one
+       page has a vector-drawn chart" case that whole-document
+       text/image emptiness checks miss.
+    """
+
+    # ========================================================
+    # 1. NORMAL PDF TEXT — PER PAGE
+    # ========================================================
+
+    page_texts: list[str] = []
+
+    try:
+
+        with pdfplumber.open(
+            file_path
+        ) as pdf:
+
+            for page in pdf.pages:
+
+                page_text = (
+                    page.extract_text()
+                    or ""
+                )
+
+                page_texts.append(
+                    page_text
+                )
+
+    except Exception:
+
+        logger.exception(
+            "PDF text extraction failed "
+            "for document_id=%s",
+            doc.id,
+        )
+
+        page_texts = []
+
+    full_text = "\n".join(
+        page_text
+        for page_text in page_texts
+        if page_text
+    )
+
+    text_chunks = []
+
+    if full_text.strip():
+
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100,
+            separators=[
+                "\n\n",
+                "\n",
+                " ",
+                "",
+            ],
+        )
+
+        text_chunks = text_splitter.split_text(
+            full_text
+        )
+
+    else:
+
+        logger.warning(
+            "No extractable text for document_id=%s",
+            doc.id,
+        )
+
+    # ========================================================
+    # 2. INDEX NORMAL PDF TEXT
+    # ========================================================
+
+    if text_chunks:
+
+        embeddings = (
+            embedding_manager.generate_embedding(
+                text_chunks
+            )
+        )
+
+        vector_store.add_documents(
+            chunks=text_chunks,
+            embeddings=embeddings,
+            filename=doc.file_name,
+            conversation_id=conversation_id,
+            user_id=str(user_id),
+            document_id=str(doc.id),
+            content_type="text",
+            parent_document_id=str(doc.id),
+            page_number=None,
+        )
+
+        document_repo.create_chunks(
+            db=db,
+            doc_id=doc.id,
+            chunks=text_chunks,
+        )
+
+    # ========================================================
+    # 3. EXTRACT EMBEDDED IMAGES
+    # ========================================================
+
+    embedded_results: list[tuple[Document, str, int]] = []
+
+    try:
+
+        embedded_results = (
+            _extract_and_persist_pdf_images(
+                db=db,
+                parent_doc=doc,
+                file_path=file_path,
+                conversation_id=conversation_id,
+                user_id=user_id,
+            )
+        )
+
+    except Exception:
+
+        logger.exception(
+            "PDF image extraction failed "
+            "for document_id=%s",
+            doc.id,
+        )
+
+    pages_with_embedded_images = {
+        page_index
+        for _, _, page_index in embedded_results
+    }
+
+    image_pairs: list[tuple[Document, str]] = [
+        (image_doc, image_path)
+        for image_doc, image_path, _ in embedded_results
+    ]
+
+    # ========================================================
+    # 4. PER-PAGE RENDERED FALLBACK (§12)
+    #
+    # Render any page that (a) has no embedded image of its own
+    # and (b) has little/no extracted text — covers both fully
+    # scanned PDFs and individual pages with a chart/diagram that
+    # PyMuPDF's get_images() didn't expose as an XObject.
+    # ========================================================
+
+    total_pages = (
+        len(page_texts)
+        if page_texts
+        else len(fitz.open(file_path))
+    )
+
+    pages_needing_render = [
+        page_index
+        for page_index in range(total_pages)
+        if page_index not in pages_with_embedded_images
+        and (
+            page_index >= len(page_texts)
+            or len(
+                (page_texts[page_index] or "").strip()
+            )
+            < PDF_PAGE_TEXT_FALLBACK_THRESHOLD
+        )
+    ]
+
+    if pages_needing_render:
+
+        logger.info(
+            "Rendering %s sparse-text/no-embedded-image page(s) "
+            "as fallback images: document_id=%s pages=%s",
+            len(pages_needing_render),
+            doc.id,
+            pages_needing_render,
+        )
+
+        pdf = fitz.open(
+            file_path
+        )
+
+        try:
+
+            for page_index in pages_needing_render:
+
+                page = pdf[page_index]
+
+                pix = page.get_pixmap(
+                    matrix=fitz.Matrix(
+                        2,
+                        2,
+                    ),
+                    alpha=False,
+                )
+
+                image_bytes = pix.tobytes(
+                    "png"
+                )
+
+                image_doc = _persist_page_image(
+                    db=db,
+                    parent_doc=doc,
+                    image_bytes=image_bytes,
+                    extension="png",
+                    page_index=page_index,
+                    image_index=0,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                )
+
+                image_path = os.path.join(
+                    UPLOAD_DIR,
+                    f"{image_doc.id}_{image_doc.file_name}",
+                )
+
+                image_pairs.append(
+                    (
+                        image_doc,
+                        image_path,
+                    )
+                )
+
+        finally:
+
+            pdf.close()
+
+    # ========================================================
+    # 5. CAPTION + OCR + EMBED + INDEX ALL IMAGES
+    # ========================================================
+
+    image_count, skipped_count = (
+        _caption_and_index_image_pairs(
+            db=db,
+            parent_doc=doc,
+            image_pairs=image_pairs,
+            conversation_id=conversation_id,
+            user_id=user_id,
+        )
+    )
 
     logger.info(
         "RAG indexing completed: "
@@ -1619,6 +1775,238 @@ def _process_pdf_for_rag(
         "conversation_id=%s",
         doc.id,
         len(text_chunks),
+        image_count,
+        skipped_count,
+        user_id,
+        conversation_id,
+    )
+
+
+# ============================================================
+# PPTX TEXT EXTRACTION
+# ============================================================
+
+
+def _extract_pptx_text(
+    file_path: str,
+) -> str:
+
+    presentation = Presentation(
+        file_path
+    )
+
+    lines = []
+
+    for slide_index, slide in enumerate(
+        presentation.slides
+    ):
+
+        slide_lines = []
+
+        for shape in slide.shapes:
+
+            if (
+                shape.has_text_frame
+                and shape.text_frame.text.strip()
+            ):
+
+                slide_lines.append(
+                    shape.text_frame.text.strip()
+                )
+
+            if shape.has_table:
+
+                for row in shape.table.rows:
+
+                    row_text = ", ".join(
+                        cell.text.strip()
+                        for cell in row.cells
+                        if cell.text.strip()
+                    )
+
+                    if row_text:
+                        slide_lines.append(
+                            row_text
+                        )
+
+        if slide_lines:
+
+            lines.append(
+                f"Slide {slide_index + 1}:\n"
+                + "\n".join(slide_lines)
+            )
+
+    return "\n\n".join(lines)
+
+
+# ============================================================
+# PPTX IMAGE EXTRACTION
+# ============================================================
+
+
+def _extract_and_persist_pptx_images(
+    db: Session,
+    parent_doc: Document,
+    file_path: str,
+    conversation_id: Optional[str],
+    user_id: str,
+) -> list[tuple[Document, str]]:
+
+    presentation = Presentation(
+        file_path
+    )
+
+    results = []
+
+    # python-pptx picture shape type
+    PICTURE_SHAPE_TYPE = 13
+
+    for slide_index, slide in enumerate(
+        presentation.slides
+    ):
+
+        image_index = 0
+
+        for shape in slide.shapes:
+
+            try:
+
+                if shape.shape_type != PICTURE_SHAPE_TYPE:
+                    continue
+
+                image = shape.image
+
+                image_doc = _persist_page_image(
+                    db=db,
+                    parent_doc=parent_doc,
+                    image_bytes=image.blob,
+                    extension=(
+                        image.ext
+                        or "png"
+                    ),
+                    page_index=slide_index,
+                    image_index=image_index,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                )
+
+                image_path = os.path.join(
+                    UPLOAD_DIR,
+                    f"{image_doc.id}_{image_doc.file_name}",
+                )
+
+                results.append(
+                    (
+                        image_doc,
+                        image_path,
+                    )
+                )
+
+                image_index += 1
+
+            except Exception:
+
+                logger.warning(
+                    "Unable to extract PPTX image "
+                    "slide=%s document_id=%s",
+                    slide_index,
+                    parent_doc.id,
+                    exc_info=True,
+                )
+
+                continue
+
+    return results
+
+
+# ============================================================
+# PPTX RAG
+# ============================================================
+
+
+def _process_pptx_for_rag(
+    db: Session,
+    doc: Document,
+    file_path: str,
+    conversation_id: Optional[str],
+    user_id: str,
+) -> None:
+
+    # ========================================================
+    # 1. TEXT
+    # ========================================================
+
+    try:
+
+        text = _extract_pptx_text(
+            file_path
+        )
+
+    except Exception:
+
+        logger.exception(
+            "PPTX text extraction failed "
+            "for document_id=%s",
+            doc.id,
+        )
+
+        text = ""
+
+    chunk_count = _chunk_and_index_text(
+        db=db,
+        doc=doc,
+        text=text,
+        conversation_id=conversation_id,
+        user_id=user_id,
+    )
+
+    # ========================================================
+    # 2. IMAGES
+    # ========================================================
+
+    image_pairs: list[tuple[Document, str]] = []
+
+    try:
+
+        image_pairs = (
+            _extract_and_persist_pptx_images(
+                db=db,
+                parent_doc=doc,
+                file_path=file_path,
+                conversation_id=conversation_id,
+                user_id=user_id,
+            )
+        )
+
+    except Exception:
+
+        logger.exception(
+            "PPTX image extraction failed "
+            "for document_id=%s",
+            doc.id,
+        )
+
+    image_count, skipped_count = (
+        _caption_and_index_image_pairs(
+            db=db,
+            parent_doc=doc,
+            image_pairs=image_pairs,
+            conversation_id=conversation_id,
+            user_id=user_id,
+        )
+    )
+
+    logger.info(
+        "RAG indexing completed: "
+        "document_id=%s "
+        "file_type=pptx "
+        "text_chunks=%s "
+        "image_chunks=%s "
+        "image_chunks_skipped=%s "
+        "user_id=%s "
+        "conversation_id=%s",
+        doc.id,
+        chunk_count,
         image_count,
         skipped_count,
         user_id,
@@ -1888,7 +2276,7 @@ def upload_document_stream_service(
                 ),
             }
 
-    except Exception as exc:
+    except Exception:
 
         logger.exception(
             "Unexpected error during streamed upload "
