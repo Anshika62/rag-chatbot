@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import Generator, Optional
 
 from fastapi import HTTPException, status
@@ -17,12 +18,60 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # LLM CONFIGURATION
 # ============================================================
+#
+# Both models are configurable via environment variables instead
+# of being hard-coded, per the "environment variables for
+# model/API configuration" requirement. Defaults preserve the
+# existing behavior for the main LLM.
+#
+# MAIN LLM (llm):
+#   Handles normal conversation + decides which tool(s) to call.
+#   Used for everything by default.
+#
+# REASONING LLM (reasoning_llm):
+#   A separate, reasoning-capable model used ONLY for the final
+#   answer-synthesis step, and only when the tool results are
+#   non-trivial (multiple tools, multiple retrieved chunks, or
+#   text+image combined — see _should_use_reasoning below).
+#   Simple chat ("Hello", "What is Python?") and simple single-
+#   tool calls (weather, datetime, a single short KB hit) never
+#   reach this model, so they stay fast and cheap.
+#
+#   The default model (deepseek-r1-distill-llama-70b, hosted on
+#   Groq) natively emits its chain-of-thought wrapped in
+#   <think>...</think> before its actual answer. generate_answer_
+#   stream() below splits that stream into separate "thinking"
+#   and "answer" events so the frontend can show a live
+#   "thinking..." trace (like other reasoning-model chat UIs)
+#   without that reasoning text being saved as the final answer.
+# ============================================================
+
+
+LLM_MODEL_NAME = os.getenv(
+    "LLM_MODEL",
+    "openai/gpt-oss-20b",
+)
+
+REASONING_MODEL_NAME = os.getenv(
+    "REASONING_MODEL",
+    "deepseek-r1-distill-llama-70b",
+)
 
 
 llm = ChatGroq(
-    model="openai/gpt-oss-20b",
+    model=LLM_MODEL_NAME,
     temperature=0.2,
 )
+
+
+reasoning_llm = ChatGroq(
+    model=REASONING_MODEL_NAME,
+    temperature=0.3,
+)
+
+
+THINK_START_TAG = "<think>"
+THINK_END_TAG = "</think>"
 
 
 # ============================================================
@@ -37,9 +86,12 @@ You have access to:
 1. Conversation history
 2. Conversation history tool
 3. Uploaded-document knowledge-base search tool
-4. Current date and time tool
-5. Weather tool
-6. Image analysis tool (analyze_image) — only present when the
+4. Document image analysis tool (analyze_document_image) — for
+   analyzing a SPECIFIC image already extracted from an uploaded
+   document/PDF, identified by document_id
+5. Current date and time tool
+6. Weather tool
+7. Image analysis tool (analyze_image) — only present when the
    user has attached an image directly to their CURRENT message
 
 Rules:
@@ -98,6 +150,20 @@ Rules:
 - If the user asks about an image inside a PDF, use the image
   result whose parent_document_id matches the PDF.
 
+- When the user asks you to explain, interpret, or describe what
+  an already-uploaded image/diagram/chart/figure actually shows
+  (not just "is there an image"), first use search_knowledge_base
+  (content_type="image") to find the relevant image and its
+  document_id, then call analyze_document_image with that
+  document_id and the user's specific question. Do not answer
+  such questions using only the cached caption/OCR text if
+  analyze_document_image is available — the actual image should
+  be analyzed for the user's specific question.
+
+- Do not guess a document_id for analyze_document_image. Only use
+  a document_id that was actually returned by search_knowledge_base
+  in this conversation.
+
 - If the knowledge-base search finds no relevant information,
   say that the information was not found in the uploaded
   knowledge base.
@@ -149,14 +215,22 @@ def _build_messages(
         )
 
     document_context = (
-        "YES. An uploaded document is available for this "
-        "conversation. If the current question could be "
-        "answered from the uploaded document, use "
-        "search_knowledge_base before answering."
+        "YES. This turn is scoped to one specific uploaded "
+        "document. If the current question could be answered "
+        "from it, use search_knowledge_base before answering."
         if document_available
         else
-        "No specific uploaded document is selected for "
-        "this turn."
+        "Documents MAY be available in the knowledge base for "
+        "this user — either global documents (uploaded without "
+        "being tied to a conversation) or documents uploaded "
+        "within this conversation. No single document_id is "
+        "pre-selected for this turn, but search_knowledge_base "
+        "still searches across all documents accessible to this "
+        "user/conversation. If the current question could "
+        "reasonably be answered from an uploaded document, use "
+        "search_knowledge_base before answering from general "
+        "knowledge — do not assume no document exists just "
+        "because none is pre-selected."
     )
 
     prompt = ChatPromptTemplate.from_messages(
@@ -394,6 +468,40 @@ def _execute_tool_calls(
                         }
                     )
 
+        elif (
+            tool_name == "analyze_document_image"
+            and isinstance(tool_result, dict)
+            and tool_result.get("success")
+            and tool_result.get("document_id")
+        ):
+
+            image_document_id = str(
+                tool_result.get("document_id")
+            )
+
+            collected_images.append(
+                {
+                    "document_id": tool_result.get(
+                        "document_id"
+                    ),
+                    "parent_document_id": (
+                        tool_result.get(
+                            "parent_document_id"
+                        )
+                        or tool_result.get(
+                            "document_id"
+                        )
+                    ),
+                    "filename": tool_result.get(
+                        "filename"
+                    ),
+                    "url": (
+                        f"/documents/"
+                        f"{image_document_id}/file"
+                    ),
+                }
+            )
+
         tool_messages.append(
             {
                 "role": "tool",
@@ -405,6 +513,289 @@ def _execute_tool_calls(
     return (
         tool_messages,
         collected_images,
+    )
+
+
+# ============================================================
+# REASONING DECISION (Section 16)
+#
+# Keep simple questions simple: "Hello", "What is Python?", a
+# single short knowledge-base hit, or a single weather/datetime
+# call never reach the reasoning model. Reasoning is only used
+# when the tool results actually need to be compared/combined —
+# multiple tools used together, an image analyzed alongside other
+# content, or a substantial amount of retrieved text to reason
+# over.
+# ============================================================
+
+
+REASONING_MIN_TOOL_CONTENT_CHARS = int(
+    os.getenv(
+        "REASONING_MIN_TOOL_CONTENT_CHARS",
+        "600",
+    )
+)
+
+
+def _should_use_reasoning(
+    tool_calls: list,
+    collected_images: list,
+    extra_messages: list,
+) -> bool:
+
+    if not tool_calls:
+        return False
+
+    tool_names = {
+        tool_call["name"]
+        for tool_call in tool_calls
+    }
+
+    # Multiple different tools used together -> results need to
+    # be combined/synthesized.
+    if len(tool_names) > 1:
+        return True
+
+    # An image was analyzed alongside other tool output -> combining
+    # vision output with text is exactly the case Section 16 calls
+    # out for reasoning.
+    if collected_images:
+        return True
+
+    # A single search_knowledge_base call that returned a
+    # substantial amount of text (multiple/long chunks) benefits
+    # from a reasoning pass to compare and synthesize across them.
+    if "search_knowledge_base" in tool_names:
+
+        combined_length = sum(
+            len(str(message.get("content", "")))
+            for message in extra_messages
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "tool"
+            )
+        )
+
+        if combined_length > REASONING_MIN_TOOL_CONTENT_CHARS:
+            return True
+
+    return False
+
+
+# ============================================================
+# THINKING/ANSWER STREAM SPLITTER
+#
+# The reasoning model emits a single continuous token stream that
+# looks like:
+#
+#     <think> ...chain of thought... </think> ...final answer...
+#
+# This splits that stream into separate "thinking" and "answer"
+# events as it arrives, so the caller can show live "thinking..."
+# output (like other reasoning-model chat UIs) without it ending
+# up as part of the saved/displayed final answer. A small tail of
+# text is always held back while scanning for a tag, in case a
+# tag like "<think>" is split across two streamed chunks.
+# ============================================================
+
+
+def _stream_with_thinking_split(
+    model_stream,
+):
+
+    state = "answer"
+    pending = ""
+
+    for chunk in model_stream:
+
+        content = getattr(
+            chunk,
+            "content",
+            "",
+        ) or ""
+
+        if not content:
+            continue
+
+        pending += content
+
+        while pending:
+
+            if state == "answer":
+
+                tag_index = pending.find(
+                    THINK_START_TAG
+                )
+
+                if tag_index == -1:
+
+                    safe_length = max(
+                        0,
+                        len(pending)
+                        - len(THINK_START_TAG),
+                    )
+
+                    if safe_length:
+
+                        yield {
+                            "type": "answer",
+                            "content": pending[
+                                :safe_length
+                            ],
+                        }
+
+                        pending = pending[
+                            safe_length:
+                        ]
+
+                    break
+
+                if tag_index:
+
+                    yield {
+                        "type": "answer",
+                        "content": pending[
+                            :tag_index
+                        ],
+                    }
+
+                pending = pending[
+                    tag_index
+                    + len(THINK_START_TAG):
+                ]
+
+                state = "thinking"
+
+            else:
+
+                tag_index = pending.find(
+                    THINK_END_TAG
+                )
+
+                if tag_index == -1:
+
+                    safe_length = max(
+                        0,
+                        len(pending)
+                        - len(THINK_END_TAG),
+                    )
+
+                    if safe_length:
+
+                        yield {
+                            "type": "thinking",
+                            "content": pending[
+                                :safe_length
+                            ],
+                        }
+
+                        pending = pending[
+                            safe_length:
+                        ]
+
+                    break
+
+                if tag_index:
+
+                    yield {
+                        "type": "thinking",
+                        "content": pending[
+                            :tag_index
+                        ],
+                    }
+
+                pending = pending[
+                    tag_index
+                    + len(THINK_END_TAG):
+                ]
+
+                state = "answer"
+
+    if pending:
+
+        yield {
+            "type": state,
+            "content": pending,
+        }
+
+
+# ============================================================
+# STRIP THINKING (non-streamed reasoning responses)
+#
+# Mirrors _stream_with_thinking_split above, but for a single
+# already-complete response string (used by generate_answer,
+# the non-streaming path). Removes any <think>...</think> block
+# so the model's private chain-of-thought is never returned as
+# part of the final answer.
+# ============================================================
+
+
+def _strip_thinking(text: str) -> str:
+
+    if not text:
+        return text
+
+    result = []
+    remaining = text
+
+    while True:
+
+        start_index = remaining.find(THINK_START_TAG)
+
+        if start_index == -1:
+            result.append(remaining)
+            break
+
+        result.append(remaining[:start_index])
+
+        end_index = remaining.find(
+            THINK_END_TAG,
+            start_index + len(THINK_START_TAG),
+        )
+
+        if end_index == -1:
+            # Unclosed tag — drop everything from the tag onward
+            # rather than risk leaking a partial chain-of-thought.
+            break
+
+        remaining = remaining[
+            end_index + len(THINK_END_TAG):
+        ]
+
+    return "".join(result).strip()
+
+
+# ============================================================
+# REASONING CONTEXT BUILDER
+#
+# Builds the minimal set of messages the reasoning model needs:
+# the original conversation/question messages plus only the tool
+# results actually produced for this turn (retrieved chunks,
+# vision analysis, weather/datetime results, etc). We never hand
+# the reasoning model the raw database/conversation dump — only
+# what _execute_tool_calls already gathered for this turn.
+# ============================================================
+
+
+def _build_reasoning_messages(
+    base_messages: list,
+    tool_messages: list,
+):
+
+    reasoning_instruction = (
+        "human",
+        "Using ONLY the information above (the question, "
+        "conversation context, and tool results), reason "
+        "carefully and produce one clear, well-synthesized "
+        "final answer for the user. Compare/combine "
+        "information across sources where relevant. Do not "
+        "mention that you are a separate reasoning step.",
+    )
+
+    return (
+        base_messages
+        + tool_messages
+        + [reasoning_instruction]
     )
 
 
@@ -491,6 +882,78 @@ def generate_answer(
             images_output.extend(
                 collected_images
             )
+
+        # ====================================================
+        # REASONING STAGE (final-answer synthesis)
+        #
+        # Only used when the tool results actually need to be
+        # compared/combined (see _should_use_reasoning). Simple
+        # single-tool turns keep using the Main LLM directly.
+        # ====================================================
+
+        use_reasoning = _should_use_reasoning(
+            tool_calls=response.tool_calls,
+            collected_images=collected_images,
+            extra_messages=extra_messages,
+        )
+
+        logger.info(
+            "REASONING %s: conversation_id=%s",
+            "SELECTED" if use_reasoning else "SKIPPED",
+            conversation_id,
+        )
+
+        if use_reasoning:
+
+            try:
+
+                logger.info(
+                    "REASONING START: model=%s "
+                    "conversation_id=%s",
+                    REASONING_MODEL_NAME,
+                    conversation_id,
+                )
+
+                reasoning_messages = _build_reasoning_messages(
+                    base_messages=messages,
+                    tool_messages=tool_messages,
+                )
+
+                reasoning_response = reasoning_llm.invoke(
+                    reasoning_messages
+                )
+
+                final_answer = _strip_thinking(
+                    reasoning_response.content
+                )
+
+                if final_answer:
+
+                    logger.info(
+                        "REASONING COMPLETE: conversation_id=%s",
+                        conversation_id,
+                    )
+
+                    return final_answer
+
+                logger.warning(
+                    "REASONING EMPTY RESULT, falling back to "
+                    "main LLM: conversation_id=%s",
+                    conversation_id,
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "REASONING FAILED, falling back to main "
+                    "LLM: conversation_id=%s",
+                    conversation_id,
+                )
+
+        # ====================================================
+        # MAIN LLM FINAL ANSWER (default path / reasoning
+        # fallback)
+        # ====================================================
 
         final_response = llm_with_tools.invoke(
             messages + tool_messages
@@ -762,6 +1225,97 @@ def generate_answer_stream(
         final_messages = (
             messages + tool_messages
         )
+
+        # ====================================================
+        # REASONING STAGE (final-answer synthesis)
+        #
+        # Only used when the tool results actually need to be
+        # compared/combined (see _should_use_reasoning). Simple
+        # single-tool turns keep streaming from the Main LLM
+        # directly, unchanged from prior behavior.
+        # ====================================================
+
+        use_reasoning = _should_use_reasoning(
+            tool_calls=tool_calls,
+            collected_images=collected_images,
+            extra_messages=extra_messages,
+        )
+
+        logger.info(
+            "REASONING %s: conversation_id=%s",
+            "SELECTED" if use_reasoning else "SKIPPED",
+            conversation_id,
+        )
+
+        if use_reasoning:
+
+            reasoning_yielded_any = False
+
+            try:
+
+                logger.info(
+                    "REASONING START: model=%s "
+                    "conversation_id=%s",
+                    REASONING_MODEL_NAME,
+                    conversation_id,
+                )
+
+                reasoning_messages = _build_reasoning_messages(
+                    base_messages=messages,
+                    tool_messages=tool_messages,
+                )
+
+                for piece in _stream_with_thinking_split(
+                    reasoning_llm.stream(reasoning_messages)
+                ):
+
+                    # Only the "answer" portion ever reaches the
+                    # caller — "thinking" (chain-of-thought) is
+                    # intentionally dropped here, never yielded,
+                    # never logged.
+                    if (
+                        piece["type"] == "answer"
+                        and piece["content"]
+                    ):
+
+                        reasoning_yielded_any = True
+
+                        yield piece["content"]
+
+                if reasoning_yielded_any:
+
+                    logger.info(
+                        "REASONING COMPLETE: conversation_id=%s",
+                        conversation_id,
+                    )
+
+                    return
+
+                logger.warning(
+                    "REASONING EMPTY RESULT, falling back to "
+                    "main LLM: conversation_id=%s",
+                    conversation_id,
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "REASONING FAILED: conversation_id=%s",
+                    conversation_id,
+                )
+
+                # If the reasoning model already streamed part of
+                # an answer before failing, do NOT also stream the
+                # Main LLM's answer — that would produce a garbled,
+                # duplicated response. Only fall back to the Main
+                # LLM when reasoning produced nothing at all.
+                if reasoning_yielded_any:
+                    return
+
+        # ====================================================
+        # MAIN LLM FINAL ANSWER (default path / reasoning
+        # fallback)
+        # ====================================================
 
         for chunk in llm_with_tools.stream(
             final_messages

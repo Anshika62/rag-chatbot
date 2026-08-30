@@ -10,8 +10,19 @@ from google import genai
 from google.genai import types
 from langchain_core.tools import tool
 
+from app.repository import document_repo
+from app.core.database import SessionLocal
+
 
 logger = logging.getLogger(__name__)
+
+
+# Local upload directory convention. Kept as a plain literal (matching
+# the existing convention already used in search_kb.py) rather than
+# importing it from doc_service.py, since doc_service.py imports this
+# module (generate_image_caption) — importing back would create a
+# circular import.
+UPLOAD_DIR = "Uploads"
 
 
 client = genai.Client(
@@ -208,3 +219,207 @@ def create_image_tool(
             ) from exc
 
     return analyze_image
+
+
+# ============================================================
+# PREVIOUSLY-UPLOADED DOCUMENT IMAGE TOOL
+#
+# analyze_image (above) only covers images attached directly to
+# the CURRENT chat message. It has no way to look up an image
+# that was extracted from a PDF/document during a PAST upload.
+#
+# search_knowledge_base can locate such an image (by content_type
+# or semantic match) and returns its document_id + cached
+# caption/OCR text, but that cached text was generated once at
+# ingestion time with a generic prompt — it cannot answer a
+# specific question about the image. This tool closes that gap:
+# given a document_id already surfaced by search_knowledge_base,
+# it loads the ACTUAL image bytes from disk and asks Gemini
+# vision the user's specific question.
+# ============================================================
+
+
+def create_document_image_analysis_tool(
+    user_id: str,
+    conversation_id: str | None,
+):
+    user_id = str(user_id)
+
+    conversation_id = (
+        str(conversation_id)
+        if conversation_id
+        else None
+    )
+
+    @tool
+    def analyze_document_image(
+        document_id: str,
+        question: str,
+    ) -> dict[str, Any]:
+        """
+        Analyze a SPECIFIC image that was previously extracted from
+        an uploaded document/PDF (or uploaded standalone), using
+        Gemini vision, to answer a specific question about it.
+
+        Use this — instead of relying only on the cached
+        description text returned by search_knowledge_base —
+        whenever the user asks to interpret, explain, or describe
+        what an already-uploaded image, diagram, chart, table, or
+        figure actually shows. Examples: "Explain the architecture
+        diagram on page 4", "What does this chart show?", "Which
+        components are shown in this diagram?".
+
+        Typical flow: call search_knowledge_base first (with
+        content_type="image") to find the relevant image and its
+        document_id, then call this tool with that document_id and
+        the user's specific question.
+
+        Args:
+            document_id: The document_id of the image, exactly as
+                returned by a previous search_knowledge_base call.
+                Never guess or invent a document_id.
+            question: The specific question to ask about the image.
+        """
+
+        if not document_id or not document_id.strip():
+
+            raise ValueError(
+                "document_id cannot be empty."
+            )
+
+        if not question or not question.strip():
+
+            raise ValueError(
+                "Image question cannot be empty."
+            )
+
+        document_id = document_id.strip()
+
+        db = SessionLocal()
+
+        try:
+
+            image_doc = (
+                document_repo.get_accessible_document_by_id(
+                    db=db,
+                    doc_id=document_id,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                )
+            )
+
+            if not image_doc:
+
+                return {
+                    "success": False,
+                    "analysis": (
+                        "That image document was not found, or "
+                        "is not accessible from this conversation."
+                    ),
+                }
+
+            if (
+                not image_doc.mime_type
+                or not image_doc.mime_type.startswith("image/")
+            ):
+
+                return {
+                    "success": False,
+                    "analysis": (
+                        "The referenced document is not an image."
+                    ),
+                }
+
+            image_path = os.path.join(
+                UPLOAD_DIR,
+                f"{image_doc.id}_{image_doc.file_name}",
+            )
+
+            if not os.path.exists(image_path):
+
+                logger.warning(
+                    "DOCUMENT IMAGE ANALYSIS: file missing on "
+                    "disk for document_id=%s path=%s",
+                    document_id,
+                    image_path,
+                )
+
+                return {
+                    "success": False,
+                    "analysis": (
+                        "The image file could not be found on "
+                        "disk."
+                    ),
+                }
+
+            try:
+
+                image_bytes = _load_image_as_png_bytes(
+                    image_path
+                )
+
+                response = client.models.generate_content(
+                    model="gemini-3.6-flash",
+                    contents=[
+                        types.Part.from_bytes(
+                            data=image_bytes,
+                            mime_type="image/png",
+                        ),
+                        question.strip(),
+                    ],
+                )
+
+            except Exception as exc:
+
+                if _is_quota_exhausted(exc):
+
+                    logger.warning(
+                        "DOCUMENT IMAGE ANALYSIS QUOTA "
+                        "EXCEEDED: document_id=%s",
+                        document_id,
+                    )
+
+                    return {
+                        "success": False,
+                        "analysis": (
+                            "Image analysis quota is currently "
+                            "exhausted. Please try again later."
+                        ),
+                    }
+
+                raise
+
+            return {
+                "success": True,
+                "analysis": response.text or "",
+                "document_id": str(image_doc.id),
+                "parent_document_id": str(
+                    image_doc.parent_id
+                    or image_doc.id
+                ),
+                "filename": image_doc.file_name,
+                "content_type": image_doc.mime_type,
+            }
+
+        except ValueError:
+
+            raise
+
+        except Exception as exc:
+
+            logger.exception(
+                "DOCUMENT IMAGE ANALYSIS ERROR: "
+                "document_id=%s error=%s",
+                document_id,
+                str(exc),
+            )
+
+            raise RuntimeError(
+                f"Unable to analyze document image: {exc}"
+            ) from exc
+
+        finally:
+
+            db.close()
+
+    return analyze_document_image

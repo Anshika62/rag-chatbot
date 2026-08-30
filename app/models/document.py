@@ -6,6 +6,7 @@ from sqlalchemy import (
     String,
     Boolean,
     BigInteger,
+    Integer,
     ForeignKey,
     DateTime,
     Enum,
@@ -72,6 +73,28 @@ class Document(Base):
     size_bytes = Column(
         BigInteger,
         nullable=True,
+    )
+
+    # ========================================================
+    # PAGE NUMBER
+    #
+    # 1-based page/slide number this document belongs to, when
+    # applicable. Only set on child image records extracted from
+    # a paginated parent (PDF page, PPTX slide). NULL for
+    # top-level documents and for standalone image uploads.
+    #
+    # Lets "show me the image on page 4" be answered with a
+    # direct metadata filter instead of semantic search (see
+    # search_kb.py / doc_service.py).
+    #
+    # Requires a migration on existing databases:
+    #     ALTER TABLE documents ADD COLUMN page_number INTEGER;
+    # ========================================================
+
+    page_number = Column(
+        Integer,
+        nullable=True,
+        index=True,
     )
 
     status = Column(

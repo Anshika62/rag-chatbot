@@ -92,6 +92,10 @@ class Vectorstore:
                 "parent_document_id",
                 PayloadSchemaType.KEYWORD,
             ),
+            (
+                "page_number",
+                PayloadSchemaType.INTEGER,
+            ),
         ]
 
         for field_name, field_schema in indexes:
@@ -125,15 +129,6 @@ class Vectorstore:
     # ============================================================
     # VECTOR NORMALIZATION HELPER
     # ============================================================
-    #
-    # NOTE: This method is called by search() and
-    # search_conversation_history() but was not present in the
-    # file as provided. Added here so the file is importable and
-    # runnable. If you already have a _to_flat_vector
-    # implementation elsewhere in your original file (above what
-    # was pasted), replace this with your original version rather
-    # than using this placeholder.
-    # ============================================================
 
     def _to_flat_vector(self, embedding) -> List[float]:
 
@@ -164,8 +159,8 @@ class Vectorstore:
         document_id: str,
         content_type: str = "text",
         parent_document_id: Optional[str] = None,
+        page_number: Optional[int] = None,
     ):
-
 
         # IMPORTANT:
         #
@@ -181,7 +176,7 @@ class Vectorstore:
 
         if conversation_id is not None:
             conversation_id = str(conversation_id)
-            
+
         user_id = str(user_id)
         document_id = str(document_id)
 
@@ -213,6 +208,7 @@ class Vectorstore:
                         "document_id": document_id,
                         "parent_document_id": parent_document_id,
                         "content_type": content_type,
+                        "page_number": page_number,
                     },
                 )
             )
@@ -278,14 +274,20 @@ class Vectorstore:
         user_id: str,
         conversation_id: Optional[str] = None,
         content_type: Optional[str] = None,
+        document_id: Optional[str] = None,
+        page_number: Optional[int] = None,
         top_k: int = 3,
     ):
         """
         conversation_id=None:
             Only global documents (conversation_id IS NULL) are
-            returned — used for document_id-scoped searches, where
-            the caller (search_kb.py) does its own per-document
-            filtering afterwards on a wider candidate set.
+            returned. Callers should only pass None here when there
+            genuinely is no conversation context — NOT as a way to
+            widen/narrow a document_id-scoped search. (A
+            document_id-scoped search must still pass the real
+            conversation_id, otherwise a conversation-scoped
+            document's own chunks would be filtered out entirely
+            before the document_id filter below ever runs.)
 
         conversation_id=<id>:
             Both this conversation's own documents AND global
@@ -298,6 +300,17 @@ class Vectorstore:
             lets an image-focused question skip straight to
             image-caption/OCR chunks instead of competing with
             text chunks on pure vector similarity.
+
+        document_id:
+            Optional filter. When set, only chunks whose
+            document_id OR parent_document_id matches are
+            returned. This is applied as a Qdrant payload filter
+            (not a client-side post-filter), so it never competes
+            with unrelated documents for a limited top_k window.
+
+        page_number:
+            Optional filter. When set, only chunks belonging to
+            that exact 1-based page/slide are returned.
         """
 
         user_id = str(user_id)
@@ -327,6 +340,39 @@ class Vectorstore:
                 ),
             )
 
+        if document_id:
+
+            document_id = str(document_id)
+
+            must_conditions.append(
+                Filter(
+                    should=[
+                        FieldCondition(
+                            key="document_id",
+                            match=MatchValue(
+                                value=document_id,
+                            ),
+                        ),
+                        FieldCondition(
+                            key="parent_document_id",
+                            match=MatchValue(
+                                value=document_id,
+                            ),
+                        ),
+                    ],
+                )
+            )
+
+        if page_number is not None:
+            must_conditions.append(
+                FieldCondition(
+                    key="page_number",
+                    match=MatchValue(
+                        value=page_number,
+                    ),
+                ),
+            )
+
         is_global_condition = IsNullCondition(
             is_null=PayloadField(
                 key="conversation_id",
@@ -337,7 +383,8 @@ class Vectorstore:
 
             conversation_id = str(conversation_id)
 
-            # AND(user_id, type[, content_type], OR(this conversation, global))
+            # AND(user_id, type[, content_type][, document_id]
+            #     [, page_number], OR(this conversation, global))
             must_conditions.append(
                 Filter(
                     should=[
@@ -366,6 +413,8 @@ class Vectorstore:
             f"user_id={user_id} | "
             f"conversation_id={conversation_id} | "
             f"content_type={content_type} | "
+            f"document_id={document_id} | "
+            f"page_number={page_number} | "
             f"top_k={top_k}"
         )
 
@@ -391,22 +440,6 @@ class Vectorstore:
 
     # ============================================================
     # DEBUG DOCUMENT
-    # ============================================================
-    #
-    # This does NOT use vector similarity.
-    #
-    # It simply asks:
-    #
-    # "Does Qdrant contain any chunks with this document_id?"
-    #
-    # We need this to distinguish:
-    #
-    # 1. Document exists in DB but wasn't indexed in Qdrant
-    #
-    # from:
-    #
-    # 2. Document exists in Qdrant but search filter is wrong.
-    #
     # ============================================================
 
     def debug_document_points(
