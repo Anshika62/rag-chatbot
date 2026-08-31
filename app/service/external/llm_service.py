@@ -54,7 +54,7 @@ LLM_MODEL_NAME = os.getenv(
 
 REASONING_MODEL_NAME = os.getenv(
     "REASONING_MODEL",
-    "deepseek-r1-distill-llama-70b",
+    "openai/gpt-oss-120b",
 )
 
 
