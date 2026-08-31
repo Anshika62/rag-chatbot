@@ -37,19 +37,22 @@ logger = logging.getLogger(__name__)
 #   tool calls (weather, datetime, a single short KB hit) never
 #   reach this model, so they stay fast and cheap.
 #
-#   The default model (openai/gpt-oss-120b, hosted on Groq) does
-#   NOT support the reasoning_format parameter at all (Groq
-#   rejects it with a 400 error for gpt-oss models), and does not
-#   wrap its reasoning in <think>...</think> tags in the content
-#   stream either. This means _stream_with_thinking_split below
-#   currently never finds a <think> tag for this model, so every
-#   piece it yields comes back as {"type": "answer", ...} — there
-#   is no live "thinking" trace for gpt-oss-120b with the current
-#   setup. To get a genuine live thinking trace, switch
-#   REASONING_MODEL to a model that does emit <think> tags inline
-#   (e.g. a DeepSeek-R1-distill or Qwen3 reasoning model on Groq)
-#   — the splitting/streaming logic below already supports that
-#   case unchanged.
+#   The reasoning model is qwen/qwen3.6-27b, currently Groq's
+#   highest-intelligence-ranked reasoning model. Unlike
+#   openai/gpt-oss-120b (which rejects reasoning_format entirely
+#   and only exposes reasoning via a separate include_reasoning
+#   flag), qwen3.6-27b officially supports reasoning_format="raw",
+#   which makes Groq inline the chain-of-thought as
+#   <think>...</think> at the start of the streamed content —
+#   exactly what _stream_with_thinking_split() below is built to
+#   split into "thinking" vs "answer" pieces. That function also
+#   still checks additional_kwargs["reasoning_content"] as a second
+#   mechanism, so switching REASONING_MODEL to a gpt-oss model
+#   later would keep working without further changes. Every piece
+#   — thinking or answer — is yielded as {"type": "thinking"/
+#   "answer", "content": ...} so the frontend can render a live
+#   "thinking..." trace as it happens, while still saving only the
+#   "answer" portion as the final message content.
 # ============================================================
 
 
@@ -60,7 +63,7 @@ LLM_MODEL_NAME = os.getenv(
 
 REASONING_MODEL_NAME = os.getenv(
     "REASONING_MODEL",
-    "openai/gpt-oss-120b",
+    "qwen/qwen3.6-27b",
 )
 
 
@@ -73,6 +76,7 @@ llm = ChatGroq(
 reasoning_llm = ChatGroq(
     model=REASONING_MODEL_NAME,
     temperature=0.3,
+    reasoning_format="raw",
 )
 
 
@@ -602,6 +606,22 @@ def _should_use_reasoning(
 # up as part of the saved/displayed final answer. A small tail of
 # text is always held back while scanning for a tag, in case a
 # tag like "<think>" is split across two streamed chunks.
+#
+# Two different mechanisms are checked on every chunk, since
+# different reasoning models expose their chain-of-thought
+# differently:
+#
+#   1. additional_kwargs["reasoning_content"] (or ["reasoning"])
+#      — used by openai/gpt-oss-20b / openai/gpt-oss-120b on Groq,
+#      which return reasoning as a separate field per chunk
+#      instead of inlining it in .content.
+#
+#   2. <think>...</think> tags inline inside .content — used by
+#      DeepSeek-R1-distill and some other reasoning models.
+#
+# A model only ever uses one of the two, so only one branch will
+# ever produce output for a given REASONING_MODEL — the other is
+# simply a silent no-op.
 # ============================================================
 
 
@@ -613,6 +633,28 @@ def _stream_with_thinking_split(
     pending = ""
 
     for chunk in model_stream:
+
+        # ---- mechanism 1: separate reasoning field per chunk ----
+
+        extra_kwargs = getattr(
+            chunk,
+            "additional_kwargs",
+            None,
+        ) or {}
+
+        reasoning_piece = (
+            extra_kwargs.get("reasoning_content")
+            or extra_kwargs.get("reasoning")
+        )
+
+        if reasoning_piece:
+
+            yield {
+                "type": "thinking",
+                "content": reasoning_piece,
+            }
+
+        # ---- mechanism 2: inline <think> tags inside .content ----
 
         content = getattr(
             chunk,
