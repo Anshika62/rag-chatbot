@@ -37,12 +37,19 @@ logger = logging.getLogger(__name__)
 #   tool calls (weather, datetime, a single short KB hit) never
 #   reach this model, so they stay fast and cheap.
 #
-#   #The default model (openai/gpt-oss-120b, hosted on Groq) does
-#   not emit <think> tags, but generate_answer_stream() below
-#   still supports splitting a stream into separate "thinking"
-#   and "answer" events (for any reasoning model that does emit
-#   them) so the frontend can show a live "thinking..." trace
-#   without that reasoning text being saved as the final answer.
+#   The default model (openai/gpt-oss-120b, hosted on Groq) does
+#   NOT support the reasoning_format parameter at all (Groq
+#   rejects it with a 400 error for gpt-oss models), and does not
+#   wrap its reasoning in <think>...</think> tags in the content
+#   stream either. This means _stream_with_thinking_split below
+#   currently never finds a <think> tag for this model, so every
+#   piece it yields comes back as {"type": "answer", ...} — there
+#   is no live "thinking" trace for gpt-oss-120b with the current
+#   setup. To get a genuine live thinking trace, switch
+#   REASONING_MODEL to a model that does emit <think> tags inline
+#   (e.g. a DeepSeek-R1-distill or Qwen3 reasoning model on Groq)
+#   — the splitting/streaming logic below already supports that
+#   case unchanged.
 # ============================================================
 
 
@@ -1070,7 +1077,7 @@ def generate_answer_stream(
     images_output: Optional[list] = None,
     document_id: Optional[str] = None,
     image_paths: Optional[list[str]] = None,
-) -> Generator[str, None, None]:
+) -> Generator[dict, None, None]:
 
     """
     document_id:
@@ -1080,6 +1087,15 @@ def generate_answer_stream(
     image_paths:
         Local file path(s) of image(s) attached directly to
         THIS message.
+
+    Yields:
+        dicts of the form {"type": "thinking" | "answer",
+        "content": str}. "thinking" pieces are the reasoning
+        model's live chain-of-thought (only ever produced during
+        the REASONING STAGE below) and should be shown to the
+        user as a transient "thinking..." trace, never saved as
+        the final message content. "answer" pieces are the real
+        response and should be both streamed and saved.
     """
 
     try:
@@ -1148,7 +1164,10 @@ def generate_answer_stream(
 
                 if chunk.content:
 
-                    yield chunk.content
+                    yield {
+                        "type": "answer",
+                        "content": chunk.content,
+                    }
 
             return
 
@@ -1264,24 +1283,37 @@ def generate_answer_stream(
                     tool_messages=tool_messages,
                 )
 
+                reasoning_answer_yielded = False
+
                 for piece in _stream_with_thinking_split(
                     reasoning_llm.stream(reasoning_messages)
                 ):
 
-                    # Only the "answer" portion ever reaches the
-                    # caller — "thinking" (chain-of-thought) is
-                    # intentionally dropped here, never yielded,
-                    # never logged.
-                    if (
-                        piece["type"] == "answer"
-                        and piece["content"]
-                    ):
+                    if not piece["content"]:
+                        continue
+
+                    if piece["type"] == "thinking":
+
+                        # Live chain-of-thought — shown to the
+                        # user as a transient "thinking..." trace.
+                        # Never saved as the final answer.
+
+                        yield {
+                            "type": "thinking",
+                            "content": piece["content"],
+                        }
+
+                    elif piece["type"] == "answer":
 
                         reasoning_yielded_any = True
+                        reasoning_answer_yielded = True
 
-                        yield piece["content"]
+                        yield {
+                            "type": "answer",
+                            "content": piece["content"],
+                        }
 
-                if reasoning_yielded_any:
+                if reasoning_answer_yielded:
 
                     logger.info(
                         "REASONING COMPLETE: conversation_id=%s",
@@ -1322,7 +1354,10 @@ def generate_answer_stream(
 
             if chunk.content:
 
-                yield chunk.content
+                yield {
+                    "type": "answer",
+                    "content": chunk.content,
+                }
 
     except HTTPException:
 

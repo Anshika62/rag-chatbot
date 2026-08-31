@@ -189,7 +189,22 @@ def query_documents_stream(
         full_answer = ""
         images_output: list = []
 
-        for chunk in generate_answer_stream(
+        # ====================================================
+        # STREAM LOOP
+        #
+        # generate_answer_stream() now yields structured pieces:
+        #     {"type": "thinking", "content": "..."}
+        #     {"type": "answer",   "content": "..."}
+        #
+        # "thinking" pieces are the reasoning model's live
+        # chain-of-thought. They are streamed to the client as
+        # their own "thinking" SSE event so the UI can render a
+        # live "thinking..." trace, but they are intentionally
+        # NEVER appended to full_answer and NEVER persisted —
+        # only the "answer" pieces make up the saved message.
+        # ====================================================
+
+        for piece in generate_answer_stream(
             question=question,
             chat_history=chat_history,
             db=db,
@@ -199,10 +214,31 @@ def query_documents_stream(
             document_id=document_id,
             image_paths=image_paths,
         ):
-            if not chunk:
+            if not piece:
                 continue
 
-            full_answer += chunk
+            piece_type = piece.get("type", "answer")
+            piece_content = piece.get("content")
+
+            if not piece_content:
+                continue
+
+            if piece_type == "thinking":
+
+                yield {
+                    "event": "thinking",
+                    "success": True,
+                    "error_code": None,
+                    "conversation_id": conversation_id,
+                    "message_id": user_message.id,
+                    "delta": piece_content,
+                    "text_content": full_answer,
+                    "images": [],
+                }
+
+                continue
+
+            full_answer += piece_content
 
             yield {
                 "event": "delta",
@@ -210,7 +246,7 @@ def query_documents_stream(
                 "error_code": None,
                 "conversation_id": conversation_id,
                 "message_id": user_message.id,
-                "delta": chunk,
+                "delta": piece_content,
                 "text_content": full_answer,
                 "images": [],
             }
