@@ -37,12 +37,11 @@ logger = logging.getLogger(__name__)
 #   tool calls (weather, datetime, a single short KB hit) never
 #   reach this model, so they stay fast and cheap.
 #
-#   The default model (deepseek-r1-distill-llama-70b, hosted on
-#   Groq) natively emits its chain-of-thought wrapped in
-#   <think>...</think> before its actual answer. generate_answer_
-#   stream() below splits that stream into separate "thinking"
-#   and "answer" events so the frontend can show a live
-#   "thinking..." trace (like other reasoning-model chat UIs)
+#   #The default model (openai/gpt-oss-120b, hosted on Groq) does
+#   not emit <think> tags, but generate_answer_stream() below
+#   still supports splitting a stream into separate "thinking"
+#   and "answer" events (for any reasoning model that does emit
+#   them) so the frontend can show a live "thinking..." trace
 #   without that reasoning text being saved as the final answer.
 # ============================================================
 
