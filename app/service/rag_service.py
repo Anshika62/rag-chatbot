@@ -253,6 +253,13 @@ def query_documents_stream(
 
         if not full_answer.strip():
             full_answer = "I was unable to generate a response."
+        else:
+            # A stray leading newline sometimes appears before the
+            # reasoning model's <think> tag (e.g. qwen3.6-27b), which
+            # gets classified as a tiny "answer" piece by the tag
+            # splitter before thinking begins. Strip it so the saved
+            # message doesn't start with extra blank lines.
+            full_answer = full_answer.strip()
 
         # Persist images alongside the assistant message so they are
         # still there after a page refresh (GET /conversation/{id}),
