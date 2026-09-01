@@ -582,6 +582,66 @@ class Vectorstore:
 
         return points
 
+        # ============================================================
+    # DELETE DOCUMENT VECTORS
+    # ============================================================
+
+    def delete_document(
+        self,
+        document_id: str,
+    ):
+        """
+        Delete all Qdrant points belonging to a document
+        and its child documents/images.
+
+        A parent document can have child documents such as
+        extracted PDF images. Child points use:
+            document_id = child_id
+            parent_document_id = parent_id
+
+        Therefore we delete points where either:
+            document_id == document_id
+        OR:
+            parent_document_id == document_id
+        """
+
+        document_id = str(document_id)
+
+        delete_filter = Filter(
+            should=[
+                FieldCondition(
+                    key="document_id",
+                    match=MatchValue(
+                        value=document_id,
+                    ),
+                ),
+                FieldCondition(
+                    key="parent_document_id",
+                    match=MatchValue(
+                        value=document_id,
+                    ),
+                ),
+            ]
+        )
+
+        print(
+            "QDRANT DELETE | "
+            f"document_id={document_id}"
+        )
+
+        result = self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=delete_filter,
+            wait=True,
+        )
+
+        print(
+            "QDRANT DELETE COMPLETE | "
+            f"document_id={document_id}"
+        )
+
+        return result
+
     # ============================================================
     # CONVERSATION HISTORY SEARCH
     # ============================================================
