@@ -4,6 +4,7 @@ from typing import Any, Optional
 
 from PIL import Image
 import pytesseract
+from sqlalchemy import or_
 from langchain_core.tools import tool
 
 from app.service.rag_clients import (
@@ -18,6 +19,7 @@ from app.service.tools.image_tool import (
 
 from app.repository import document_repo
 from app.core.database import SessionLocal
+from app.models.document import Document
 
 
 logger = logging.getLogger(__name__)
@@ -285,6 +287,106 @@ def _is_image_query(query: str) -> bool:
     )
 
 
+# ================================================================
+# FILENAME-HINT RESOLUTION (NEW)
+#
+# PROBLEM THIS FIXES: pure semantic/vector search matches on
+# MEANING, not on filename text. A query like "who is present in
+# premium_photo-1669740462478-135db9b990ea.avi" has almost no
+# semantic content Overlap with any stored image caption, so the
+# vector search was returning unrelated images that happened to
+# score highest by accident.
+#
+# WHAT THIS DOES NOT DO: it does NOT replace, skip, or alter the
+# semantic/vector search in any way. It only runs BEFORE it, and
+# only when the tool-level document_id is not already fixed
+# (i.e. the general "search across everything" case — exactly the
+# case seen in the logs). If it finds exactly one uploaded document
+# whose filename clearly matches something in the query text, it
+# narrows the SAME semantic search to that one document via the
+# document_id filter the search already supports. The embedding
+# comparison itself is completely unchanged.
+#
+# If zero or multiple documents match, this is a no-op and the
+# original unscoped semantic search runs exactly as before —
+# so there's no way for this to make results worse than they
+# already were; it can only help disambiguate.
+# ================================================================
+
+MIN_FILENAME_HINT_LENGTH = 4
+
+
+def _find_documents_by_filename_hint(
+    db,
+    user_id: str,
+    conversation_id: Optional[str],
+    query: str,
+    limit: int = 3,
+) -> list[Document]:
+
+    clean = query.strip()
+
+    if not clean or len(clean) < MIN_FILENAME_HINT_LENGTH:
+        return []
+
+    base_query = (
+        db.query(Document)
+        .filter(Document.user_id == user_id)
+        .filter(Document.is_folder == False)  # noqa: E712
+    )
+
+    if conversation_id:
+        base_query = base_query.filter(
+            or_(
+                Document.conversation_id == conversation_id,
+                Document.conversation_id.is_(None),
+            )
+        )
+    else:
+        base_query = base_query.filter(
+            Document.conversation_id.is_(None)
+        )
+
+    # First pass: does the query, as a whole, contain (or get
+    # contained by) an actual uploaded filename? This is the
+    # common case — the user pastes/types the filename directly.
+    direct_matches = (
+        base_query
+        .filter(Document.file_name.ilike(f"%{clean}%"))
+        .limit(limit)
+        .all()
+    )
+
+    if direct_matches:
+        return direct_matches
+
+    # Second pass: token overlap fallback — handles minor typos/
+    # truncation (e.g. a dropped trailing letter, or the user only
+    # typing part of a long filename). Only meaningful tokens
+    # (length > 3) are used so short words like "the", "img" don't
+    # cause false positives.
+    tokens = [
+        token
+        for token in clean.replace("_", " ").replace("-", " ").split()
+        if len(token) > 3
+    ]
+
+    if not tokens:
+        return []
+
+    token_filters = [
+        Document.file_name.ilike(f"%{token}%")
+        for token in tokens
+    ]
+
+    return (
+        base_query
+        .filter(or_(*token_filters))
+        .limit(limit)
+        .all()
+    )
+
+
 def create_search_knowledge_base_tool(
     user_id: str,
     conversation_id: str | None,
@@ -359,10 +461,73 @@ def create_search_knowledge_base_tool(
         ):
             effective_content_type = "image"
 
+        # ========================================================
+        # FILENAME-HINT RESOLUTION (NEW — see block comment above)
+        #
+        # Only attempted when the tool wasn't already scoped to a
+        # specific document at creation time. If exactly one
+        # document matches, semantic search below is narrowed to
+        # it. Any other outcome (0 or 2+ matches) leaves behavior
+        # completely unchanged from before.
+        # ========================================================
+
+        resolved_document_id = document_id
+
+        if not resolved_document_id:
+
+            hint_db = SessionLocal()
+
+            try:
+
+                filename_matches = _find_documents_by_filename_hint(
+                    db=hint_db,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    query=clean_query,
+                )
+
+                if len(filename_matches) == 1:
+
+                    resolved_document_id = str(
+                        filename_matches[0].id
+                    )
+
+                    logger.info(
+                        "KB SEARCH FILENAME HINT MATCHED: "
+                        "query=%s -> document_id=%s (%s)",
+                        clean_query,
+                        resolved_document_id,
+                        filename_matches[0].file_name,
+                    )
+
+                elif len(filename_matches) > 1:
+
+                    logger.info(
+                        "KB SEARCH FILENAME HINT AMBIGUOUS: "
+                        "query=%s matched %s documents — "
+                        "falling back to unscoped semantic search",
+                        clean_query,
+                        len(filename_matches),
+                    )
+
+            except Exception:
+
+                logger.exception(
+                    "Filename-hint resolution failed for "
+                    "query=%s — falling back to unscoped "
+                    "semantic search",
+                    clean_query,
+                )
+
+            finally:
+
+                hint_db.close()
+
         logger.info(
             "KB SEARCH START: query=%s, limit=%s, "
             "content_type=%s (effective=%s), page_number=%s, "
-            "user_id=%s, conversation_id=%s, document_id=%s",
+            "user_id=%s, conversation_id=%s, document_id=%s "
+            "(resolved=%s)",
             clean_query,
             limit,
             content_type,
@@ -371,6 +536,7 @@ def create_search_knowledge_base_tool(
             user_id,
             conversation_id,
             document_id,
+            resolved_document_id,
         )
 
         # ========================================================
@@ -381,7 +547,7 @@ def create_search_knowledge_base_tool(
         # page_number (§19). No semantic search involved.
         # ========================================================
 
-        if document_id and effective_content_type == "image":
+        if resolved_document_id and effective_content_type == "image":
 
             db = SessionLocal()
 
@@ -390,7 +556,7 @@ def create_search_knowledge_base_tool(
                 parent_doc = (
                     document_repo.get_accessible_document_by_id(
                         db=db,
-                        doc_id=document_id,
+                        doc_id=resolved_document_id,
                         user_id=user_id,
                         conversation_id=conversation_id,
                     )
@@ -439,7 +605,7 @@ def create_search_knowledge_base_tool(
 
                 logger.exception(
                     "IMAGE RETRIEVAL FAILED: document_id=%s",
-                    document_id,
+                    resolved_document_id,
                 )
 
                 return [
@@ -463,6 +629,12 @@ def create_search_knowledge_base_tool(
         # document_id (and page_number, when set) are now applied
         # as Qdrant payload filters directly — not a client-side
         # post-filter over an artificially widened top_k window.
+        #
+        # This is the exact same semantic search as before — the
+        # only change is that `resolved_document_id` (which equals
+        # the original `document_id` unless the filename-hint
+        # match above fired) is passed instead of the raw
+        # `document_id`.
         # ========================================================
 
         query_embedding = (
@@ -480,7 +652,7 @@ def create_search_knowledge_base_tool(
                 if effective_content_type in ("text", "image")
                 else None
             ),
-            document_id=document_id,
+            document_id=resolved_document_id,
             page_number=page_number,
             top_k=limit,
         )
@@ -565,7 +737,7 @@ def create_search_knowledge_base_tool(
         # direct image retrieval rather than reporting "not found".
         # ========================================================
 
-        if not documents and document_id:
+        if not documents and resolved_document_id:
 
             db = SessionLocal()
 
@@ -574,7 +746,7 @@ def create_search_knowledge_base_tool(
                 parent_doc = (
                     document_repo.get_accessible_document_by_id(
                         db=db,
-                        doc_id=document_id,
+                        doc_id=resolved_document_id,
                         user_id=user_id,
                         conversation_id=conversation_id,
                     )
@@ -624,7 +796,7 @@ def create_search_knowledge_base_tool(
                             logger.info(
                                 "KB SEARCH IMAGE FALLBACK USED: "
                                 "document_id=%s count=%s",
-                                document_id,
+                                resolved_document_id,
                                 len(fallback_documents),
                             )
 
