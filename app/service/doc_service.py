@@ -2,7 +2,6 @@ import csv
 import os
 import logging
 from typing import Optional
-
 from PIL import Image
 import fitz  # PyMuPDF
 import pdfplumber
@@ -344,13 +343,25 @@ def upload_document_service(
 
     try:
 
-        _process_for_rag(
+        # ----------------------------------------------------
+        # _process_for_rag is now a GENERATOR (it yields progress
+        # events for the SSE upload flow). This non-streaming
+        # variant has nowhere to send those events, but it still
+        # MUST iterate the generator — otherwise the generator
+        # object is created and immediately discarded, and none
+        # of the actual extraction/embedding/indexing code inside
+        # it ever runs. Draining it with a for-loop is what
+        # actually executes the work.
+        # ----------------------------------------------------
+
+        for _ in _process_for_rag(
             db=db,
             doc=doc,
             file_path=file_path,
             conversation_id=conversation_id,
             user_id=user_id,
-        )
+        ):
+            pass
 
         doc = document_repo.update_file_storage_info(
             db=db,
@@ -508,7 +519,14 @@ def _process_for_rag(
     file_path: str,
     conversation_id: Optional[str],
     user_id: str,
-) -> None:
+):
+    """
+    NOTE: this is now a GENERATOR. It yields progress dicts of the
+    shape {"percent": int, "message": str} while it works, and the
+    caller (upload_document_stream_service) forwards each one as
+    its own SSE "processing" event so the frontend can render a
+    live progress bar instead of jumping straight from 10% to 100%.
+    """
 
     file_type = _detect_file_type(
         file_path=file_path,
@@ -516,9 +534,14 @@ def _process_for_rag(
         file_name=doc.file_name,
     )
 
+    yield {
+        "percent": 15,
+        "message": "Analyzing file...",
+    }
+
     if file_type == "image":
 
-        _process_image_for_rag(
+        yield from _process_image_for_rag(
             db=db,
             doc=doc,
             file_path=file_path,
@@ -530,7 +553,7 @@ def _process_for_rag(
 
     if file_type == "pdf":
 
-        _process_pdf_for_rag(
+        yield from _process_pdf_for_rag(
             db=db,
             doc=doc,
             file_path=file_path,
@@ -542,7 +565,7 @@ def _process_for_rag(
 
     if file_type == "pptx":
 
-        _process_pptx_for_rag(
+        yield from _process_pptx_for_rag(
             db=db,
             doc=doc,
             file_path=file_path,
@@ -559,7 +582,7 @@ def _process_for_rag(
         "docx",
     ):
 
-        _process_tabular_or_text_for_rag(
+        yield from _process_tabular_or_text_for_rag(
             db=db,
             doc=doc,
             file_path=file_path,
@@ -594,6 +617,11 @@ def _process_for_rag(
         doc.file_name,
     )
 
+    yield {
+        "percent": 30,
+        "message": "Extracting text...",
+    }
+
     try:
         text = _extract_plain_text(file_path)
 
@@ -620,6 +648,11 @@ def _process_for_rag(
 
         return
 
+    yield {
+        "percent": 60,
+        "message": "Generating embeddings...",
+    }
+
     chunk_count = _chunk_and_index_text(
         db=db,
         doc=doc,
@@ -627,6 +660,11 @@ def _process_for_rag(
         conversation_id=conversation_id,
         user_id=user_id,
     )
+
+    yield {
+        "percent": 95,
+        "message": "Finalizing...",
+    }
 
     logger.info(
         "RAG indexing completed via generic text fallback: "
@@ -650,7 +688,12 @@ def _process_image_for_rag(
     file_path: str,
     conversation_id: Optional[str],
     user_id: str,
-) -> None:
+):
+
+    yield {
+        "percent": 30,
+        "message": "Analyzing image...",
+    }
 
     try:
 
@@ -687,6 +730,11 @@ def _process_image_for_rag(
 
         return
 
+    yield {
+        "percent": 65,
+        "message": "Generating embeddings...",
+    }
+
     chunks = [
         caption.strip()
     ]
@@ -694,6 +742,11 @@ def _process_image_for_rag(
     embeddings = embedding_manager.generate_embedding(
         chunks
     )
+
+    yield {
+        "percent": 90,
+        "message": "Indexing...",
+    }
 
     vector_store.add_documents(
         chunks=chunks,
@@ -967,7 +1020,12 @@ def _process_tabular_or_text_for_rag(
     file_type: str,
     conversation_id: Optional[str],
     user_id: str,
-) -> None:
+):
+
+    yield {
+        "percent": 30,
+        "message": "Extracting text...",
+    }
 
     try:
 
@@ -1006,6 +1064,11 @@ def _process_tabular_or_text_for_rag(
 
         return
 
+    yield {
+        "percent": 60,
+        "message": "Generating embeddings...",
+    }
+
     chunk_count = _chunk_and_index_text(
         db=db,
         doc=doc,
@@ -1013,6 +1076,11 @@ def _process_tabular_or_text_for_rag(
         conversation_id=conversation_id,
         user_id=user_id,
     )
+
+    yield {
+        "percent": 95,
+        "message": "Finalizing...",
+    }
 
     logger.info(
         "RAG indexing completed: document_id=%s "
@@ -1292,12 +1360,20 @@ def _caption_and_index_image_pairs(
     image_pairs: list[tuple[Document, str]],
     conversation_id: Optional[str],
     user_id: str,
-) -> tuple[int, int]:
+    progress_start: int = 60,
+    progress_end: int = 90,
+):
     """
     image_pairs: list of (image_doc, image_path) — the page_index
     is not needed here since image_doc.page_number is already set.
 
-    Returns (image_count_indexed, image_count_skipped_due_to_limit).
+    This is a GENERATOR: it yields a {"percent": ..., "message": ...}
+    progress event after each image is processed (scaled between
+    progress_start and progress_end, so the caller can place this
+    loop wherever it falls in the overall pipeline), and RETURNS
+    (image_count_indexed, image_count_skipped_due_to_limit) —
+    callers should capture that via
+    `result = yield from _caption_and_index_image_pairs(...)`.
     """
 
     image_count = 0
@@ -1306,6 +1382,8 @@ def _caption_and_index_image_pairs(
     images_to_process = image_pairs[
         :MAX_PDF_IMAGES_TO_CAPTION
     ]
+
+    total_images = len(images_to_process)
 
     skipped_count = max(
         0,
@@ -1325,7 +1403,9 @@ def _caption_and_index_image_pairs(
             parent_doc.id,
         )
 
-    for image_doc, image_path in images_to_process:
+    for image_index, (image_doc, image_path) in enumerate(
+        images_to_process
+    ):
 
         try:
 
@@ -1496,6 +1576,32 @@ def _caption_and_index_image_pairs(
                 parent_doc.id,
             )
 
+        # ----------------------------------------------------
+        # PER-IMAGE PROGRESS
+        #
+        # Scaled between progress_start/progress_end so the
+        # caller can place this loop anywhere in its own
+        # percent range (e.g. 60-90 for a PDF that also had a
+        # text phase before this).
+        # ----------------------------------------------------
+
+        current_percent = progress_start + int(
+            (image_index + 1)
+            / total_images
+            * (progress_end - progress_start)
+        )
+
+        yield {
+            "percent": min(
+                current_percent,
+                progress_end,
+            ),
+            "message": (
+                f"Analyzing image {image_index + 1} "
+                f"of {total_images}..."
+            ),
+        }
+
     return image_count, skipped_count
 
 
@@ -1510,9 +1616,10 @@ def _process_pdf_for_rag(
     file_path: str,
     conversation_id: Optional[str],
     user_id: str,
-) -> None:
+):
     """
-    PDF processing:
+    PDF processing (GENERATOR — yields {"percent", "message"}
+    progress events; see _process_for_rag's docstring):
 
     1. Normal PDF text (per page) -> chunks -> embeddings -> Qdrant
 
@@ -1536,6 +1643,11 @@ def _process_pdf_for_rag(
     # ========================================================
     # 1. NORMAL PDF TEXT — PER PAGE
     # ========================================================
+
+    yield {
+        "percent": 25,
+        "message": "Extracting text from PDF...",
+    }
 
     page_texts: list[str] = []
 
@@ -1604,6 +1716,11 @@ def _process_pdf_for_rag(
 
     if text_chunks:
 
+        yield {
+            "percent": 40,
+            "message": "Generating text embeddings...",
+        }
+
         embeddings = (
             embedding_manager.generate_embedding(
                 text_chunks
@@ -1631,6 +1748,11 @@ def _process_pdf_for_rag(
     # ========================================================
     # 3. EXTRACT EMBEDDED IMAGES
     # ========================================================
+
+    yield {
+        "percent": 50,
+        "message": "Extracting images from PDF...",
+    }
 
     embedded_results: list[tuple[Document, str, int]] = []
 
@@ -1702,6 +1824,11 @@ def _process_pdf_for_rag(
             pages_needing_render,
         )
 
+        yield {
+            "percent": 55,
+            "message": "Rendering scanned/visual pages...",
+        }
+
         pdf = fitz.open(
             file_path
         )
@@ -1755,15 +1882,28 @@ def _process_pdf_for_rag(
     # 5. CAPTION + OCR + EMBED + INDEX ALL IMAGES
     # ========================================================
 
-    image_count, skipped_count = (
-        _caption_and_index_image_pairs(
-            db=db,
-            parent_doc=doc,
-            image_pairs=image_pairs,
-            conversation_id=conversation_id,
-            user_id=user_id,
+    if image_pairs:
+
+        image_count, skipped_count = (
+            yield from _caption_and_index_image_pairs(
+                db=db,
+                parent_doc=doc,
+                image_pairs=image_pairs,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                progress_start=60,
+                progress_end=95,
+            )
         )
-    )
+
+    else:
+
+        image_count, skipped_count = 0, 0
+
+        yield {
+            "percent": 95,
+            "message": "Finalizing...",
+        }
 
     logger.info(
         "RAG indexing completed: "
@@ -1930,11 +2070,17 @@ def _process_pptx_for_rag(
     file_path: str,
     conversation_id: Optional[str],
     user_id: str,
-) -> None:
+):
+    """GENERATOR — yields {"percent", "message"} progress events."""
 
     # ========================================================
     # 1. TEXT
     # ========================================================
+
+    yield {
+        "percent": 25,
+        "message": "Extracting text from slides...",
+    }
 
     try:
 
@@ -1952,6 +2098,11 @@ def _process_pptx_for_rag(
 
         text = ""
 
+    yield {
+        "percent": 40,
+        "message": "Generating text embeddings...",
+    }
+
     chunk_count = _chunk_and_index_text(
         db=db,
         doc=doc,
@@ -1963,6 +2114,11 @@ def _process_pptx_for_rag(
     # ========================================================
     # 2. IMAGES
     # ========================================================
+
+    yield {
+        "percent": 50,
+        "message": "Extracting images from slides...",
+    }
 
     image_pairs: list[tuple[Document, str]] = []
 
@@ -1986,15 +2142,28 @@ def _process_pptx_for_rag(
             doc.id,
         )
 
-    image_count, skipped_count = (
-        _caption_and_index_image_pairs(
-            db=db,
-            parent_doc=doc,
-            image_pairs=image_pairs,
-            conversation_id=conversation_id,
-            user_id=user_id,
+    if image_pairs:
+
+        image_count, skipped_count = (
+            yield from _caption_and_index_image_pairs(
+                db=db,
+                parent_doc=doc,
+                image_pairs=image_pairs,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                progress_start=60,
+                progress_end=95,
+            )
         )
-    )
+
+    else:
+
+        image_count, skipped_count = 0, 0
+
+        yield {
+            "percent": 95,
+            "message": "Finalizing...",
+        }
 
     logger.info(
         "RAG indexing completed: "
@@ -2124,6 +2293,7 @@ def upload_document_stream_service(
 
         yield {
             "status": DocumentStatus.UPLOADING.value,
+            "percent": 5,
             "message": "Uploading file...",
         }
 
@@ -2182,6 +2352,7 @@ def upload_document_stream_service(
             "status": DocumentStatus.PROCESSING.value,
             "document_id": str(doc.id),
             "file_name": doc.file_name,
+            "percent": 10,
             "message": (
                 "Processing document "
                 "for knowledge base..."
@@ -2194,13 +2365,32 @@ def upload_document_stream_service(
 
         try:
 
-            _process_for_rag(
+            # =================================================
+            # RAG PROCESSING PROGRESS
+            #
+            # _process_for_rag is now a generator that yields
+            # incremental {"percent": ...} progress events while
+            # it works (text extraction, chunking, embedding,
+            # image captioning, etc). Forward each one to the SSE
+            # stream as its own "processing" event so the frontend
+            # can render a live progress bar instead of jumping
+            # straight from 10% to 100%.
+            # =================================================
+
+            for progress_event in _process_for_rag(
                 db=db,
                 doc=doc,
                 file_path=file_path,
                 conversation_id=conversation_id,
                 user_id=user_id,
-            )
+            ):
+
+                yield {
+                    "status": DocumentStatus.PROCESSING.value,
+                    "document_id": str(doc.id),
+                    "file_name": doc.file_name,
+                    **progress_event,
+                }
 
             # =================================================
             # READY
@@ -2225,6 +2415,7 @@ def upload_document_stream_service(
 
             yield {
                 "status": DocumentStatus.READY.value,
+                "percent": 100,
                 "document": (
                     DocumentOut.model_validate(
                         doc
