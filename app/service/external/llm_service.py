@@ -835,9 +835,20 @@ def _build_reasoning_messages(
         "Using ONLY the information above (the question, "
         "conversation context, and tool results), reason "
         "carefully and produce one clear, well-synthesized "
-        "final answer for the user. Compare/combine "
-        "information across sources where relevant. Do not "
-        "mention that you are a separate reasoning step.",
+        "final answer for the user.\n\n"
+        "Important:\n"
+        "- Some retrieved tool results may NOT be relevant to "
+        "the user's actual question (retrieval is not perfect). "
+        "Silently discard anything irrelevant — do not mention, "
+        "summarize, or reference it in your answer.\n"
+        "- Only use content that directly helps answer the "
+        "question asked.\n"
+        "- Write a natural, concise, conversational answer. Do "
+        "not dump raw retrieved text, filenames, metadata, or "
+        "internal tool details into the answer.\n"
+        "- Do not mention that you are a separate reasoning "
+        "step, that you used tools, or that some results were "
+        "discarded.",
     )
 
     return (
