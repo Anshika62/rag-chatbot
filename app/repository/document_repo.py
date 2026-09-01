@@ -63,6 +63,24 @@ def get_chunks_by_document_id(
         raise
 
 
+def delete_chunks_by_document_id(
+    db: Session,
+    doc_id: str,
+):
+    try:
+        db.query(Docs_chunks).filter(
+            Docs_chunks.doc_id == str(doc_id)
+        ).delete(
+            synchronize_session=False
+        )
+
+        db.commit()
+
+    except SQLAlchemyError:
+        db.rollback()
+        raise
+
+
 # ============================================================
 # FOLDER / FILE OPERATIONS
 # ============================================================
@@ -252,7 +270,8 @@ def get_accessible_document_by_id(
                 (
                     Document.conversation_id.is_(None)
                 )
-                | (
+                |
+                (
                     Document.conversation_id
                     == str(conversation_id)
                 )
@@ -370,16 +389,6 @@ def get_children(
 
     If page_number is provided:
         - only children with that exact page_number are returned.
-        Lets a caller ask for "the image(s) on page 4" as a direct
-        metadata filter instead of semantic search (see search_kb.py).
-
-    user_id is optional (defaults to None / unfiltered) so existing
-    internal callers that have already verified ownership of the
-    parent (and therefore of its children, since children are
-    always created with the same user_id as their parent) keep
-    working unchanged. New/external callers should always pass
-    user_id explicitly as a defense-in-depth measure against
-    cross-user access.
     """
 
     try:
@@ -409,7 +418,8 @@ def get_children(
                 (
                     Document.conversation_id.is_(None)
                 )
-                | (
+                |
+                (
                     Document.conversation_id
                     == str(conversation_id)
                 )
@@ -472,6 +482,13 @@ def delete_document_row(
     doc: Document,
 ):
     try:
+        # Delete all DB chunks belonging to this document
+        # before deleting the document row.
+        delete_chunks_by_document_id(
+            db=db,
+            doc_id=doc.id,
+        )
+
         db.delete(doc)
         db.commit()
 
