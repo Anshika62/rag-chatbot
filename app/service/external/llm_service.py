@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from typing import Generator, Optional , Any
+from typing import Generator, Optional, Any
 
 from fastapi import HTTPException, status
 from langchain_core.prompts import ChatPromptTemplate
@@ -21,38 +21,16 @@ logger = logging.getLogger(__name__)
 #
 # Both models are configurable via environment variables instead
 # of being hard-coded, per the "environment variables for
-# model/API configuration" requirement. Defaults preserve the
-# existing behavior for the main LLM.
+# model/API configuration" requirement.
 #
-# MAIN LLM (llm):
+# MAIN LLM:
 #   Handles normal conversation + decides which tool(s) to call.
-#   Used for everything by default.
 #
-# REASONING LLM (reasoning_llm):
-#   A separate, reasoning-capable model used ONLY for the final
-#   answer-synthesis step, and only when the tool results are
-#   non-trivial (multiple tools, multiple retrieved chunks, or
-#   text+image combined — see _should_use_reasoning below).
-#   Simple chat ("Hello", "What is Python?") and simple single-
-#   tool calls (weather, datetime, a single short KB hit) never
-#   reach this model, so they stay fast and cheap.
-#
-#   The reasoning model is qwen/qwen3.6-27b, currently Groq's
-#   highest-intelligence-ranked reasoning model. Unlike
-#   openai/gpt-oss-120b (which rejects reasoning_format entirely
-#   and only exposes reasoning via a separate include_reasoning
-#   flag), qwen3.6-27b officially supports reasoning_format="raw",
-#   which makes Groq inline the chain-of-thought as
-#   <think>...</think> at the start of the streamed content —
-#   exactly what _stream_with_thinking_split() below is built to
-#   split into "thinking" vs "answer" pieces. That function also
-#   still checks additional_kwargs["reasoning_content"] as a second
-#   mechanism, so switching REASONING_MODEL to a gpt-oss model
-#   later would keep working without further changes. Every piece
-#   — thinking or answer — is yielded as {"type": "thinking"/
-#   "answer", "content": ...} so the frontend can render a live
-#   "thinking..." trace as it happens, while still saving only the
-#   "answer" portion as the final message content.
+# REASONING LLM:
+#   Used ONLY for complex final answer synthesis.
+#   Its private chain-of-thought is never exposed to the frontend.
+#   Instead, a concise safe reasoning summary can be shown before
+#   the final answer.
 # ============================================================
 
 
@@ -82,6 +60,12 @@ reasoning_llm = ChatGroq(
 
 THINK_START_TAG = "<think>"
 THINK_END_TAG = "</think>"
+
+SAFE_REASONING_START = "[REASONING SUMMARY]"
+SAFE_REASONING_END = "[/REASONING SUMMARY]"
+
+SAFE_ANSWER_START = "[FINAL ANSWER]"
+SAFE_ANSWER_END = "[/FINAL ANSWER]"
 
 MAX_KB_SEARCH_ATTEMPTS = int(
     os.getenv("MAX_KB_SEARCH_ATTEMPTS", "4")
@@ -366,7 +350,6 @@ def _extract_kb_sources(tool_result: Any) -> list[dict]:
         page_number = item.get("page_number")
         chunk_index = item.get("chunk_index")
 
-        # Ignore no-result/error placeholder records.
         if not filename and not document_id:
             continue
 
@@ -538,15 +521,7 @@ def _execute_tool_calls(
 
 
 # ============================================================
-# REASONING DECISION (Section 16)
-#
-# Keep simple questions simple: "Hello", "What is Python?", a
-# single short knowledge-base hit, or a single weather/datetime
-# call never reach the reasoning model. Reasoning is only used
-# when the tool results actually need to be compared/combined —
-# multiple tools used together, an image analyzed alongside other
-# content, or a substantial amount of retrieved text to reason
-# over.
+# REASONING DECISION
 # ============================================================
 
 
@@ -572,20 +547,12 @@ def _should_use_reasoning(
         for tool_call in tool_calls
     }
 
-    # Multiple different tools used together -> results need to
-    # be combined/synthesized.
     if len(tool_names) > 1:
         return True
 
-    # An image was analyzed alongside other tool output -> combining
-    # vision output with text is exactly the case Section 16 calls
-    # out for reasoning.
     if collected_images:
         return True
 
-    # A single search_knowledge_base call that returned a
-    # substantial amount of text (multiple/long chunks) benefits
-    # from a reasoning pass to compare and synthesize across them.
     if "search_knowledge_base" in tool_names:
 
         combined_length = sum(
@@ -605,34 +572,6 @@ def _should_use_reasoning(
 
 # ============================================================
 # THINKING/ANSWER STREAM SPLITTER
-#
-# The reasoning model emits a single continuous token stream that
-# looks like:
-#
-#     <think> ...chain of thought... </think> ...final answer...
-#
-# This splits that stream into separate "thinking" and "answer"
-# events as it arrives, so the caller can show live "thinking..."
-# output (like other reasoning-model chat UIs) without it ending
-# up as part of the saved/displayed final answer. A small tail of
-# text is always held back while scanning for a tag, in case a
-# tag like "<think>" is split across two streamed chunks.
-#
-# Two different mechanisms are checked on every chunk, since
-# different reasoning models expose their chain-of-thought
-# differently:
-#
-#   1. additional_kwargs["reasoning_content"] (or ["reasoning"])
-#      — used by openai/gpt-oss-20b / openai/gpt-oss-120b on Groq,
-#      which return reasoning as a separate field per chunk
-#      instead of inlining it in .content.
-#
-#   2. <think>...</think> tags inline inside .content — used by
-#      DeepSeek-R1-distill and some other reasoning models.
-#
-# A model only ever uses one of the two, so only one branch will
-# ever produce output for a given REASONING_MODEL — the other is
-# simply a silent no-op.
 # ============================================================
 
 
@@ -644,8 +583,6 @@ def _stream_with_thinking_split(
     pending = ""
 
     for chunk in model_stream:
-
-        # ---- mechanism 1: separate reasoning field per chunk ----
 
         extra_kwargs = getattr(
             chunk,
@@ -664,8 +601,6 @@ def _stream_with_thinking_split(
                 "type": "thinking",
                 "content": reasoning_piece,
             }
-
-        # ---- mechanism 2: inline <think> tags inside .content ----
 
         content = getattr(
             chunk,
@@ -741,13 +676,6 @@ def _stream_with_thinking_split(
 
                     if safe_length:
 
-                        yield {
-                            "type": "thinking",
-                            "content": pending[
-                                :safe_length
-                            ],
-                        }
-
                         pending = pending[
                             safe_length:
                         ]
@@ -756,12 +684,9 @@ def _stream_with_thinking_split(
 
                 if tag_index:
 
-                    yield {
-                        "type": "thinking",
-                        "content": pending[
-                            :tag_index
-                        ],
-                    }
+                    pending = pending[
+                        tag_index:
+                    ]
 
                 pending = pending[
                     tag_index
@@ -770,22 +695,15 @@ def _stream_with_thinking_split(
 
                 state = "answer"
 
-    if pending:
-
+    if pending and state == "answer":
         yield {
-            "type": state,
+            "type": "answer",
             "content": pending,
         }
 
 
 # ============================================================
-# STRIP THINKING (non-streamed reasoning responses)
-#
-# Mirrors _stream_with_thinking_split above, but for a single
-# already-complete response string (used by generate_answer,
-# the non-streaming path). Removes any <think>...</think> block
-# so the model's private chain-of-thought is never returned as
-# part of the final answer.
+# STRIP THINKING
 # ============================================================
 
 
@@ -813,8 +731,6 @@ def _strip_thinking(text: str) -> str:
         )
 
         if end_index == -1:
-            # Unclosed tag — drop everything from the tag onward
-            # rather than risk leaking a partial chain-of-thought.
             break
 
         remaining = remaining[
@@ -825,14 +741,82 @@ def _strip_thinking(text: str) -> str:
 
 
 # ============================================================
+# SAFE REASONING OUTPUT PARSER
+# ============================================================
+
+
+def _parse_safe_reasoning_output(
+    text: str,
+) -> tuple[str, str]:
+
+    cleaned = _strip_thinking(
+        text or ""
+    ).strip()
+
+    if not cleaned:
+        return "", ""
+
+    summary = ""
+    answer = cleaned
+
+    summary_start = cleaned.find(
+        SAFE_REASONING_START
+    )
+
+    summary_end = cleaned.find(
+        SAFE_REASONING_END
+    )
+
+    answer_start = cleaned.find(
+        SAFE_ANSWER_START
+    )
+
+    answer_end = cleaned.find(
+        SAFE_ANSWER_END
+    )
+
+    if (
+        summary_start != -1
+        and summary_end != -1
+        and summary_end > summary_start
+    ):
+        summary = cleaned[
+            summary_start
+            + len(SAFE_REASONING_START):
+            summary_end
+        ].strip()
+
+    if answer_start != -1:
+
+        answer_content_start = (
+            answer_start
+            + len(SAFE_ANSWER_START)
+        )
+
+        if (
+            answer_end != -1
+            and answer_end > answer_content_start
+        ):
+            answer = cleaned[
+                answer_content_start:
+                answer_end
+            ].strip()
+        else:
+            answer = cleaned[
+                answer_content_start:
+            ].strip()
+
+    elif summary_end != -1:
+        answer = cleaned[
+            summary_end
+            + len(SAFE_REASONING_END):
+        ].strip()
+
+    return summary, answer
+
+
+# ============================================================
 # REASONING CONTEXT BUILDER
-#
-# Builds the minimal set of messages the reasoning model needs:
-# the original conversation/question messages plus only the tool
-# results actually produced for this turn (retrieved chunks,
-# vision analysis, weather/datetime results, etc). We never hand
-# the reasoning model the raw database/conversation dump — only
-# what _execute_tool_calls already gathered for this turn.
 # ============================================================
 
 
@@ -843,12 +827,30 @@ def _build_reasoning_messages(
 
     reasoning_instruction = (
         "human",
-        "Using ONLY the information above (the question, "
-        "conversation context, and tool results), reason "
-        "carefully and produce one clear, well-synthesized "
-        "final answer for the user. Compare/combine "
-        "information across sources where relevant. Do not "
-        "mention that you are a separate reasoning step.",
+        """
+Using ONLY the information above (the question, conversation
+context, and tool results), produce a final response in exactly
+this structure:
+
+[REASONING SUMMARY]
+- Give a concise but useful user-facing explanation of the key
+  evidence considered.
+- Mention important information that was compared, combined,
+  interpreted, or selected from the available tool results.
+- Explain the important decision or conclusion that follows from
+  that evidence.
+- Keep this summary focused on useful reasoning, not hidden
+  internal chain-of-thought.
+- Do not reveal private chain-of-thought, internal deliberation,
+  hidden tokens, or private model reasoning.
+[/REASONING SUMMARY]
+
+[FINAL ANSWER]
+Give one clear, well-synthesized final answer for the user.
+Use only the available information. Do not invent information.
+Do not mention that you are a separate reasoning step.
+[/FINAL ANSWER]
+""",
     )
 
     return (
@@ -970,15 +972,9 @@ def generate_answer(
             all_sources.extend(collected_sources)
             kb_search_count += allowed_kb_calls
 
-            # If the limit has now been reached, the next LLM round is
-            # still allowed to produce the final answer, but any new KB
-            # call will be blocked above.
-
         if images_output is not None:
             images_output.extend(all_images)
 
-        # Preserve the existing reasoning/synthesis model for complex
-        # tool results, but never expose its private thinking content.
         if all_tool_messages:
             use_reasoning = _should_use_reasoning(
                 tool_calls=first_tool_calls,
@@ -997,8 +993,10 @@ def generate_answer(
                         reasoning_messages
                     )
 
-                    reasoning_answer = _strip_thinking(
-                        reasoning_response.content
+                    reasoning_summary, reasoning_answer = (
+                        _parse_safe_reasoning_output(
+                            reasoning_response.content
+                        )
                     )
 
                     if reasoning_answer:
@@ -1131,8 +1129,9 @@ def generate_answer_stream(
     Stream an answer while allowing the main LLM to perform up to four
     Knowledge Base searches when earlier results are insufficient.
 
-    Only short, safe activity messages are emitted as "thinking" events.
-    Raw model chain-of-thought is never sent to the frontend.
+    Generic activity messages are not emitted as reasoning.
+    For complex reasoning, only a safe user-facing reasoning summary
+    is emitted. Private chain-of-thought is never sent to the frontend.
     """
     try:
         messages = _build_messages(
@@ -1157,20 +1156,6 @@ def generate_answer_stream(
         all_images = []
         all_sources = []
         first_tool_calls = []
-        emitted_steps = set()
-
-        def emit_thinking(step: str):
-            if step in emitted_steps:
-                return None
-
-            if len(emitted_steps) >= MAX_VISIBLE_THINKING_STEPS:
-                return None
-
-            emitted_steps.add(step)
-            return {
-                "type": "thinking",
-                "content": step,
-            }
 
         while True:
             streamed_chunks = []
@@ -1200,8 +1185,7 @@ def generate_answer_stream(
             # NO TOOL CALL
             # ------------------------------------------------
             if not tool_calls:
-                # If this is a simple conversation with no tools,
-                # preserve the existing direct streaming behavior.
+
                 if not all_tool_messages:
                     for chunk in streamed_chunks:
                         if chunk.content:
@@ -1211,13 +1195,8 @@ def generate_answer_stream(
                             }
                     return
 
-                # The main LLM has decided it has enough retrieved
-                # information. Now optionally run the existing reasoning
-                # model for complex/multi-source synthesis.
-                step = emit_thinking("Generating answer")
-                if step:
-                    yield step
-
+                # The main LLM has enough information.
+                # For complex cases, run the reasoning model.
                 use_reasoning = _should_use_reasoning(
                     tool_calls=first_tool_calls,
                     collected_images=all_images,
@@ -1231,24 +1210,33 @@ def generate_answer_stream(
                             tool_messages=all_tool_messages,
                         )
 
-                        answer_started = False
+                        reasoning_response = reasoning_llm.invoke(
+                            reasoning_messages
+                        )
 
-                        for piece in _stream_with_thinking_split(
-                            reasoning_llm.stream(reasoning_messages)
-                        ):
-                            if (
-                                piece["type"] == "answer"
-                                and piece["content"]
-                            ):
-                                answer_started = True
-                                yield {
-                                    "type": "answer",
-                                    "content": piece["content"],
-                                }
+                        reasoning_summary, reasoning_answer = (
+                            _parse_safe_reasoning_output(
+                                reasoning_response.content
+                            )
+                        )
 
-                        if answer_started:
+                        # Only the safe user-facing reasoning summary
+                        # is sent as a thinking event.
+                        if reasoning_summary:
+                            yield {
+                                "type": "thinking",
+                                "content": reasoning_summary,
+                            }
+
+                        if reasoning_answer:
+                            yield {
+                                "type": "answer",
+                                "content": reasoning_answer,
+                            }
+
                             if images_output is not None:
                                 images_output.extend(all_images)
+
                             if all_sources:
                                 yield {
                                     "type": "sources",
@@ -1256,6 +1244,7 @@ def generate_answer_stream(
                                         all_sources
                                     ),
                                 }
+
                             return
 
                     except Exception:
@@ -1287,6 +1276,7 @@ def generate_answer_stream(
                 first_tool_calls = list(tool_calls)
 
             full_ai_response = None
+
             for chunk in streamed_chunks:
                 if full_ai_response is None:
                     full_ai_response = chunk
@@ -1303,25 +1293,11 @@ def generate_answer_stream(
             current_messages.append(full_ai_response)
             all_tool_messages.append(full_ai_response)
 
-            if not emitted_steps:
-                step = emit_thinking(
-                    "Understanding your question"
-                )
-                if step:
-                    yield step
-
             kb_calls = [
                 call
                 for call in tool_calls
                 if call["name"] == "search_knowledge_base"
             ]
-
-            if kb_calls:
-                step = emit_thinking(
-                    "Searching your documents"
-                )
-                if step:
-                    yield step
 
             remaining = max(
                 0,
@@ -1333,18 +1309,21 @@ def generate_answer_stream(
             allowed_kb_calls = 0
 
             for call in tool_calls:
+
                 if call["name"] == "search_knowledge_base":
+
                     if allowed_kb_calls < remaining:
                         executable_calls.append(call)
                         allowed_kb_calls += 1
                     else:
                         blocked_kb_calls.append(call)
+
                 else:
                     executable_calls.append(call)
 
             # Add blocked-call results after the AI tool-call message.
-            # This keeps LangChain's tool-call/message ordering valid.
             for call in blocked_kb_calls:
+
                 current_messages.append({
                     "role": "tool",
                     "tool_call_id": call["id"],
@@ -1359,6 +1338,7 @@ def generate_answer_stream(
 
             # Execute the allowed tools.
             if executable_calls:
+
                 (
                     extra_messages,
                     collected_images,
@@ -1378,11 +1358,6 @@ def generate_answer_stream(
             kb_search_count += allowed_kb_calls
 
             if allowed_kb_calls:
-                step = emit_thinking(
-                    "Finding relevant information"
-                )
-                if step:
-                    yield step
 
                 deduped_sources = _deduplicate_sources(
                     all_sources
@@ -1400,11 +1375,6 @@ def generate_answer_stream(
                 conversation_id,
             )
 
-            # If the model attempted another KB search after the limit,
-            # the blocked tool result is already in current_messages.
-            # The next loop therefore forces the LLM to answer without
-            # another KB call.
-
     except HTTPException:
         raise
 
@@ -1418,7 +1388,6 @@ def generate_answer_stream(
         raise RuntimeError(
             f"Unable to generate streaming response: {exc}"
         ) from exc
-
 
 
 # ============================================================
@@ -1530,7 +1499,6 @@ Assistant Answer:
         if not content:
             return []
 
-        # Handle models that wrap JSON in a markdown code fence.
         if content.startswith("```"):
             if content.startswith("```json"):
                 content = content[len("```json"):]
@@ -1544,6 +1512,7 @@ Assistant Answer:
 
         try:
             suggestions = json.loads(content)
+
         except json.JSONDecodeError:
             logger.warning(
                 "SUGGESTION GENERATION returned invalid JSON: %s",
@@ -1560,6 +1529,7 @@ Assistant Answer:
         cleaned_suggestions = []
 
         for suggestion in suggestions:
+
             if not isinstance(suggestion, str):
                 continue
 
@@ -1596,6 +1566,7 @@ Assistant Answer:
             str(exc),
         )
         return []
+
 
 # ============================================================
 # GENERATE CONVERSATION TITLE
