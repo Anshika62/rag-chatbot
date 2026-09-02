@@ -1,16 +1,17 @@
 import json
 import logging
 import os
+import re
 from typing import Generator, Optional
 
 from fastapi import HTTPException, status
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
+import requests
 
 from app.service.tools.conversation_tool import (
     create_conversation_tools,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,13 @@ logger = logging.getLogger(__name__)
 #   "answer", "content": ...} so the frontend can render a live
 #   "thinking..." trace as it happens, while still saving only the
 #   "answer" portion as the final message content.
+#
+#   The raw chain-of-thought from reasoning models is often noisy
+#   (self-correction filler like "wait", "let me re-check",
+#   "actually no", "hmm"). _filter_thinking_stream() below wraps
+#   _stream_with_thinking_split() and drops those filler sentences
+#   from the live "thinking" trace shown to the user, while never
+#   touching or delaying "answer" pieces.
 # ============================================================
 
 
@@ -61,10 +69,21 @@ LLM_MODEL_NAME = os.getenv(
     "openai/gpt-oss-20b",
 )
 
+# Reasoning model now runs on Cloudflare Workers AI instead of
+# Groq's qwen/qwen3.6-27b (kept as the fallback default in case
+# REASONING_MODEL isn't set). This model still emits its
+# chain-of-thought as inline <think>...</think> tags, so
+# _stream_with_thinking_split() and _filter_thinking_stream()
+# below work unchanged.
 REASONING_MODEL_NAME = os.getenv(
     "REASONING_MODEL",
-    "qwen/qwen3.6-27b",
+    "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
 )
+
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
+
+CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4/accounts"
 
 
 llm = ChatGroq(
@@ -73,10 +92,187 @@ llm = ChatGroq(
 )
 
 
-reasoning_llm = ChatGroq(
+# ============================================================
+# CLOUDFLARE REASONING ADAPTER
+#
+# langchain_community's CloudflareWorkersAI wrapper has two
+# problems for our use case:
+#
+#   1. It's a completion-style LLM (plain string "prompt"), not
+#      a chat model — Cloudflare's reasoning/chat models actually
+#      expect a "messages" array, same shape as OpenAI's chat
+#      format.
+#   2. Its built-in _stream() method has a parsing bug: it slices
+#      the first 6 characters off every non-empty SSE line and
+#      tries to json.loads() it, without checking the line
+#      actually starts with "data: " first. Any other line (an
+#      SSE comment, a differently-shaped event, or an error body
+#      that isn't in "data: ..." format at all) makes it crash
+#      with a JSONDecodeError instead of just skipping that line.
+#
+# This adapter bypasses that library entirely and talks to the
+# Cloudflare REST API directly with `requests`, using the proper
+# "messages" format and a defensive line-by-line SSE parser that
+# silently skips anything that isn't a valid "data: {...}" line
+# instead of raising.
+#
+# It exposes only `.invoke(messages)` and `.stream(messages)`,
+# since those are the only two methods called on reasoning_llm
+# anywhere else in this file — so nothing else needs to change.
+# ============================================================
+
+
+_ROLE_MAP = {
+    "system": "system",
+    "human": "user",
+    "user": "user",
+    "ai": "assistant",
+    "assistant": "assistant",
+    "tool": "user",
+}
+
+
+def _reasoning_messages_to_cf_messages(messages):
+
+    cf_messages = []
+
+    for message in messages:
+
+        if isinstance(message, tuple):
+            role, content = message
+        else:
+            role = getattr(message, "type", "human")
+            content = getattr(message, "content", str(message))
+
+        cf_messages.append(
+            {
+                "role": _ROLE_MAP.get(role, "user"),
+                "content": content,
+            }
+        )
+
+    return cf_messages
+
+
+class _ReasoningChunk:
+
+    __slots__ = ("content", "additional_kwargs")
+
+    def __init__(self, content: str):
+        self.content = content
+        self.additional_kwargs = {}
+
+
+class _ReasoningResponse:
+
+    def __init__(self, content: str):
+        self.content = content
+
+
+REASONING_MAX_TOKENS = int(
+    os.getenv(
+        "REASONING_MAX_TOKENS",
+        "4096",
+    )
+)
+
+
+class _CloudflareReasoningLLM:
+
+    def __init__(self, account_id: str, api_token: str, model: str):
+
+        self._account_id = account_id
+        self._api_token = api_token
+        self._model = model
+        self._endpoint = (
+            f"{CLOUDFLARE_BASE_URL}/{account_id}/ai/run/{model}"
+        )
+
+    def _request(self, messages, stream: bool):
+
+        headers = {
+            "Authorization": f"Bearer {self._api_token}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "messages": _reasoning_messages_to_cf_messages(messages),
+            "stream": stream,
+            "max_tokens": REASONING_MAX_TOKENS,
+        }
+
+        response = requests.post(
+            self._endpoint,
+            headers=headers,
+            json=payload,
+            stream=stream,
+            timeout=120,
+        )
+
+        if not response.ok:
+
+            raise RuntimeError(
+                f"Cloudflare Workers AI request failed "
+                f"(status={response.status_code}): {response.text}"
+            )
+
+        return response
+
+    def invoke(self, messages):
+
+        response = self._request(messages, stream=False)
+
+        data = response.json()
+
+        text = data.get("result", {}).get("response", "")
+
+        return _ReasoningResponse(text)
+
+    def stream(self, messages):
+
+        response = self._request(messages, stream=True)
+
+        for raw_line in response.iter_lines():
+
+            if not raw_line:
+                continue
+
+            if not raw_line.startswith(b"data: "):
+                # SSE comment lines, differently-shaped events,
+                # or anything else that isn't a data payload —
+                # skip instead of crashing.
+                continue
+
+            payload_bytes = raw_line[len(b"data: "):]
+
+            if payload_bytes.strip() == b"[DONE]":
+                break
+
+            try:
+
+                data = json.loads(payload_bytes)
+
+            except json.JSONDecodeError:
+
+                logger.warning(
+                    "REASONING STREAM: skipping unparseable "
+                    "line: %r",
+                    raw_line,
+                )
+
+                continue
+
+            token = data.get("response")
+
+            if token:
+
+                yield _ReasoningChunk(token)
+
+
+reasoning_llm = _CloudflareReasoningLLM(
+    account_id=CLOUDFLARE_ACCOUNT_ID,
+    api_token=CLOUDFLARE_API_TOKEN,
     model=REASONING_MODEL_NAME,
-    temperature=0.3,
-    reasoning_format="raw",
 )
 
 
@@ -768,6 +964,146 @@ def _stream_with_thinking_split(
 
 
 # ============================================================
+# THINKING NOISE FILTER
+#
+# Wraps _stream_with_thinking_split()'s output. "answer" pieces
+# are passed through completely untouched and unbuffered — this
+# never delays or alters the real response.
+#
+# "thinking" pieces are buffered into full sentences (split on
+# ". ", "! ", "? ", or newline) and only forwarded to the caller
+# if they pass a noise filter — i.e. they don't look like
+# self-correction filler ("wait", "let me re-check", "actually
+# no", "hmm", etc). This keeps the live "thinking..." trace shown
+# to the user focused on genuine reasoning steps instead of raw
+# chain-of-thought noise.
+#
+# This is purely a display filter: it only decides what gets
+# yielded as "thinking" events. It never touches "answer" content,
+# so the final saved message is identical to what it would have
+# been without this filter.
+# ============================================================
+
+
+_THINKING_NOISE_PATTERNS = [
+    r"\bwait[,.]?\b",
+    r"\blet me (re-?check|reconsider|verify|double-?check)\b",
+    r"\bactually,?\s*(no|wait)\b",
+    r"\bhmm+\b",
+    r"\bi (should|need to) (re-?check|reconsider|redo)\b",
+    r"^okay,?\s*so\b",
+    r"\blet'?s (re-?verify|double-?check)\b",
+    r"\bon second thought\b",
+    r"\bscratch that\b",
+    # Meta-commentary / self-validation filler — adds no value to
+    # a live reasoning trace, just the model narrating its own
+    # process/checklist.
+    r"^done\.?$",
+    r"\boutput matches\b",
+    r"\bmatches (the )?requirement",
+    r"\bthis (satisfies|meets) the\b",
+    r"^no other relevant info(rmation)? found\.?$",
+    r"^[\u2705\u2714\u2713]+$",  # standalone checkmark emoji/char
+    r"\bi will (formulate|proceed|finalize)\b",
+    r"^proceed\.?$",
+    r"^ready\.?$",
+]
+
+_THINKING_NOISE_RE = re.compile(
+    "|".join(_THINKING_NOISE_PATTERNS),
+    re.IGNORECASE,
+)
+
+_SENTENCE_END_CHARS = (".", "!", "?", "\n")
+
+
+def _is_noisy_thinking_sentence(sentence: str) -> bool:
+
+    stripped = sentence.strip()
+
+    if not stripped:
+        return True
+
+    return bool(_THINKING_NOISE_RE.search(stripped))
+
+
+def _filter_thinking_stream(
+    piece_stream,
+):
+    """
+    Wraps the output of _stream_with_thinking_split(). Passes
+    "answer" pieces through immediately and unmodified. Buffers
+    "thinking" pieces sentence-by-sentence and only yields the
+    sentences that pass _is_noisy_thinking_sentence's check.
+    """
+
+    thinking_buffer = ""
+
+    for piece in piece_stream:
+
+        if piece["type"] != "thinking":
+
+            # Flush any leftover thinking buffer first, in the
+            # rare case the model switches straight from thinking
+            # to answer mid-sentence (no trailing punctuation).
+            if (
+                thinking_buffer.strip()
+                and not _is_noisy_thinking_sentence(
+                    thinking_buffer
+                )
+            ):
+
+                yield {
+                    "type": "thinking",
+                    "content": thinking_buffer.strip(),
+                }
+
+            thinking_buffer = ""
+
+            yield piece
+
+            continue
+
+        thinking_buffer += piece["content"]
+
+        while True:
+
+            cut_index = -1
+
+            for end_char in _SENTENCE_END_CHARS:
+
+                idx = thinking_buffer.find(end_char)
+
+                if idx != -1 and (
+                    cut_index == -1 or idx < cut_index
+                ):
+                    cut_index = idx
+
+            if cut_index == -1:
+                break
+
+            sentence = thinking_buffer[: cut_index + 1]
+            thinking_buffer = thinking_buffer[cut_index + 1 :]
+
+            if not _is_noisy_thinking_sentence(sentence):
+
+                yield {
+                    "type": "thinking",
+                    "content": sentence.strip(),
+                }
+
+    if (
+        thinking_buffer.strip()
+        and not _is_noisy_thinking_sentence(thinking_buffer)
+    ):
+
+        yield {
+            "type": "thinking",
+            "content": thinking_buffer.strip(),
+        }
+
+
+# ============================================================
 # STRIP THINKING (non-streamed reasoning responses)
 #
 # Mirrors _stream_with_thinking_split above, but for a single
@@ -1145,10 +1481,12 @@ def generate_answer_stream(
         dicts of the form {"type": "thinking" | "answer",
         "content": str}. "thinking" pieces are the reasoning
         model's live chain-of-thought (only ever produced during
-        the REASONING STAGE below) and should be shown to the
-        user as a transient "thinking..." trace, never saved as
-        the final message content. "answer" pieces are the real
-        response and should be both streamed and saved.
+        the REASONING STAGE below), pre-filtered by
+        _filter_thinking_stream to drop self-correction filler,
+        and should be shown to the user as a transient
+        "thinking..." trace, never saved as the final message
+        content. "answer" pieces are the real response and should
+        be both streamed and saved.
     """
 
     try:
@@ -1338,8 +1676,17 @@ def generate_answer_stream(
 
                 reasoning_answer_yielded = False
 
-                for piece in _stream_with_thinking_split(
-                    reasoning_llm.stream(reasoning_messages)
+                # NOTE: _stream_with_thinking_split's raw output is
+                # wrapped in _filter_thinking_stream, which drops
+                # self-correction filler ("wait", "let me
+                # re-check", "hmm", etc) from "thinking" pieces
+                # only. "answer" pieces pass through unchanged and
+                # unbuffered, so the final saved answer is
+                # identical to before this filter was added.
+                for piece in _filter_thinking_stream(
+                    _stream_with_thinking_split(
+                        reasoning_llm.stream(reasoning_messages)
+                    )
                 ):
 
                     if not piece["content"]:
