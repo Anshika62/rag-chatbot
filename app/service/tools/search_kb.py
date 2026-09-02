@@ -25,6 +25,35 @@ from app.models.document import Document
 logger = logging.getLogger(__name__)
 
 
+def _is_image_content_type(content_type) -> bool:
+    """
+    True for either shape "content_type" appears in across this
+    codebase:
+      - the bare Qdrant payload discriminator "image" (what
+        vector_store.add_documents(content_type="image", ...)
+        actually stores — see doc_service.py / search_kb.py)
+      - a real mime type like "image/png" (what
+        _retrieve_document_images returns, taken from
+        image_doc.mime_type)
+
+    A plain `.startswith("image/")` check only matches the second
+    shape and silently misses every semantic-search hit, since
+    those come back from Qdrant with the bare "image" string —
+    that mismatch is why image results from search_knowledge_base
+    were previously missing their "url" field.
+    """
+
+    if not content_type:
+        return False
+
+    content_type = str(content_type)
+
+    return (
+        content_type == "image"
+        or content_type.startswith("image/")
+    )
+
+
 def _extract_text_from_image(image_path: str) -> str:
     """
     Same OCR approach used at upload time in doc_service.py's
@@ -239,6 +268,10 @@ def _retrieve_document_images(
                 "content_type": image_doc.mime_type,
                 "page_number": image_doc.page_number,
                 "gcs_path": image_doc.gcs_path,
+                # NEW: ready-to-use render URL, so the LLM never
+                # has to reconstruct/guess the path pattern when
+                # embedding this image inline in its answer.
+                "url": f"/documents/{image_doc.id}/file",
             }
         )
 
@@ -689,6 +722,10 @@ def create_search_knowledge_base_tool(
                 "parent_document_id"
             )
 
+            point_content_type = payload.get(
+                "content_type"
+            )
+
             documents.append(
                 {
                     "filename": payload.get(
@@ -708,11 +745,33 @@ def create_search_knowledge_base_tool(
                         if point_parent_id
                         else None
                     ),
-                    "content_type": payload.get(
-                        "content_type"
-                    ),
+                    "content_type": point_content_type,
                     "page_number": payload.get(
                         "page_number"
+                    ),
+                    # NEW: same ready-to-use render URL as the
+                    # direct-image-retrieval path above, so image
+                    # results coming back from semantic search are
+                    # just as embeddable by the LLM. Only added
+                    # when this hit is actually an image — text
+                    # hits keep their existing shape unchanged.
+                    # Uses _is_image_content_type() because Qdrant
+                    # stores this as the bare "image" discriminator,
+                    # not a mime type.
+                    **(
+                        {
+                            "url": (
+                                f"/documents/"
+                                f"{point_document_id}/file"
+                            )
+                        }
+                        if (
+                            _is_image_content_type(
+                                point_content_type
+                            )
+                            and point_document_id
+                        )
+                        else {}
                     ),
                 }
             )
