@@ -277,6 +277,32 @@ THINK_START_TAG = "<think>"
 THINK_END_TAG = "</think>"
 
 
+def _is_image_content_type(content_type) -> bool:
+    """
+    True for either shape "content_type" appears in across the
+    tool results this function consumes:
+      - the bare Qdrant payload discriminator "image" (what
+        semantic-search hits from search_knowledge_base carry)
+      - a real mime type like "image/png" (what direct image
+        retrieval — content_type="image" branch in search_kb.py —
+        carries, taken from image_doc.mime_type)
+
+    A plain `.startswith("image/")` check only matches the second
+    shape and silently misses every semantic-search image hit,
+    so those never made it into collected_images.
+    """
+
+    if not content_type:
+        return False
+
+    content_type = str(content_type)
+
+    return (
+        content_type == "image"
+        or content_type.startswith("image/")
+    )
+
+
 # ============================================================
 # SYSTEM PROMPT
 # ============================================================
@@ -387,6 +413,28 @@ Rules:
 
 - Never invent current weather information. Always use
   get_weather for current weather questions.
+
+- When search_knowledge_base or analyze_document_image returns an
+  image (a result whose content_type starts with "image/", or a
+  document_id returned by analyze_document_image), and that image
+  helps answer the user's question, embed it INLINE in your
+  answer text, exactly at the point where it is relevant to what
+  you are explaining — do not describe the image and then list it
+  separately, and do not collect images to mention only at the
+  end of your answer.
+
+- To embed an image inline, use this exact markdown image syntax,
+  using the "url" field from the tool result:
+  ![short description](url)
+
+- Only use a document_id/url that was actually returned by
+  search_knowledge_base or analyze_document_image earlier in this
+  same turn. Never invent, guess, or reuse a document_id/url from
+  a previous conversation turn.
+
+- If more than one image is relevant to different parts of your
+  answer, place each image inline right next to the text it
+  relates to, not grouped together in one place.
 """
 
 
@@ -639,8 +687,7 @@ def _execute_tool_calls(
                 )
 
                 if (
-                    content_type
-                    and content_type.startswith("image/")
+                    _is_image_content_type(content_type)
                     and item.get("document_id")
                 ):
 
@@ -1041,7 +1088,17 @@ def _build_reasoning_messages(
         "internal tool details into the answer.\n"
         "- Do not mention that you are a separate reasoning "
         "step, that you used tools, or that some results were "
-        "discarded.",
+        "discarded.\n"
+        "- If any tool result above includes a retrieved image "
+        "(a result whose content_type starts with \"image/\", or "
+        "an analyze_document_image result), and that image helps "
+        "answer the question, embed it INLINE in your answer, "
+        "exactly at the point where it is relevant, using this "
+        "exact markdown syntax and the \"url\" field from that "
+        "tool result: ![short description](url). Only use a "
+        "document_id/url that actually appears in the tool "
+        "results above — never invent or guess one. Do not "
+        "collect images and place them only at the end.",
     )
 
     return (
