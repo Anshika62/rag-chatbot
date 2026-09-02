@@ -1,11 +1,13 @@
 import json
 import logging
 import os
-from typing import Generator, Optional , Any
+import re
+from typing import Generator, Optional, Any
 
 from fastapi import HTTPException, status
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
+import requests
 
 from app.service.tools.conversation_tool import (
     create_conversation_tools,
