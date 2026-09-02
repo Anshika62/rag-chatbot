@@ -12,6 +12,7 @@ from app.repository.conversation_repo import (
 from app.service.external.llm_service import (
     generate_answer,
     generate_answer_stream,
+    generate_suggestions,
 )
 
 
@@ -192,16 +193,15 @@ def query_documents_stream(
         # ====================================================
         # STREAM LOOP
         #
-        # generate_answer_stream() now yields structured pieces:
-        #     {"type": "thinking", "content": "..."}
-        #     {"type": "answer",   "content": "..."}
+        # generate_answer_stream() yields structured pieces:
         #
-        # "thinking" pieces are the reasoning model's live
-        # chain-of-thought. They are streamed to the client as
-        # their own "thinking" SSE event so the UI can render a
-        # live "thinking..." trace, but they are intentionally
-        # NEVER appended to full_answer and NEVER persisted —
-        # only the "answer" pieces make up the saved message.
+        #     {"type": "thinking", "content": "..."}
+        #     {"type": "answer", "content": "..."}
+        #
+        # Thinking pieces are streamed to the frontend but are
+        # never added to full_answer or persisted.
+        #
+        # Only answer pieces are stored as the final response.
         # ====================================================
 
         for piece in generate_answer_stream(
@@ -251,19 +251,24 @@ def query_documents_stream(
                 "images": [],
             }
 
+        # ====================================================
+        # FINAL ANSWER CLEANUP
+        # ====================================================
+
         if not full_answer.strip():
+
             full_answer = "I was unable to generate a response."
+
         else:
-            # A stray leading newline sometimes appears before the
-            # reasoning model's <think> tag (e.g. qwen3.6-27b), which
-            # gets classified as a tiny "answer" piece by the tag
-            # splitter before thinking begins. Strip it so the saved
-            # message doesn't start with extra blank lines.
+
+            # Remove accidental leading/trailing whitespace from
+            # the final answer before persisting it.
             full_answer = full_answer.strip()
 
-        # Persist images alongside the assistant message so they are
-        # still there after a page refresh (GET /conversation/{id}),
-        # not just during the live SSE stream.
+        # ====================================================
+        # SAVE ASSISTANT MESSAGE
+        # ====================================================
+
         assistant_message = create_message(
             db=db,
             conversation_id=conversation_id,
@@ -271,6 +276,15 @@ def query_documents_stream(
             content=full_answer,
             images=images_output,
         )
+
+        # ====================================================
+        # EXISTING DONE EVENT
+        #
+        # IMPORTANT:
+        # Keep this event before suggestion generation.
+        # This means the frontend receives the completed answer
+        # before we start sending suggestions.
+        # ====================================================
 
         yield {
             "event": "done",
@@ -283,9 +297,66 @@ def query_documents_stream(
             "images": images_output,
         }
 
+        # ====================================================
+        # GENERATE FOLLOW-UP SUGGESTIONS
+        #
+        # IMPORTANT:
+        # This happens AFTER the done event.
+        #
+        # Suggestion generation is an optional enhancement.
+        # If it fails, the already completed answer remains
+        # successful and no error event is sent.
+        # ====================================================
+
+        try:
+
+            suggestions = generate_suggestions(
+                question=question,
+                answer=full_answer,
+                chat_history=chat_history,
+            )
+
+            if suggestions:
+
+                yield {
+                    "event": "suggestions",
+                    "success": True,
+                    "error_code": None,
+                    "conversation_id": conversation_id,
+                    "message_id": assistant_message.id,
+                    "delta": None,
+                    "text_content": "",
+                    "images": [],
+                    "suggestions": suggestions,
+                }
+
+            else:
+
+                logger.info(
+                    "No suggestions generated: "
+                    "conversation_id=%s",
+                    conversation_id,
+                )
+
+        except Exception:
+
+            logger.exception(
+                "Suggestion generation failed: "
+                "conversation_id=%s user_id=%s",
+                conversation_id,
+                user_id,
+            )
+
+            # Do NOT send an error event here.
+            #
+            # The answer was already completed successfully.
+            # Suggestion failure must not make the chat request
+            # appear to have failed.
+
     except HTTPException as exc:
         logger.exception(
-            "QUERY STREAM HTTP ERROR: conversation_id=%s user_id=%s",
+            "QUERY STREAM HTTP ERROR: "
+            "conversation_id=%s user_id=%s",
             conversation_id,
             user_id,
         )
@@ -303,7 +374,8 @@ def query_documents_stream(
 
     except Exception as exc:
         logger.exception(
-            "QUERY STREAM ERROR: conversation_id=%s user_id=%s error=%s",
+            "QUERY STREAM ERROR: "
+            "conversation_id=%s user_id=%s error=%s",
             conversation_id,
             user_id,
             str(exc),
