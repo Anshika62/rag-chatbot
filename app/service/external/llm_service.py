@@ -188,6 +188,18 @@ Rules:
 
 - Keep answers clear and concise.
 
+- When your answer references an image found via
+  search_knowledge_base (content_type="image") or
+  analyze_document_image, you MUST embed it inline using
+  markdown image syntax:
+
+  ![<short description>](/documents/<document_id>/file)
+
+  Use the exact document_id returned by the tool. Never say you
+  "cannot display" or "cannot attach" an image — you CAN, using
+  this markdown syntax. Place it right at the point in your
+  answer where it's relevant.
+
 - Use get_current_datetime when the user asks for the current
   date or time.
 
@@ -200,6 +212,7 @@ Rules:
 
 - Never invent current weather information. Always use
   get_weather for current weather questions.
+
 """
 
 
@@ -486,9 +499,13 @@ def _execute_tool_calls(
 
                 if (
                     content_type
-                    and content_type.startswith("image/")
+                    and (
+                        content_type.startswith("image/")
+                        or content_type == "image"
+                    )
                     and item.get("document_id")
                 ):
+                  
                     image_document_id = str(item.get("document_id"))
 
                     collected_images.append({
@@ -847,9 +864,28 @@ def _build_reasoning_messages(
         "Using ONLY the information above (the question, "
         "conversation context, and tool results), reason "
         "carefully and produce one clear, well-synthesized "
-        "final answer for the user. Compare/combine "
-        "information across sources where relevant. Do not "
-        "mention that you are a separate reasoning step.",
+        "final answer for the user.\n\n"
+        "Important:\n"
+        "- Compare/combine information across sources where "
+        "relevant.\n"
+        "- Some retrieved tool results may NOT be relevant to "
+        "the user's actual question (retrieval is not perfect). "
+        "Silently discard anything irrelevant — do not mention, "
+        "summarize, or reference it in your answer.\n"
+        "- Only use content that directly helps answer the "
+        "question asked.\n"
+        "- Write a natural, concise, conversational answer. Do "
+        "not dump raw retrieved text, filenames, or internal "
+        "tool details into the answer.\n"
+        "- EXCEPTION: if a tool result includes an image "
+        "document_id, embed that image inline at the relevant "
+        "point using markdown image syntax: "
+        "![description](/documents/<document_id>/file) — this is "
+        "required, not optional metadata. Never say you cannot "
+        "display or attach an image.\n"
+        "- Do not mention that you are a separate reasoning "
+        "step, that you used tools, or that some results were "
+        "discarded.",
     )
 
     return (
@@ -857,7 +893,6 @@ def _build_reasoning_messages(
         + tool_messages
         + [reasoning_instruction]
     )
-
 
 # ============================================================
 # GENERATE ANSWER
