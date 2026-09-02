@@ -6,6 +6,7 @@ from typing import Generator, Optional , Any
 from fastapi import HTTPException, status
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
+from app.schemas.suggestion_schema import SuggestionsResponse
 
 from app.service.tools.conversation_tool import (
     create_conversation_tools,
@@ -1432,12 +1433,11 @@ def generate_suggestions(
     chat_history: Optional[list[dict]] = None,
 ) -> list[str]:
     """
-    Generate exactly three concise follow-up questions based on
-    the user's current question and the assistant's final answer.
+    Generate exactly three concise follow-up questions using structured output.
 
-    This function is intentionally independent of the existing
-    RAG/tool/reasoning answer-generation flow. Suggestion generation
-    must never cause the completed chat answer to fail.
+    This function is intentionally independent of the existing RAG/tool/
+    reasoning answer-generation flow. Suggestion generation is non-streaming
+    and must never cause the completed chat answer to fail.
     """
 
     try:
@@ -1447,57 +1447,32 @@ def generate_suggestions(
         if not answer or not answer.strip():
             return []
 
-        recent_history = (chat_history or [])[-6:]
-
-        history_text = "\n".join(
-            f"{message.get('role', '')}: "
-            f"{message.get('content', '')}"
-            for message in recent_history
-        )
-
-        if not history_text:
-            history_text = "No previous conversation history."
-
+        # Suggestions only need the current question and completed answer.
+        # Avoid sending unnecessary conversation history to reduce latency
+        # and token usage.
         suggestion_prompt = ChatPromptTemplate.from_messages(
             [
                 (
                     "system",
                     """
-You generate follow-up suggestions for an AI chatbot.
+You generate follow-up questions for an AI chatbot.
 
-Based on the user's current question and the assistant's answer,
-generate exactly 3 useful follow-up questions that the user could
-ask next.
+Based on the user's current question and the assistant's final answer,
+generate exactly 3 useful follow-up questions that the user could ask next.
 
 Rules:
-- Return exactly 3 suggestions.
-- Each suggestion must be a complete question.
-- Keep each suggestion concise and natural.
-- Suggestions must be relevant to the assistant's answer.
-- Suggestions should help the user explore the topic further.
+- Return exactly 3 questions.
+- Each question must be complete, concise, and natural.
+- Questions must be relevant to the assistant's answer.
+- Questions should help the user explore the topic further.
 - Do not repeat the user's current question.
-- Do not answer the suggestions.
-- Do not include explanations.
-- Do not include numbering.
-- Do not include bullet points.
-- Do not include markdown.
-- Return ONLY a valid JSON array of strings.
-
-Example output:
-[
-  "What are the main benefits?",
-  "Can you explain this in more detail?",
-  "What are the limitations?"
-]
+- Do not provide answers or explanations.
+- Do not use numbering, bullet points, or markdown.
 """,
                 ),
                 (
                     "human",
                     """
-Conversation History:
-
-{history}
-
 Current User Question:
 
 {question}
@@ -1511,49 +1486,23 @@ Assistant Answer:
         )
 
         messages = suggestion_prompt.format_messages(
-            history=history_text,
             question=question.strip(),
             answer=answer.strip(),
         )
 
-        response = llm.invoke(messages)
-        content = response.content
+        # Structured output avoids free-form JSON generation/parsing and
+        # returns the suggestions directly as a Pydantic object.
+        structured_llm = llm.with_structured_output(
+            SuggestionsResponse
+        )
 
-        if not isinstance(content, str):
-            logger.warning(
-                "SUGGESTION GENERATION returned non-string content"
-            )
-            return []
+        response = structured_llm.invoke(messages)
 
-        content = content.strip()
-
-        if not content:
-            return []
-
-        # Handle models that wrap JSON in a markdown code fence.
-        if content.startswith("```"):
-            if content.startswith("```json"):
-                content = content[len("```json"):]
-            else:
-                content = content[len("```"):]
-
-            if content.endswith("```"):
-                content = content[:-3]
-
-            content = content.strip()
-
-        try:
-            suggestions = json.loads(content)
-        except json.JSONDecodeError:
-            logger.warning(
-                "SUGGESTION GENERATION returned invalid JSON: %s",
-                content,
-            )
-            return []
+        suggestions = getattr(response, "suggestions", None)
 
         if not isinstance(suggestions, list):
             logger.warning(
-                "SUGGESTION GENERATION returned non-list JSON"
+                "SUGGESTION GENERATION returned an invalid suggestions field"
             )
             return []
 
@@ -1591,11 +1540,14 @@ Assistant Answer:
         return cleaned_suggestions
 
     except Exception as exc:
+        # Suggestion generation is optional. Never allow it to turn a
+        # successfully generated RAG answer into a failed chat response.
         logger.exception(
             "SUGGESTION GENERATION ERROR: error=%s",
             str(exc),
         )
         return []
+
 
 # ============================================================
 # GENERATE CONVERSATION TITLE
