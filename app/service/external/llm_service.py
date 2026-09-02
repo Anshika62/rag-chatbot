@@ -643,7 +643,7 @@ def _execute_tool_calls(
 
                 if (
                     content_type
-                    and content_type.startswith("image/")
+                    and content_type.startswith("image/") or content_type == "image"
                     and item.get("document_id")
                 ):
 
