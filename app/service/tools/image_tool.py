@@ -44,7 +44,7 @@ UPLOAD_DIR = "Uploads"
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 
-VISION_MODEL = "@cf/llava-hf/llava-1.5-7b-hf"
+VISION_MODEL = "@cf/google/gemma-4-26b-a4b-it"
 
 VISION_ENDPOINT = (
     "https://api.cloudflare.com/client/v4/accounts/"
@@ -204,69 +204,132 @@ def _run_vision_model(
     max_tokens: int = 1024,
 ) -> str:
     """
-    Shared low-level call to the Cloudflare Workers AI vision
-    model. Raises ImageCaptionQuotaExceededError on rate-limit /
-    quota errors, RuntimeError on anything else.
+    Shared low-level call to Cloudflare Workers AI Gemma 4
+    vision model.
+
+    Raises:
+        ImageCaptionQuotaExceededError:
+            On HTTP 429 / quota / rate-limit errors.
+        RuntimeError:
+            On other Cloudflare/API errors.
     """
 
+    import base64
+
     try:
+        # Convert image bytes to a data URL.
+        # Gemma 4 vision accepts the image as base64 image data.
+        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+        image_data_url = f"data:image/jpeg;base64,{image_base64}"
+
         response = requests.post(
             VISION_ENDPOINT,
             headers=VISION_HEADERS,
             json={
-                "image": list(image_bytes),
-                "prompt": prompt,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt,
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": image_data_url,
+                                },
+                            },
+                        ],
+                    }
+                ],
                 "max_tokens": max_tokens,
+                "chat_template_kwargs": {
+                    "enable_thinking": False,
+                },
             },
             timeout=60,
         )
 
+        # ---------------------------------------------------------
+        # RATE LIMIT / QUOTA
+        # ---------------------------------------------------------
         if response.status_code == 429:
-
             raise ImageCaptionQuotaExceededError(
-                "Cloudflare Workers AI rate limit / daily "
-                "Neurons quota exceeded."
+                "Cloudflare Workers AI rate limit / "
+                "daily Neurons quota exceeded."
             )
 
+        # ---------------------------------------------------------
+        # PAYLOAD TOO LARGE
+        # ---------------------------------------------------------
         if response.status_code == 413:
-
             raise RuntimeError(
-                "Cloudflare Workers AI rejected the image as too "
-                "large (413) even after resize/compress. This "
-                "should be rare — consider lowering MAX_PAYLOAD_BYTES "
-                "in image_tool.py."
+                "Cloudflare Workers AI rejected the image as "
+                "too large (413) even after resize/compress. "
+                "Consider lowering MAX_PAYLOAD_BYTES."
             )
 
+        # ---------------------------------------------------------
+        # OTHER HTTP ERRORS
+        # ---------------------------------------------------------
         response.raise_for_status()
 
         payload = response.json()
 
-        if not payload.get("success"):
+        # ---------------------------------------------------------
+        # CLOUDFLARE ENVELOPE ERRORS
+        # ---------------------------------------------------------
+        if not payload.get("success", True):
 
-            errors = payload.get("errors")
+            errors = payload.get("errors") or []
 
-            if _is_quota_exhausted(str(errors)):
+            error_text = str(errors)
 
+            if _is_quota_exhausted(
+                RuntimeError(error_text)
+            ):
                 raise ImageCaptionQuotaExceededError(
-                    f"Cloudflare Workers AI quota exhausted: {errors}"
+                    f"Cloudflare Workers AI quota exhausted: "
+                    f"{errors}"
                 )
 
             raise RuntimeError(
-                f"Cloudflare Workers AI returned an error: {errors}"
+                f"Cloudflare Workers AI returned an error: "
+                f"{errors}"
             )
 
-        result = payload.get("result", {})
+        # ---------------------------------------------------------
+        # RESPONSE PARSING
+        #
+        # Chat-completion style response:
+        #
+        # result -> choices -> message -> content
+        # ---------------------------------------------------------
+        result = payload.get("result") or {}
 
-        # Different vision models on Workers AI use slightly
-        # different response keys ("description" for llava,
-        # "response" for some others) — check both defensively.
+        choices = result.get("choices") or []
+
+        if choices:
+            message = choices[0].get("message") or {}
+            text = message.get("content") or ""
+
+            if isinstance(text, str):
+                return text.strip()
+
+        # ---------------------------------------------------------
+        # FALLBACK FOR OTHER RESPONSE SHAPES
+        # ---------------------------------------------------------
         text = (
-            result.get("description")
-            or result.get("response")
+            result.get("response")
+            or result.get("description")
             or ""
         )
 
-        return text
+        if isinstance(text, str):
+            return text.strip()
+
+        return ""
 
     except ImageCaptionQuotaExceededError:
         raise
@@ -281,7 +344,6 @@ def _run_vision_model(
         raise RuntimeError(
             f"Cloudflare Workers AI request failed: {exc}"
         ) from exc
-
 
 def generate_image_caption(
     image_path: str,

@@ -1163,7 +1163,6 @@ def _strip_thinking(text: str) -> str:
 
     return "".join(result).strip()
 
-
 # ============================================================
 # REASONING CONTEXT BUILDER
 #
@@ -1647,6 +1646,114 @@ def generate_answer_stream(
                 collected_images
             )
 
+         # ====================================================
+        # SECOND TOOL-CALL ROUND
+        #
+        # If the first search found an uploaded image, give the
+        # Main LLM one more chance to call analyze_document_image
+        # with the exact document_id returned by the search.
+        # ====================================================
+
+        all_tool_calls = tool_calls
+
+        if (
+            "search_knowledge_base"
+            in {
+                tool_call["name"]
+                for tool_call in tool_calls
+            }
+            and collected_images
+        ):
+
+            logger.info(
+                "STREAM SECOND TOOL-CALL ROUND: "
+                "giving LLM access to retrieved image",
+            )
+
+            second_streamed_chunks = []
+            second_tool_call_chunks = []
+
+            for chunk in llm_with_tools.stream(
+                messages + tool_messages
+            ):
+
+                second_streamed_chunks.append(chunk)
+
+                current_tool_chunks = getattr(
+                    chunk,
+                    "tool_call_chunks",
+                    None,
+                )
+
+                if current_tool_chunks:
+
+                    second_tool_call_chunks.extend(
+                        current_tool_chunks
+                    )
+
+            second_tool_calls = _parse_tool_calls(
+                second_tool_call_chunks
+            )
+
+            if second_tool_calls:
+
+                logger.info(
+                    "STREAM SECOND TOOL CALLS: tools=%s "
+                    "conversation_id=%s",
+                    [
+                        tool_call["name"]
+                        for tool_call in second_tool_calls
+                    ],
+                    conversation_id,
+                )
+
+                second_ai_response = None
+
+                for chunk in second_streamed_chunks:
+
+                    if second_ai_response is None:
+
+                        second_ai_response = chunk
+
+                    else:
+
+                        second_ai_response = (
+                            second_ai_response + chunk
+                        )
+
+                if second_ai_response is not None:
+
+                    tool_messages.append(
+                        second_ai_response
+                    )
+
+                second_extra_messages, second_collected_images = (
+                    _execute_tool_calls(
+                        tools=tools,
+                        tool_calls=second_tool_calls,
+                        conversation_id=conversation_id,
+                        log_prefix="STREAM ",
+                    )
+                )
+
+                tool_messages.extend(
+                    second_extra_messages
+                )
+
+                collected_images.extend(
+                    second_collected_images
+                )
+
+                all_tool_calls = (
+                    tool_calls + second_tool_calls
+                )
+
+                if images_output is not None:
+
+                    images_output.extend(
+                        second_collected_images
+                    )
+
         # ====================================================
         # GENERATE FINAL RESPONSE
         # ====================================================
@@ -1665,9 +1772,14 @@ def generate_answer_stream(
         # ====================================================
 
         use_reasoning = _should_use_reasoning(
-            tool_calls=tool_calls,
+            tool_calls=all_tool_calls,
             collected_images=collected_images,
-            extra_messages=extra_messages,
+            extra_messages=(
+                extra_messages
+                + second_extra_messages
+                if "second_extra_messages" in locals()
+                else extra_messages
+            ),
         )
 
         logger.info(
@@ -1703,10 +1815,10 @@ def generate_answer_stream(
                 # only. "answer" pieces pass through unchanged and
                 # unbuffered, so the final saved answer is
                 # identical to before this filter was added.
-                for piece in _filter_thinking_stream(
-                    _stream_with_thinking_split(
+                for piece in _stream_with_thinking_split(
+                   
                         reasoning_llm.stream(reasoning_messages)
-                    )
+                    
                 ):
 
                     if not piece["content"]:
