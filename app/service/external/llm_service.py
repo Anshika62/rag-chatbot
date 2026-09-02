@@ -1,17 +1,16 @@
 import json
 import logging
 import os
-from typing import Generator, Optional, Any
+from typing import Generator, Optional
 
 from fastapi import HTTPException, status
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
+import requests
 
-from app.schemas.suggestion_schema import SuggestionsResponse
 from app.service.tools.conversation_tool import (
     create_conversation_tools,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -19,16 +18,69 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # LLM CONFIGURATION
 # ============================================================
+#
+# Both models are configurable via environment variables instead
+# of being hard-coded, per the "environment variables for
+# model/API configuration" requirement. Defaults preserve the
+# existing behavior for the main LLM.
+#
+# MAIN LLM (llm):
+#   Handles normal conversation + decides which tool(s) to call.
+#   Used for everything by default.
+#
+# REASONING LLM (reasoning_llm):
+#   A separate, reasoning-capable model used ONLY for the final
+#   answer-synthesis step, and only when the tool results are
+#   non-trivial (multiple tools, multiple retrieved chunks, or
+#   text+image combined — see _should_use_reasoning below).
+#   Simple chat ("Hello", "What is Python?") and simple single-
+#   tool calls (weather, datetime, a single short KB hit) never
+#   reach this model, so they stay fast and cheap.
+#
+#   The reasoning model is qwen/qwen3.6-27b, currently Groq's
+#   highest-intelligence-ranked reasoning model. Unlike
+#   openai/gpt-oss-120b (which rejects reasoning_format entirely
+#   and only exposes reasoning via a separate include_reasoning
+#   flag), qwen3.6-27b officially supports reasoning_format="raw",
+#   which makes Groq inline the chain-of-thought as
+#   <think>...</think> at the start of the streamed content —
+#   exactly what _stream_with_thinking_split() below is built to
+#   split into "thinking" vs "answer" pieces. That function also
+#   still checks additional_kwargs["reasoning_content"] as a second
+#   mechanism, so switching REASONING_MODEL to a gpt-oss model
+#   later would keep working without further changes. Every piece
+#   — thinking or answer — is yielded as {"type": "thinking"/
+#   "answer", "content": ...} so the frontend can render a live
+#   "thinking..." trace as it happens, while still saving only the
+#   "answer" portion as the final message content.
+#
+#   The raw chain-of-thought is streamed to the user as-is (no
+#   artificial shortening/filtering of "thinking" content).
+# ============================================================
+
 
 LLM_MODEL_NAME = os.getenv(
     "LLM_MODEL",
     "openai/gpt-oss-20b",
 )
 
+# Reasoning model runs on Cloudflare Workers AI. Default is
+# @cf/deepseek-ai/deepseek-r1-distill-qwen-32b, Cloudflare's currently supported free/
+# freemium "Reasoning"-tagged model for this use case. It uses
+# the exact same REST contract as the previous
+# deepseek-r1-distill-qwen-32b default (messages in, "response"
+# field per SSE line out) and still emits its chain-of-thought
+# as inline <think>...</think> tags, so _stream_with_thinking_
+# split() below works completely unchanged.
 REASONING_MODEL_NAME = os.getenv(
     "REASONING_MODEL",
-    "qwen/qwen3.6-27b",
+    "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
 )
+
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
+
+CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4/accounts"
 
 
 llm = ChatGroq(
@@ -37,33 +89,198 @@ llm = ChatGroq(
 )
 
 
-reasoning_llm = ChatGroq(
+# ============================================================
+# CLOUDFLARE REASONING ADAPTER
+#
+# langchain_community's CloudflareWorkersAI wrapper has two
+# problems for our use case:
+#
+#   1. It's a completion-style LLM (plain string "prompt"), not
+#      a chat model — Cloudflare's reasoning/chat models actually
+#      expect a "messages" array, same shape as OpenAI's chat
+#      format.
+#   2. Its built-in _stream() method has a parsing bug: it slices
+#      the first 6 characters off every non-empty SSE line and
+#      tries to json.loads() it, without checking the line
+#      actually starts with "data: " first. Any other line (an
+#      SSE comment, a differently-shaped event, or an error body
+#      that isn't in "data: ..." format at all) makes it crash
+#      with a JSONDecodeError instead of just skipping that line.
+#
+# This adapter bypasses that library entirely and talks to the
+# Cloudflare REST API directly with `requests`, using the proper
+# "messages" format and a defensive line-by-line SSE parser that
+# silently skips anything that isn't a valid "data: {...}" line
+# instead of raising.
+#
+# It exposes only `.invoke(messages)` and `.stream(messages)`,
+# since those are the only two methods called on reasoning_llm
+# anywhere else in this file — so nothing else needs to change.
+# ============================================================
+
+
+_ROLE_MAP = {
+    "system": "system",
+    "human": "user",
+    "user": "user",
+    "ai": "assistant",
+    "assistant": "assistant",
+    "tool": "user",
+}
+
+
+def _reasoning_messages_to_cf_messages(messages):
+
+    cf_messages = []
+
+    for message in messages:
+
+        if isinstance(message, tuple):
+            role, content = message
+        else:
+            role = getattr(message, "type", "human")
+            content = getattr(message, "content", str(message))
+
+        cf_messages.append(
+            {
+                "role": _ROLE_MAP.get(role, "user"),
+                "content": content,
+            }
+        )
+
+    return cf_messages
+
+
+class _ReasoningChunk:
+
+    __slots__ = ("content", "additional_kwargs")
+
+    def __init__(self, content: str):
+        self.content = content
+        self.additional_kwargs = {}
+
+
+class _ReasoningResponse:
+
+    def __init__(self, content: str):
+        self.content = content
+
+
+REASONING_MAX_TOKENS = int(
+    os.getenv(
+        "REASONING_MAX_TOKENS",
+        "4096",
+    )
+)
+
+
+class _CloudflareReasoningLLM:
+
+    def __init__(self, account_id: str, api_token: str, model: str):
+
+        self._account_id = account_id
+        self._api_token = api_token
+        self._model = model
+        self._endpoint = (
+            f"{CLOUDFLARE_BASE_URL}/{account_id}/ai/run/{model}"
+        )
+
+    def _request(self, messages, stream: bool):
+
+        headers = {
+            "Authorization": f"Bearer {self._api_token}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "messages": _reasoning_messages_to_cf_messages(messages),
+            "stream": stream,
+            "max_tokens": REASONING_MAX_TOKENS,
+        }
+
+        response = requests.post(
+            self._endpoint,
+            headers=headers,
+            json=payload,
+            stream=stream,
+            timeout=120,
+        )
+
+        if not response.ok:
+
+            raise RuntimeError(
+                f"Cloudflare Workers AI request failed "
+                f"(status={response.status_code}): {response.text}"
+            )
+
+        return response
+
+    def invoke(self, messages):
+
+        response = self._request(messages, stream=False)
+
+        data = response.json()
+
+        text = data.get("result", {}).get("response", "")
+
+        return _ReasoningResponse(text)
+
+    def stream(self, messages):
+
+        response = self._request(messages, stream=True)
+
+        for raw_line in response.iter_lines():
+
+            if not raw_line:
+                continue
+
+            if not raw_line.startswith(b"data: "):
+                # SSE comment lines, differently-shaped events,
+                # or anything else that isn't a data payload —
+                # skip instead of crashing.
+                continue
+
+            payload_bytes = raw_line[len(b"data: "):]
+
+            if payload_bytes.strip() == b"[DONE]":
+                break
+
+            try:
+
+                data = json.loads(payload_bytes)
+
+            except json.JSONDecodeError:
+
+                logger.warning(
+                    "REASONING STREAM: skipping unparseable "
+                    "line: %r",
+                    raw_line,
+                )
+
+                continue
+
+            token = data.get("response")
+
+            if token:
+
+                yield _ReasoningChunk(token)
+
+
+reasoning_llm = _CloudflareReasoningLLM(
+    account_id=CLOUDFLARE_ACCOUNT_ID,
+    api_token=CLOUDFLARE_API_TOKEN,
     model=REASONING_MODEL_NAME,
-    temperature=0.3,
-    reasoning_format="raw",
 )
 
 
 THINK_START_TAG = "<think>"
 THINK_END_TAG = "</think>"
 
-MAX_KB_SEARCH_ATTEMPTS = int(
-    os.getenv("MAX_KB_SEARCH_ATTEMPTS", "4")
-)
-
-MAX_VISIBLE_THINKING_STEPS = 4
-
-REASONING_MIN_TOOL_CONTENT_CHARS = int(
-    os.getenv(
-        "REASONING_MIN_TOOL_CONTENT_CHARS",
-        "600",
-    )
-)
-
 
 # ============================================================
 # SYSTEM PROMPT
 # ============================================================
+
 
 SYSTEM_PROMPT = """
 You are a helpful AI assistant.
@@ -141,10 +358,10 @@ Rules:
   (not just "is there an image"), first use search_knowledge_base
   (content_type="image") to find the relevant image and its
   document_id, then call analyze_document_image with that
-  document_id and the user's specific question.
-
-- Do not answer image interpretation questions using only cached
-  caption/OCR text when analyze_document_image is available.
+  document_id and the user's specific question. Do not answer
+  such questions using only the cached caption/OCR text if
+  analyze_document_image is available — the actual image should
+  be analyzed for the user's specific question.
 
 - Do not guess a document_id for analyze_document_image. Only use
   a document_id that was actually returned by search_knowledge_base
@@ -157,20 +374,6 @@ Rules:
 - Use conversation history for follow-up questions.
 
 - Keep answers clear and concise.
-
-- When your answer references an image found via
-  search_knowledge_base (content_type="image") or
-  analyze_document_image, you MUST embed it inline using
-  markdown image syntax:
-
-  ![<short description>](/documents/<document_id>/file)
-
-  Use the exact document_id returned by the tool.
-
-- Never say you cannot display or attach an image.
-
-- Place the image markdown at the point in the answer where
-  the image is relevant.
 
 - Use get_current_datetime when the user asks for the current
   date or time.
@@ -209,7 +412,10 @@ def _build_messages(
     )
 
     if not history_text:
-        history_text = "No previous conversation history."
+
+        history_text = (
+            "No previous conversation history."
+        )
 
     document_context = (
         "YES. This turn is scoped to one specific uploaded "
@@ -328,91 +534,6 @@ def _get_tool(
 
 
 # ============================================================
-# EXTRACT KB SOURCES
-# ============================================================
-
-
-def _extract_kb_sources(
-    tool_result: Any,
-) -> list[dict]:
-    """Extract real source metadata from search results."""
-
-    if not isinstance(tool_result, list):
-        return []
-
-    sources = []
-
-    for item in tool_result:
-
-        if not isinstance(item, dict):
-            continue
-
-        filename = item.get("filename")
-        document_id = item.get("document_id")
-        parent_document_id = item.get(
-            "parent_document_id"
-        )
-        page_number = item.get("page_number")
-        chunk_index = item.get("chunk_index")
-
-        # Ignore no-result/error placeholder records.
-        if not filename and not document_id:
-            continue
-
-        sources.append(
-            {
-                "document_id": (
-                    str(document_id)
-                    if document_id
-                    else None
-                ),
-                "parent_document_id": (
-                    str(parent_document_id)
-                    if parent_document_id
-                    else None
-                ),
-                "filename": filename,
-                "page_number": page_number,
-                "chunk_index": chunk_index,
-            }
-        )
-
-    return sources
-
-
-# ============================================================
-# DEDUPLICATE SOURCES
-# ============================================================
-
-
-def _deduplicate_sources(
-    sources: list[dict],
-) -> list[dict]:
-    """Remove duplicate source entries while preserving order."""
-
-    unique = []
-    seen = set()
-
-    for source in sources:
-
-        key = (
-            source.get("document_id"),
-            source.get("parent_document_id"),
-            source.get("filename"),
-            source.get("page_number"),
-            source.get("chunk_index"),
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        unique.append(source)
-
-    return unique
-
-
-# ============================================================
 # EXECUTE TOOL CALLS
 # ============================================================
 
@@ -425,8 +546,8 @@ def _execute_tool_calls(
 ):
 
     tool_messages = []
+
     collected_images = []
-    collected_sources = []
 
     for tool_call in tool_calls:
 
@@ -443,12 +564,14 @@ def _execute_tool_calls(
         )
 
         if selected_tool is None:
+
             raise RuntimeError(
                 f"Requested tool not found: {tool_name}"
             )
 
         logger.info(
-            "%sTOOL EXECUTING: tool=%s args=%s conversation_id=%s",
+            "%sTOOL EXECUTING: tool=%s args=%s "
+            "conversation_id=%s",
             log_prefix,
             tool_name,
             tool_args,
@@ -464,7 +587,8 @@ def _execute_tool_calls(
         except Exception:
 
             logger.exception(
-                "%sTOOL FAILED: tool=%s args=%s conversation_id=%s",
+                "%sTOOL FAILED: tool=%s args=%s "
+                "conversation_id=%s",
                 log_prefix,
                 tool_name,
                 tool_args,
@@ -476,10 +600,10 @@ def _execute_tool_calls(
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "content": (
-                        f"The '{tool_name}' tool failed and is "
-                        "temporarily unavailable. Let the user "
-                        "know and answer with whatever other "
-                        "information is available."
+                        f"The '{tool_name}' tool failed and "
+                        "is temporarily unavailable. Let the "
+                        "user know and answer with whatever "
+                        "other information is available."
                     ),
                 }
             )
@@ -493,24 +617,21 @@ def _execute_tool_calls(
             conversation_id,
         )
 
-        # ----------------------------------------------------
-        # SEARCH KNOWLEDGE BASE
-        # ----------------------------------------------------
+        # ====================================================
+        # COLLECT IMAGE REFERENCES
+        # ====================================================
 
         if (
             tool_name == "search_knowledge_base"
             and isinstance(tool_result, list)
         ):
 
-            collected_sources.extend(
-                _extract_kb_sources(
-                    tool_result
-                )
-            )
-
             for item in tool_result:
 
-                if not isinstance(item, dict):
+                if not isinstance(
+                    item,
+                    dict,
+                ):
                     continue
 
                 content_type = item.get(
@@ -519,12 +640,7 @@ def _execute_tool_calls(
 
                 if (
                     content_type
-                    and (
-                        content_type.startswith(
-                            "image/"
-                        )
-                        or content_type == "image"
-                    )
+                    and content_type.startswith("image/")
                     and item.get("document_id")
                 ):
 
@@ -554,10 +670,6 @@ def _execute_tool_calls(
                             ),
                         }
                     )
-
-        # ----------------------------------------------------
-        # DOCUMENT IMAGE ANALYSIS
-        # ----------------------------------------------------
 
         elif (
             tool_name == "analyze_document_image"
@@ -593,10 +705,6 @@ def _execute_tool_calls(
                 }
             )
 
-        # ----------------------------------------------------
-        # TOOL MESSAGE
-        # ----------------------------------------------------
-
         tool_messages.append(
             {
                 "role": "tool",
@@ -608,15 +716,28 @@ def _execute_tool_calls(
     return (
         tool_messages,
         collected_images,
-        _deduplicate_sources(
-            collected_sources
-        ),
     )
 
 
 # ============================================================
-# REASONING DECISION
+# REASONING DECISION (Section 16)
+#
+# Keep simple questions simple: "Hello", "What is Python?", a
+# single short knowledge-base hit, or a single weather/datetime
+# call never reach the reasoning model. Reasoning is only used
+# when the tool results actually need to be compared/combined —
+# multiple tools used together, an image analyzed alongside other
+# content, or a substantial amount of retrieved text to reason
+# over.
 # ============================================================
+
+
+REASONING_MIN_TOOL_CONTENT_CHARS = int(
+    os.getenv(
+        "REASONING_MIN_TOOL_CONTENT_CHARS",
+        "600",
+    )
+)
 
 
 def _should_use_reasoning(
@@ -633,26 +754,24 @@ def _should_use_reasoning(
         for tool_call in tool_calls
     }
 
-    # Multiple tools -> synthesis required.
+    # Multiple different tools used together -> results need to
+    # be combined/synthesized.
     if len(tool_names) > 1:
         return True
 
-    # Image results -> potentially requires visual synthesis.
+    # An image was analyzed alongside other tool output -> combining
+    # vision output with text is exactly the case Section 16 calls
+    # out for reasoning.
     if collected_images:
         return True
 
-    # Large KB result -> reasoning can help synthesize.
+    # A single search_knowledge_base call that returned a
+    # substantial amount of text (multiple/long chunks) benefits
+    # from a reasoning pass to compare and synthesize across them.
     if "search_knowledge_base" in tool_names:
 
         combined_length = sum(
-            len(
-                str(
-                    message.get(
-                        "content",
-                        "",
-                    )
-                )
-            )
+            len(str(message.get("content", "")))
             for message in extra_messages
             if (
                 isinstance(message, dict)
@@ -660,17 +779,42 @@ def _should_use_reasoning(
             )
         )
 
-        if (
-            combined_length
-            > REASONING_MIN_TOOL_CONTENT_CHARS
-        ):
+        if combined_length > REASONING_MIN_TOOL_CONTENT_CHARS:
             return True
 
     return False
 
 
 # ============================================================
-# THINKING / ANSWER STREAM SPLITTER
+# THINKING/ANSWER STREAM SPLITTER
+#
+# The reasoning model emits a single continuous token stream that
+# looks like:
+#
+#     <think> ...chain of thought... </think> ...final answer...
+#
+# This splits that stream into separate "thinking" and "answer"
+# events as it arrives, so the caller can show live "thinking..."
+# output (like other reasoning-model chat UIs) without it ending
+# up as part of the saved/displayed final answer. A small tail of
+# text is always held back while scanning for a tag, in case a
+# tag like "<think>" is split across two streamed chunks.
+#
+# Two different mechanisms are checked on every chunk, since
+# different reasoning models expose their chain-of-thought
+# differently:
+#
+#   1. additional_kwargs["reasoning_content"] (or ["reasoning"])
+#      — used by openai/gpt-oss-20b / openai/gpt-oss-120b on Groq,
+#      which return reasoning as a separate field per chunk
+#      instead of inlining it in .content.
+#
+#   2. <think>...</think> tags inline inside .content — used by
+#      DeepSeek-R1-distill and some other reasoning models.
+#
+# A model only ever uses one of the two, so only one branch will
+# ever produce output for a given REASONING_MODEL — the other is
+# simply a silent no-op.
 # ============================================================
 
 
@@ -683,9 +827,7 @@ def _stream_with_thinking_split(
 
     for chunk in model_stream:
 
-        # ----------------------------------------------------
-        # SEPARATE REASONING FIELD
-        # ----------------------------------------------------
+        # ---- mechanism 1: separate reasoning field per chunk ----
 
         extra_kwargs = getattr(
             chunk,
@@ -694,12 +836,8 @@ def _stream_with_thinking_split(
         ) or {}
 
         reasoning_piece = (
-            extra_kwargs.get(
-                "reasoning_content"
-            )
-            or extra_kwargs.get(
-                "reasoning"
-            )
+            extra_kwargs.get("reasoning_content")
+            or extra_kwargs.get("reasoning")
         )
 
         if reasoning_piece:
@@ -709,9 +847,7 @@ def _stream_with_thinking_split(
                 "content": reasoning_piece,
             }
 
-        # ----------------------------------------------------
-        # INLINE THINK TAGS
-        # ----------------------------------------------------
+        # ---- mechanism 2: inline <think> tags inside .content ----
 
         content = getattr(
             chunk,
@@ -825,13 +961,17 @@ def _stream_with_thinking_split(
 
 
 # ============================================================
-# STRIP THINKING
+# STRIP THINKING (non-streamed reasoning responses)
+#
+# Mirrors _stream_with_thinking_split above, but for a single
+# already-complete response string (used by generate_answer,
+# the non-streaming path). Removes any <think>...</think> block
+# so the model's private chain-of-thought is never returned as
+# part of the final answer.
 # ============================================================
 
 
-def _strip_thinking(
-    text: str,
-) -> str:
+def _strip_thinking(text: str) -> str:
 
     if not text:
         return text
@@ -841,38 +981,26 @@ def _strip_thinking(
 
     while True:
 
-        start_index = remaining.find(
-            THINK_START_TAG
-        )
+        start_index = remaining.find(THINK_START_TAG)
 
         if start_index == -1:
-
-            result.append(
-                remaining
-            )
-
+            result.append(remaining)
             break
 
-        result.append(
-            remaining[
-                :start_index
-            ]
-        )
+        result.append(remaining[:start_index])
 
         end_index = remaining.find(
             THINK_END_TAG,
-            start_index
-            + len(THINK_START_TAG),
+            start_index + len(THINK_START_TAG),
         )
 
         if end_index == -1:
-
-            # Drop incomplete thinking section.
+            # Unclosed tag — drop everything from the tag onward
+            # rather than risk leaking a partial chain-of-thought.
             break
 
         remaining = remaining[
-            end_index
-            + len(THINK_END_TAG):
+            end_index + len(THINK_END_TAG):
         ]
 
     return "".join(result).strip()
@@ -880,6 +1008,13 @@ def _strip_thinking(
 
 # ============================================================
 # REASONING CONTEXT BUILDER
+#
+# Builds the minimal set of messages the reasoning model needs:
+# the original conversation/question messages plus only the tool
+# results actually produced for this turn (retrieved chunks,
+# vision analysis, weather/datetime results, etc). We never hand
+# the reasoning model the raw database/conversation dump — only
+# what _execute_tool_calls already gathered for this turn.
 # ============================================================
 
 
@@ -895,23 +1030,18 @@ def _build_reasoning_messages(
         "carefully and produce one clear, well-synthesized "
         "final answer for the user.\n\n"
         "Important:\n"
-        "- Compare/combine information across sources where "
-        "relevant.\n"
         "- Some retrieved tool results may NOT be relevant to "
-        "the user's actual question. Silently discard anything "
-        "irrelevant.\n"
+        "the user's actual question (retrieval is not perfect). "
+        "Silently discard anything irrelevant — do not mention, "
+        "summarize, or reference it in your answer.\n"
         "- Only use content that directly helps answer the "
         "question asked.\n"
-        "- Write a natural, concise, conversational answer. "
-        "Do not dump raw retrieved text, filenames, or internal "
-        "tool details into the answer.\n"
-        "- If a tool result includes an image document_id, "
-        "embed that image inline at the relevant point using "
-        "markdown image syntax:\n"
-        "![description](/documents/<document_id>/file)\n"
-        "- Use the exact document_id returned by the tool.\n"
+        "- Write a natural, concise, conversational answer. Do "
+        "not dump raw retrieved text, filenames, metadata, or "
+        "internal tool details into the answer.\n"
         "- Do not mention that you are a separate reasoning "
-        "step or that you used tools.",
+        "step, that you used tools, or that some results were "
+        "discarded.",
     )
 
     return (
@@ -937,16 +1067,22 @@ def generate_answer(
     image_paths: Optional[list[str]] = None,
 ):
 
-    """Generate a non-streaming answer."""
+    """
+    document_id:
+        If provided, scopes the knowledge-base search tool
+        to that single uploaded document.
+
+    image_paths:
+        Local file path(s) of images attached directly to
+        THIS message.
+    """
 
     try:
 
         messages = _build_messages(
             question=question,
             chat_history=chat_history,
-            document_available=bool(
-                document_id
-            ),
+            document_available=bool(document_id),
         )
 
         tools = _create_tools(
@@ -957,229 +1093,125 @@ def generate_answer(
             image_paths=image_paths,
         )
 
-        llm_with_tools = _bind_tools(
-            tools
-        )
+        llm_with_tools = _bind_tools(tools)
 
-        current_messages = list(
+        response = llm_with_tools.invoke(
             messages
         )
 
-        kb_search_count = 0
+        if not response.tool_calls:
 
-        all_tool_messages = []
-        all_images = []
-        all_sources = []
+            return response.content
 
-        first_tool_calls = []
+        logger.info(
+            "LLM TOOL CALLS: tools=%s "
+            "conversation_id=%s",
+            [
+                tool_call["name"]
+                for tool_call in response.tool_calls
+            ],
+            conversation_id,
+        )
 
-        while True:
+        tool_messages = [
+            response
+        ]
 
-            response = llm_with_tools.invoke(
-                current_messages
-            )
-
-            if not response.tool_calls:
-
-                final_answer = response.content
-                break
-
-            if not first_tool_calls:
-
-                first_tool_calls = list(
-                    response.tool_calls
-                )
-
-            current_messages.append(
-                response
-            )
-
-            all_tool_messages.append(
-                response
-            )
-
-            remaining = max(
-                0,
-                MAX_KB_SEARCH_ATTEMPTS
-                - kb_search_count,
-            )
-
-            executable_calls = []
-            blocked_kb_calls = []
-            allowed_kb_calls = 0
-
-            for call in response.tool_calls:
-
-                if (
-                    call["name"]
-                    == "search_knowledge_base"
-                ):
-
-                    if (
-                        allowed_kb_calls
-                        < remaining
-                    ):
-
-                        executable_calls.append(
-                            call
-                        )
-
-                        allowed_kb_calls += 1
-
-                    else:
-
-                        blocked_kb_calls.append(
-                            call
-                        )
-
-                else:
-
-                    executable_calls.append(
-                        call
-                    )
-
-            # ------------------------------------------------
-            # BLOCK EXCESS KB SEARCHES
-            # ------------------------------------------------
-
-            for call in blocked_kb_calls:
-
-                current_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": (
-                            "Maximum knowledge-base search "
-                            "attempts have been reached. "
-                            "Do not search again. Use the "
-                            "information already retrieved. "
-                            "If it is insufficient, say that "
-                            "the information was not found."
-                        ),
-                    }
-                )
-
-            # ------------------------------------------------
-            # NO EXECUTABLE TOOLS
-            # ------------------------------------------------
-
-            if (
-                blocked_kb_calls
-                and not executable_calls
-            ):
-
-                final_response = llm.invoke(
-                    current_messages
-                )
-
-                final_answer = (
-                    final_response.content
-                )
-
-                break
-
-            # ------------------------------------------------
-            # EXECUTE TOOLS
-            # ------------------------------------------------
-
-            (
-                extra_messages,
-                collected_images,
-                collected_sources,
-            ) = _execute_tool_calls(
+        extra_messages, collected_images = (
+            _execute_tool_calls(
                 tools=tools,
-                tool_calls=executable_calls,
+                tool_calls=response.tool_calls,
                 conversation_id=conversation_id,
             )
+        )
 
-            current_messages.extend(
-                extra_messages
-            )
-
-            all_tool_messages.extend(
-                extra_messages
-            )
-
-            all_images.extend(
-                collected_images
-            )
-
-            all_sources.extend(
-                collected_sources
-            )
-
-            kb_search_count += (
-                allowed_kb_calls
-            )
-
-        # ----------------------------------------------------
-        # RETURN IMAGES
-        # ----------------------------------------------------
+        tool_messages.extend(
+            extra_messages
+        )
 
         if images_output is not None:
 
             images_output.extend(
-                all_images
+                collected_images
             )
 
-        # ----------------------------------------------------
-        # OPTIONAL REASONING
-        # ----------------------------------------------------
+        # ====================================================
+        # REASONING STAGE (final-answer synthesis)
+        #
+        # Only used when the tool results actually need to be
+        # compared/combined (see _should_use_reasoning). Simple
+        # single-tool turns keep using the Main LLM directly.
+        # ====================================================
 
-        if all_tool_messages:
-
-            use_reasoning = _should_use_reasoning(
-                tool_calls=first_tool_calls,
-                collected_images=all_images,
-                extra_messages=all_tool_messages,
-            )
-
-            if use_reasoning:
-
-                try:
-
-                    reasoning_messages = (
-                        _build_reasoning_messages(
-                            base_messages=messages,
-                            tool_messages=all_tool_messages,
-                        )
-                    )
-
-                    reasoning_response = (
-                        reasoning_llm.invoke(
-                            reasoning_messages
-                        )
-                    )
-
-                    reasoning_answer = (
-                        _strip_thinking(
-                            reasoning_response.content
-                        )
-                    )
-
-                    if reasoning_answer:
-
-                        final_answer = (
-                            reasoning_answer
-                        )
-
-                except Exception:
-
-                    logger.exception(
-                        "REASONING FAILED, using main "
-                        "LLM answer: conversation_id=%s",
-                        conversation_id,
-                    )
+        use_reasoning = _should_use_reasoning(
+            tool_calls=response.tool_calls,
+            collected_images=collected_images,
+            extra_messages=extra_messages,
+        )
 
         logger.info(
-            "KB SEARCH ATTEMPTS: count=%s conversation_id=%s",
-            kb_search_count,
+            "REASONING %s: conversation_id=%s",
+            "SELECTED" if use_reasoning else "SKIPPED",
             conversation_id,
         )
 
-        return _strip_thinking(
-            final_answer
+        if use_reasoning:
+
+            try:
+
+                logger.info(
+                    "REASONING START: model=%s "
+                    "conversation_id=%s",
+                    REASONING_MODEL_NAME,
+                    conversation_id,
+                )
+
+                reasoning_messages = _build_reasoning_messages(
+                    base_messages=messages,
+                    tool_messages=tool_messages,
+                )
+
+                reasoning_response = reasoning_llm.invoke(
+                    reasoning_messages
+                )
+
+                final_answer = _strip_thinking(
+                    reasoning_response.content
+                )
+
+                if final_answer:
+
+                    logger.info(
+                        "REASONING COMPLETE: conversation_id=%s",
+                        conversation_id,
+                    )
+
+                    return final_answer
+
+                logger.warning(
+                    "REASONING EMPTY RESULT, falling back to "
+                    "main LLM: conversation_id=%s",
+                    conversation_id,
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "REASONING FAILED, falling back to main "
+                    "LLM: conversation_id=%s",
+                    conversation_id,
+                )
+
+        # ====================================================
+        # MAIN LLM FINAL ANSWER (default path / reasoning
+        # fallback)
+        # ====================================================
+
+        final_response = llm_with_tools.invoke(
+            messages + tool_messages
         )
+
+        return final_response.content
 
     except HTTPException:
 
@@ -1188,7 +1220,8 @@ def generate_answer(
     except Exception as exc:
 
         logger.exception(
-            "LLM RESPONSE ERROR: conversation_id=%s error=%s",
+            "LLM RESPONSE ERROR: conversation_id=%s "
+            "error=%s",
             conversation_id,
             str(exc),
         )
@@ -1209,6 +1242,7 @@ def _parse_tool_calls(
 ):
 
     if not tool_call_chunks:
+
         return []
 
     tool_calls = {}
@@ -1229,27 +1263,22 @@ def _parse_tool_calls(
             }
 
         tool_calls[index]["id"] += (
-            chunk.get("id")
-            or ""
+            chunk.get("id") or ""
         )
 
         tool_calls[index]["name"] += (
-            chunk.get("name")
-            or ""
+            chunk.get("name") or ""
         )
 
         tool_calls[index]["args"] += (
-            chunk.get("args")
-            or ""
+            chunk.get("args") or ""
         )
 
     parsed_calls = []
 
     for tool_call in tool_calls.values():
 
-        args_text = (
-            tool_call["args"].strip()
-        )
+        args_text = tool_call["args"].strip()
 
         if args_text:
 
@@ -1297,11 +1326,22 @@ def generate_answer_stream(
 ) -> Generator[dict, None, None]:
 
     """
-    Stream an answer while allowing the main LLM to perform
-    multiple Knowledge Base/tool searches.
+    document_id:
+        If provided, scopes the knowledge-base search tool
+        to that single uploaded document.
 
-    Only short activity messages are emitted as thinking events.
-    Raw reasoning content is not intentionally exposed here.
+    image_paths:
+        Local file path(s) of image(s) attached directly to
+        THIS message.
+
+    Yields:
+        dicts of the form {"type": "thinking" | "answer",
+        "content": str}. "thinking" pieces are the reasoning
+        model's live chain-of-thought (only ever produced during
+        the REASONING STAGE below) and should be shown to the
+        user as a transient "thinking..." trace, never saved as
+        the final message content. "answer" pieces are the real
+        response and should be both streamed and saved.
     """
 
     try:
@@ -1309,9 +1349,7 @@ def generate_answer_stream(
         messages = _build_messages(
             question=question,
             chat_history=chat_history,
-            document_available=bool(
-                document_id
-            ),
+            document_available=bool(document_id),
         )
 
         tools = _create_tools(
@@ -1322,468 +1360,256 @@ def generate_answer_stream(
             image_paths=image_paths,
         )
 
-        llm_with_tools = _bind_tools(
-            tools
+        llm_with_tools = _bind_tools(tools)
+
+        logger.info(
+            "LLM STREAM START: conversation_id=%s "
+            "tools=%s",
+            conversation_id,
+            [
+                tool.name
+                for tool in tools
+            ],
         )
 
-        current_messages = list(
+        streamed_chunks = []
+
+        tool_call_chunks = []
+
+        for chunk in llm_with_tools.stream(
             messages
-        )
-
-        kb_search_count = 0
-
-        all_tool_messages = []
-        all_images = []
-        all_sources = []
-
-        first_tool_calls = []
-
-        emitted_steps = set()
-
-        # ----------------------------------------------------
-        # SAFE THINKING EVENT
-        # ----------------------------------------------------
-
-        def emit_thinking(
-            step: str,
         ):
 
-            if step in emitted_steps:
-                return None
-
-            if (
-                len(emitted_steps)
-                >= MAX_VISIBLE_THINKING_STEPS
-            ):
-                return None
-
-            emitted_steps.add(step)
-
-            return {
-                "type": "thinking",
-                "content": step,
-            }
-
-        # ----------------------------------------------------
-        # MAIN TOOL / ANSWER LOOP
-        # ----------------------------------------------------
-
-        while True:
-
-            streamed_chunks = []
-            tool_call_chunks = []
-
-            for chunk in llm_with_tools.stream(
-                current_messages
-            ):
-
-                streamed_chunks.append(
-                    chunk
-                )
-
-                current_tool_chunks = getattr(
-                    chunk,
-                    "tool_call_chunks",
-                    None,
-                )
-
-                if current_tool_chunks:
-
-                    tool_call_chunks.extend(
-                        current_tool_chunks
-                    )
-
-            tool_calls = _parse_tool_calls(
-                tool_call_chunks
+            streamed_chunks.append(
+                chunk
             )
 
-            # =================================================
-            # NO TOOL CALL
-            # =================================================
+            current_tool_chunks = getattr(
+                chunk,
+                "tool_call_chunks",
+                None,
+            )
 
-            if not tool_calls:
+            if current_tool_chunks:
 
-                # ------------------------------------------------
-                # SIMPLE CHAT
-                # ------------------------------------------------
-
-                if not all_tool_messages:
-
-                    for chunk in streamed_chunks:
-
-                        content = getattr(
-                            chunk,
-                            "content",
-                            "",
-                        )
-
-                        if content:
-
-                            yield {
-                                "type": "answer",
-                                "content": content,
-                            }
-
-                    return
-
-                # ------------------------------------------------
-                # TOOL RESULT -> FINAL ANSWER
-                # ------------------------------------------------
-
-                step = emit_thinking(
-                    "Generating answer"
+                tool_call_chunks.extend(
+                    current_tool_chunks
                 )
 
-                if step:
-                    yield step
+        tool_calls = _parse_tool_calls(
+            tool_call_chunks
+        )
 
-                use_reasoning = (
-                    _should_use_reasoning(
-                        tool_calls=first_tool_calls,
-                        collected_images=all_images,
-                        extra_messages=all_tool_messages,
-                    )
-                )
+        # ====================================================
+        # NORMAL STREAMING RESPONSE
+        # ====================================================
 
-                # ------------------------------------------------
-                # REASONING MODEL
-                # ------------------------------------------------
-
-                if use_reasoning:
-
-                    try:
-
-                        reasoning_messages = (
-                            _build_reasoning_messages(
-                                base_messages=messages,
-                                tool_messages=all_tool_messages,
-                            )
-                        )
-
-                        answer_started = False
-
-                        for piece in (
-                            _stream_with_thinking_split(
-                                reasoning_llm.stream(
-                                    reasoning_messages
-                                )
-                            )
-                        ):
-
-                            if (
-                                piece["type"]
-                                == "answer"
-                                and piece["content"]
-                            ):
-
-                                answer_started = True
-
-                                yield {
-                                    "type": "answer",
-                                    "content": piece[
-                                        "content"
-                                    ],
-                                }
-
-                        if answer_started:
-
-                            if images_output is not None:
-
-                                images_output.extend(
-                                    all_images
-                                )
-
-                            if all_sources:
-
-                                yield {
-                                    "type": "sources",
-                                    "sources": (
-                                        _deduplicate_sources(
-                                            all_sources
-                                        )
-                                    ),
-                                }
-
-                            return
-
-                    except Exception:
-
-                        logger.exception(
-                            "REASONING FAILED: "
-                            "conversation_id=%s",
-                            conversation_id,
-                        )
-
-                # ------------------------------------------------
-                # FALLBACK TO MAIN LLM ANSWER
-                # ------------------------------------------------
-
-                for chunk in streamed_chunks:
-
-                    content = getattr(
-                        chunk,
-                        "content",
-                        "",
-                    )
-
-                    if content:
-
-                        yield {
-                            "type": "answer",
-                            "content": content,
-                        }
-
-                if images_output is not None:
-
-                    images_output.extend(
-                        all_images
-                    )
-
-                if all_sources:
-
-                    yield {
-                        "type": "sources",
-                        "sources": (
-                            _deduplicate_sources(
-                                all_sources
-                            )
-                        ),
-                    }
-
-                return
-
-            # =================================================
-            # TOOL CALL FOUND
-            # =================================================
-
-            if not first_tool_calls:
-
-                first_tool_calls = list(
-                    tool_calls
-                )
-
-            # ------------------------------------------------
-            # RECONSTRUCT AI TOOL RESPONSE
-            # ------------------------------------------------
-
-            full_ai_response = None
+        if not tool_calls:
 
             for chunk in streamed_chunks:
 
-                if full_ai_response is None:
+                if chunk.content:
 
-                    full_ai_response = chunk
+                    yield {
+                        "type": "answer",
+                        "content": chunk.content,
+                    }
 
-                else:
+            return
 
-                    full_ai_response = (
-                        full_ai_response
-                        + chunk
-                    )
+        # ====================================================
+        # TOOL CALLS DETECTED
+        # ====================================================
+
+        logger.info(
+            "STREAM TOOL CALLS: tools=%s "
+            "conversation_id=%s",
+            [
+                tool_call["name"]
+                for tool_call in tool_calls
+            ],
+            conversation_id,
+        )
+
+        # ====================================================
+        # RECONSTRUCT AI TOOL-CALL RESPONSE
+        # ====================================================
+
+        full_ai_response = None
+
+        for chunk in streamed_chunks:
 
             if full_ai_response is None:
 
-                raise RuntimeError(
-                    "Unable to reconstruct "
-                    "tool-call response"
+                full_ai_response = chunk
+
+            else:
+
+                full_ai_response = (
+                    full_ai_response + chunk
                 )
 
-            current_messages.append(
-                full_ai_response
+        if full_ai_response is None:
+
+            raise RuntimeError(
+                "Unable to reconstruct tool-call response"
             )
 
-            all_tool_messages.append(
-                full_ai_response
+        tool_messages = [
+            full_ai_response
+        ]
+
+        # ====================================================
+        # EXECUTE TOOLS
+        # ====================================================
+
+        extra_messages, collected_images = (
+            _execute_tool_calls(
+                tools=tools,
+                tool_calls=tool_calls,
+                conversation_id=conversation_id,
+                log_prefix="STREAM ",
+            )
+        )
+
+        tool_messages.extend(
+            extra_messages
+        )
+
+        if images_output is not None:
+
+            images_output.extend(
+                collected_images
             )
 
-            # ------------------------------------------------
-            # THINKING: UNDERSTANDING
-            # ------------------------------------------------
+        # ====================================================
+        # GENERATE FINAL RESPONSE
+        # ====================================================
 
-            if not emitted_steps:
+        final_messages = (
+            messages + tool_messages
+        )
 
-                step = emit_thinking(
-                    "Understanding your question"
+        # ====================================================
+        # REASONING STAGE (final-answer synthesis)
+        #
+        # Only used when the tool results actually need to be
+        # compared/combined (see _should_use_reasoning). Simple
+        # single-tool turns keep streaming from the Main LLM
+        # directly, unchanged from prior behavior.
+        # ====================================================
+
+        use_reasoning = _should_use_reasoning(
+            tool_calls=tool_calls,
+            collected_images=collected_images,
+            extra_messages=extra_messages,
+        )
+
+        logger.info(
+            "REASONING %s: conversation_id=%s",
+            "SELECTED" if use_reasoning else "SKIPPED",
+            conversation_id,
+        )
+
+        if use_reasoning:
+
+            reasoning_yielded_any = False
+
+            try:
+
+                logger.info(
+                    "REASONING START: model=%s "
+                    "conversation_id=%s",
+                    REASONING_MODEL_NAME,
+                    conversation_id,
                 )
 
-                if step:
-                    yield step
-
-            # ------------------------------------------------
-            # THINKING: KB SEARCH
-            # ------------------------------------------------
-
-            kb_calls = [
-                call
-                for call in tool_calls
-                if call["name"]
-                == "search_knowledge_base"
-            ]
-
-            if kb_calls:
-
-                step = emit_thinking(
-                    "Searching your documents"
+                reasoning_messages = _build_reasoning_messages(
+                    base_messages=messages,
+                    tool_messages=tool_messages,
                 )
 
-                if step:
-                    yield step
+                reasoning_answer_yielded = False
 
-            # ------------------------------------------------
-            # KB SEARCH LIMIT
-            # ------------------------------------------------
-
-            remaining = max(
-                0,
-                MAX_KB_SEARCH_ATTEMPTS
-                - kb_search_count,
-            )
-
-            executable_calls = []
-            blocked_kb_calls = []
-
-            allowed_kb_calls = 0
-
-            for call in tool_calls:
-
-                if (
-                    call["name"]
-                    == "search_knowledge_base"
+                # NOTE: _stream_with_thinking_split's output is
+                # yielded as-is — "thinking" pieces are the raw,
+                # unfiltered chain-of-thought (no artificial
+                # shortening/noise filtering applied), and
+                # "answer" pieces pass through unchanged and
+                # unbuffered.
+                for piece in _stream_with_thinking_split(
+                    reasoning_llm.stream(reasoning_messages)
                 ):
 
-                    if (
-                        allowed_kb_calls
-                        < remaining
-                    ):
+                    if not piece["content"]:
+                        continue
 
-                        executable_calls.append(
-                            call
-                        )
+                    if piece["type"] == "thinking":
 
-                        allowed_kb_calls += 1
+                        # Live chain-of-thought — shown to the
+                        # user as a transient "thinking..." trace.
+                        # Never saved as the final answer.
 
-                    else:
+                        yield {
+                            "type": "thinking",
+                            "content": piece["content"],
+                        }
 
-                        blocked_kb_calls.append(
-                            call
-                        )
+                    elif piece["type"] == "answer":
 
-                else:
+                        reasoning_yielded_any = True
+                        reasoning_answer_yielded = True
 
-                    executable_calls.append(
-                        call
+                        yield {
+                            "type": "answer",
+                            "content": piece["content"],
+                        }
+
+                if reasoning_answer_yielded:
+
+                    logger.info(
+                        "REASONING COMPLETE: conversation_id=%s",
+                        conversation_id,
                     )
 
-            # ------------------------------------------------
-            # BLOCKED TOOL CALL RESULTS
-            # ------------------------------------------------
+                    return
 
-            for call in blocked_kb_calls:
-
-                current_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": (
-                            "Maximum knowledge-base search "
-                            "attempts have been reached. "
-                            "Do not search again. Use the "
-                            "information already retrieved. "
-                            "If it is insufficient, say that "
-                            "the information was not found."
-                        ),
-                    }
+                logger.warning(
+                    "REASONING EMPTY RESULT, falling back to "
+                    "main LLM: conversation_id=%s",
+                    conversation_id,
                 )
 
-            # ------------------------------------------------
-            # EXECUTE TOOLS
-            # ------------------------------------------------
+            except Exception:
 
-            if executable_calls:
-
-                (
-                    extra_messages,
-                    collected_images,
-                    collected_sources,
-                ) = _execute_tool_calls(
-                    tools=tools,
-                    tool_calls=executable_calls,
-                    conversation_id=conversation_id,
-                    log_prefix="STREAM ",
+                logger.exception(
+                    "REASONING FAILED: conversation_id=%s",
+                    conversation_id,
                 )
 
-                current_messages.extend(
-                    extra_messages
-                )
+                # If the reasoning model already streamed part of
+                # an answer before failing, do NOT also stream the
+                # Main LLM's answer — that would produce a garbled,
+                # duplicated response. Only fall back to the Main
+                # LLM when reasoning produced nothing at all.
+                if reasoning_yielded_any:
+                    return
 
-                all_tool_messages.extend(
-                    extra_messages
-                )
+        # ====================================================
+        # MAIN LLM FINAL ANSWER (default path / reasoning
+        # fallback)
+        # ====================================================
 
-                all_images.extend(
-                    collected_images
-                )
+        for chunk in llm_with_tools.stream(
+            final_messages
+        ):
 
-                all_sources.extend(
-                    collected_sources
-                )
+            if chunk.content:
 
-            kb_search_count += (
-                allowed_kb_calls
-            )
-
-            # ------------------------------------------------
-            # THINKING: RESULTS
-            # ------------------------------------------------
-
-            if allowed_kb_calls:
-
-                step = emit_thinking(
-                    "Finding relevant information"
-                )
-
-                if step:
-                    yield step
-
-                deduped_sources = (
-                    _deduplicate_sources(
-                        all_sources
-                    )
-                )
-
-                if deduped_sources:
-
-                    yield {
-                        "type": "sources",
-                        "sources": deduped_sources,
-                    }
-
-            logger.info(
-                "KB SEARCH ATTEMPTS: count=%s "
-                "conversation_id=%s",
-                kb_search_count,
-                conversation_id,
-            )
-
-            # ------------------------------------------------
-            # IMPORTANT:
-            #
-            # Do NOT add a separate "second tool-call round"
-            # here.
-            #
-            # The while True loop automatically sends the
-            # retrieved tool result back to the LLM.
-            #
-            # Therefore the model can naturally do:
-            #
-            # search_knowledge_base
-            #       ->
-            # analyze_document_image
-            #       ->
-            # final answer
-            #
-            # when required.
-            # ------------------------------------------------
+                yield {
+                    "type": "answer",
+                    "content": chunk.content,
+                }
 
     except HTTPException:
 
@@ -1798,175 +1624,9 @@ def generate_answer_stream(
             str(exc),
         )
 
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=(
-                "Unable to generate streaming "
-                "response from LLM"
-            ),
+        raise RuntimeError(
+            f"Unable to generate streaming response: {exc}"
         ) from exc
-
-
-# ============================================================
-# GENERATE FOLLOW-UP SUGGESTIONS
-# ============================================================
-
-
-def generate_suggestions(
-    question: str,
-    answer: str,
-    chat_history: Optional[list[dict]] = None,
-) -> list[str]:
-
-    """
-    Generate exactly three concise follow-up questions.
-
-    Suggestion generation is intentionally independent of the
-    existing RAG/tool/reasoning answer-generation flow.
-
-    If suggestion generation fails, return an empty list so that
-    the main chat response is never affected.
-    """
-
-    try:
-
-        if not question or not question.strip():
-            return []
-
-        if not answer or not answer.strip():
-            return []
-
-        suggestion_prompt = (
-            ChatPromptTemplate.from_messages(
-                [
-                    (
-                        "system",
-                        """
-Based on the user's current question and the assistant's
-final answer, generate exactly 3 useful follow-up questions
-that the user could ask next.
-
-Rules:
-- Return exactly 3 questions.
-- Each question must be complete, concise, and natural.
-- Questions must be relevant to the assistant's answer.
-- Questions should help the user explore the topic further.
-- Do not repeat the user's current question.
-- Do not provide answers or explanations.
-- Do not use numbering, bullet points, or markdown.
-""",
-                    ),
-                    (
-                        "human",
-                        """
-Current User Question:
-
-{question}
-
-Assistant Answer:
-
-{answer}
-""",
-                    ),
-                ]
-            )
-        )
-
-        messages = (
-            suggestion_prompt.format_messages(
-                question=question.strip(),
-                answer=answer.strip(),
-            )
-        )
-
-        structured_llm = (
-            llm.with_structured_output(
-                SuggestionsResponse
-            )
-        )
-
-        response = structured_llm.invoke(
-            messages
-        )
-
-        suggestions = getattr(
-            response,
-            "suggestions",
-            None,
-        )
-
-        if not isinstance(
-            suggestions,
-            list,
-        ):
-
-            logger.warning(
-                "SUGGESTION GENERATION returned "
-                "an invalid suggestions field"
-            )
-
-            return []
-
-        cleaned_suggestions = []
-
-        for suggestion in suggestions:
-
-            if not isinstance(
-                suggestion,
-                str,
-            ):
-                continue
-
-            suggestion = suggestion.strip()
-
-            if not suggestion:
-                continue
-
-            if suggestion in cleaned_suggestions:
-                continue
-
-            cleaned_suggestions.append(
-                suggestion
-            )
-
-            if (
-                len(cleaned_suggestions)
-                == 3
-            ):
-                break
-
-        if (
-            len(cleaned_suggestions)
-            != 3
-        ):
-
-            logger.warning(
-                "SUGGESTION GENERATION expected "
-                "3 suggestions, got %s",
-                len(cleaned_suggestions),
-            )
-
-            return []
-
-        logger.info(
-            "SUGGESTIONS GENERATED: count=%s",
-            len(cleaned_suggestions),
-        )
-
-        return cleaned_suggestions
-
-    except Exception as exc:
-
-        # Suggestions are optional.
-        # Never let suggestion generation break
-        # the main RAG answer.
-
-        logger.exception(
-            "SUGGESTION GENERATION ERROR: error=%s",
-            str(exc),
-        )
-
-        return []
 
 
 # ============================================================
@@ -1980,12 +1640,11 @@ def generate_title(
 
     try:
 
-        title_prompt = (
-            ChatPromptTemplate.from_messages(
-                [
-                    (
-                        "system",
-                        """
+        title_prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    """
 Generate a short, clear title
 (3-6 words) for a conversation
 that starts with the given user message.
@@ -1995,19 +1654,16 @@ Rules:
 - Do not add punctuation at the end.
 - Return only the title.
 """,
-                    ),
-                    (
-                        "human",
-                        "{question}",
-                    ),
-                ]
-            )
+                ),
+                (
+                    "human",
+                    "{question}",
+                ),
+            ]
         )
 
-        messages = (
-            title_prompt.format_messages(
-                question=question
-            )
+        messages = title_prompt.format_messages(
+            question=question
         )
 
         response = llm.invoke(
@@ -2030,3 +1686,145 @@ Rules:
         )
 
         return question[:50]
+
+
+# ============================================================
+# GENERATE FOLLOW-UP SUGGESTIONS
+#
+# Called by rag_service.query_documents_stream() AFTER the
+# "done" event has already been sent, as a non-critical
+# enhancement. Uses the Main LLM (not the reasoning model) to
+# propose a small number of short, natural follow-up questions
+# the user might want to ask next, based on the question just
+# asked and the answer just given (plus recent chat history for
+# context).
+#
+# This intentionally mirrors generate_title()'s structure: a
+# small, single-purpose ChatPromptTemplate + llm.invoke() call,
+# wrapped in a try/except that swallows all errors and returns
+# an empty list on failure, so a broken/slow suggestions call
+# can never affect the already-completed answer.
+# ============================================================
+
+
+SUGGESTIONS_MAX_COUNT = int(
+    os.getenv(
+        "SUGGESTIONS_MAX_COUNT",
+        "3",
+    )
+)
+
+
+def generate_suggestions(
+    question: str,
+    answer: str,
+    chat_history: Optional[list[dict]] = None,
+) -> list[str]:
+
+    """
+    Returns a short list of follow-up-question strings the user
+    might want to ask next, based on the just-completed Q&A turn.
+    Returns an empty list if generation fails or no good
+    suggestions can be produced — callers should treat an empty
+    list as "no suggestions" rather than an error.
+    """
+
+    try:
+
+        chat_history = chat_history or []
+
+        recent_history = chat_history[-6:]
+
+        history_text = "\n".join(
+            f"{message.get('role', '')}: "
+            f"{message.get('content', '')}"
+            for message in recent_history
+        )
+
+        if not history_text:
+
+            history_text = (
+                "No previous conversation history."
+            )
+
+        suggestions_prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    f"""
+You suggest short follow-up questions a user might naturally
+want to ask next in a chat conversation, based on the question
+they just asked and the answer they just received.
+
+Rules:
+- Suggest at most {SUGGESTIONS_MAX_COUNT} follow-up questions.
+- Each suggestion must be a short, natural question the USER
+  would ask (not a statement, not an instruction to the AI).
+- Suggestions must be directly relevant to the question/answer
+  above — do not suggest generic or unrelated questions.
+- Do not repeat the question that was just asked.
+- Do not number the suggestions.
+- Do not use quotes or bullet points.
+- Return exactly one suggestion per line, and nothing else —
+  no preamble, no explanation.
+- If no good follow-up questions make sense (e.g. the answer
+  already fully resolves the topic, or the turn was just
+  small talk), return nothing at all.
+""",
+                ),
+                (
+                    "human",
+                    """Recent Conversation History:
+
+{history}
+
+Question Just Asked:
+
+{question}
+
+Answer Just Given:
+
+{answer}""",
+                ),
+            ]
+        )
+
+        messages = suggestions_prompt.format_messages(
+            history=history_text,
+            question=question,
+            answer=answer,
+        )
+
+        response = llm.invoke(
+            messages
+        )
+
+        raw_text = (response.content or "").strip()
+
+        if not raw_text:
+            return []
+
+        suggestions = []
+
+        for line in raw_text.splitlines():
+
+            cleaned = line.strip(" \t-*•\"'")
+
+            if not cleaned:
+                continue
+
+            suggestions.append(cleaned)
+
+            if len(suggestions) >= SUGGESTIONS_MAX_COUNT:
+                break
+
+        return suggestions
+
+    except Exception as exc:
+
+        logger.exception(
+            "SUGGESTIONS GENERATION ERROR: error=%s",
+            str(exc),
+        )
+
+        return []
