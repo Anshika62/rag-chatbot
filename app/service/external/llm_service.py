@@ -77,8 +77,10 @@ REASONING_MODEL_NAME = os.getenv(
     "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
 )
 
-CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
-CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
+
+CLOUDFLARE_ACCOUNT_ID = (os.getenv("CLOUDFLARE_ACCOUNT_ID") or "").strip()
+CLOUDFLARE_API_TOKEN = (os.getenv("CLOUDFLARE_API_TOKEN") or "").strip()
 
 CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4/accounts"
 
@@ -86,6 +88,7 @@ CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4/accounts"
 llm = ChatGroq(
     model=LLM_MODEL_NAME,
     temperature=0.2,
+    api_key=GROQ_API_KEY,
 )
 
 
