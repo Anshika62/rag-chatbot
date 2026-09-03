@@ -93,7 +93,8 @@ def upload_document(
     file: UploadFile = File(...),
     parent_id: Optional[str] = Form(None),
     conversation_id: Optional[str] = Form(None),
-    is_new_conv: bool = Form(False),
+    is_conversation_new: bool = Form(False),
+    is_chat: bool = Form(False),
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -143,7 +144,7 @@ def upload_document(
     # CREATE NEW CONVERSATION IF REQUESTED
     # --------------------------------------------------------
 
-    if is_new_conv:
+    if is_conversation_new:
 
         conversation = create_conversation(
             db=db,
@@ -170,12 +171,12 @@ def upload_document(
         "file=%r | "
         "parent_id=%r | "
         "conversation_id=%r | "
-        "is_new_conv=%r | "
+        "is_conversation_new=%r | "
         "user_id=%r",
         file.filename,
         parent_id,
         conversation_id,
-        is_new_conv,
+        is_conversation_new,
         user.id,
     )
 
