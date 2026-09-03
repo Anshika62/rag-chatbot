@@ -496,37 +496,3 @@ def delete_document_row(
         db.rollback()
         raise
 
-def attach_documents_to_conversation(
-    db: Session,
-    document_ids: list[str],
-    conversation_id: str,
-    user_id: str,
-):
-    """
-    Link previously-uploaded GLOBAL documents (conversation_id IS
-    NULL) to a conversation, once that conversation exists.
-    """
-    if not document_ids:
-        return []
-
-    try:
-        docs = (
-            db.query(Document)
-            .filter(
-                Document.id.in_(document_ids),
-                Document.user_id == str(user_id),
-                Document.conversation_id.is_(None),
-            )
-            .all()
-        )
-
-        for doc in docs:
-            doc.conversation_id = str(conversation_id)
-
-        db.commit()
-
-        return docs
-
-    except SQLAlchemyError:
-        db.rollback()
-        raise

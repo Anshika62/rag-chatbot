@@ -96,24 +96,6 @@ def send_message(
 
         conversation_id = str(conversation.id)
 
-        # --------------------------------------------------------
-    # Link any documents uploaded before this conversation
-    # existed (e.g. attached in a brand-new chat) to it now
-    # --------------------------------------------------------
-
-    if request.attachment_document_ids:
-
-        from app.repository.document_repo import (
-            attach_documents_to_conversation,
-        )
-
-        attach_documents_to_conversation(
-            db=db,
-            document_ids=request.attachment_document_ids,
-            conversation_id=conversation_id,
-            user_id=str(user.id),
-        )
-
     # --------------------------------------------------------
     # Debug request scope
     # --------------------------------------------------------
