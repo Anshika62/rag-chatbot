@@ -119,6 +119,21 @@ def upload_document(
     conversation-scoped documents cannot be placed inside a
     global folder.
 
+    is_chat:
+        True when this upload originates from WITHIN an existing
+        chat/conversation window (as opposed to the global
+        document library). This is a HARD SCOPE GUARD, not just a
+        UI hint: a chat-context upload must always resolve to a
+        conversation-scoped document, never to a global one. If
+        it were allowed to silently fall through to
+        conversation_id=None, that document would become globally
+        accessible and its content would leak into (and be
+        answerable from) every other conversation — exactly the
+        bug this guard prevents. It's only skipped when
+        is_conversation_new=True, since in that case a fresh
+        conversation_id is about to be created and attached below
+        anyway.
+
     SSE events emitted by the service:
 
         uploading
@@ -139,6 +154,38 @@ def upload_document(
 
     if conversation_id is not None:
         conversation_id = conversation_id.strip() or None
+
+    # --------------------------------------------------------
+    # GUARD: chat-context uploads must never silently become
+    # global documents.
+    #
+    # If this upload is coming from within an existing chat
+    # (is_chat=True) and it is NOT creating a brand new
+    # conversation, a conversation_id MUST already be present.
+    # Without this check, a missing/dropped conversation_id from
+    # the frontend would silently fall through to scope rule #3
+    # (global document) instead of failing loudly — which is
+    # exactly how a conversation-specific document was ending up
+    # answerable from every other conversation.
+    # --------------------------------------------------------
+
+    if is_chat and not is_conversation_new and not conversation_id:
+
+        logger.warning(
+            "DOCUMENT UPLOAD REJECTED | "
+            "is_chat=True but no conversation_id provided | "
+            "file=%r | user_id=%r",
+            file.filename,
+            user.id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "conversation_id is required when uploading "
+                "a document from an existing chat"
+            ),
+        )
 
     # --------------------------------------------------------
     # CREATE NEW CONVERSATION IF REQUESTED
@@ -172,11 +219,13 @@ def upload_document(
         "parent_id=%r | "
         "conversation_id=%r | "
         "is_conversation_new=%r | "
+        "is_chat=%r | "
         "user_id=%r",
         file.filename,
         parent_id,
         conversation_id,
         is_conversation_new,
+        is_chat,
         user.id,
     )
 
@@ -486,4 +535,4 @@ def get_document_file(
             or "application/octet-stream"
         ),
         filename=document.file_name,
-    )
+    ) 
