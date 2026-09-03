@@ -4,6 +4,10 @@ from app.repository.conversation_repo import (
     get_last_10_messages,
 )
 
+from app.service.tools.places_tool import (
+    search_nearby_places,
+)
+
 from app.service.tools.search_kb import (
     create_search_knowledge_base_tool,
 )
