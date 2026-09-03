@@ -320,7 +320,10 @@ You have access to:
    document/PDF, identified by document_id
 5. Current date and time tool
 6. Weather tool
-7. Image analysis tool (analyze_image) — only present when the
+7. Get user location tool (get_location) — for requesting the
+   user's OWN current location when it is required and not
+   already known
+8. Image analysis tool (analyze_image) — only present when the
    user has attached an image directly to their CURRENT message
 
 Rules:
@@ -413,6 +416,20 @@ Rules:
 
 - Never invent current weather information. Always use
   get_weather for current weather questions.
+
+- Use get_location ONLY when the user's own current/live
+  location is required to answer (e.g. "near me", "closest to
+  me", "here") and it has not already been provided in the
+  current question or the conversation history.
+
+- Do NOT use get_location when the user names a specific place
+  (city, address, landmark) — use get_weather or
+  search_knowledge_base as appropriate instead.
+
+- Never guess, assume, or invent the user's location. If
+  get_location has been called, wait for the user to actually
+  provide it in a later message rather than answering as if a
+  location is already known.
 
 - When search_knowledge_base or analyze_document_image returns an
   image (a result whose content_type starts with "image/", or a
@@ -597,6 +614,8 @@ def _execute_tool_calls(
 
     collected_images = []
 
+    location_request = None
+
     for tool_call in tool_calls:
 
         tool_name = tool_call["name"]
@@ -752,6 +771,24 @@ def _execute_tool_calls(
                 }
             )
 
+        # ====================================================
+        # DETECT LOCATION REQUEST
+        #
+        # get_location never returns real coordinates — it
+        # returns this marker dict to signal that the frontend
+        # should be told (via a dedicated SSE event) to show a
+        # location-selection UI. See location_tool.py.
+        # ====================================================
+
+        elif (
+            tool_name == "get_location"
+            and isinstance(tool_result, dict)
+            and tool_result.get("action")
+            == "request_location"
+        ):
+
+            location_request = tool_result
+
         tool_messages.append(
             {
                 "role": "tool",
@@ -763,6 +800,7 @@ def _execute_tool_calls(
     return (
         tool_messages,
         collected_images,
+        location_request,
     )
 
 
@@ -1174,7 +1212,7 @@ def generate_answer(
             response
         ]
 
-        extra_messages, collected_images = (
+        extra_messages, collected_images, _location_request = (
             _execute_tool_calls(
                 tools=tools,
                 tool_calls=response.tool_calls,
@@ -1520,7 +1558,7 @@ def generate_answer_stream(
         # EXECUTE TOOLS
         # ====================================================
 
-        extra_messages, collected_images = (
+        extra_messages, collected_images, location_request = (
             _execute_tool_calls(
                 tools=tools,
                 tool_calls=tool_calls,
@@ -1538,6 +1576,35 @@ def generate_answer_stream(
             images_output.extend(
                 collected_images
             )
+
+        # ====================================================
+        # LOCATION REQUESTED
+        #
+        # get_location was called. Do NOT let the LLM synthesize
+        # a final answer here — it has no real location and
+        # would be forced to guess/hallucinate one. Short-circuit
+        # with a single "location_request" piece instead; the
+        # streaming caller (rag_service.py) turns this into a
+        # dedicated SSE event that tells the frontend to show the
+        # location picker.
+        # ====================================================
+
+        if location_request is not None:
+
+            logger.info(
+                "LOCATION REQUESTED: conversation_id=%s",
+                conversation_id,
+            )
+
+            yield {
+                "type": "location_request",
+                "content": (
+                    "I need your location to help with that. "
+                    "Please share it using the location picker."
+                ),
+            }
+
+            return
 
         # ====================================================
         # GENERATE FINAL RESPONSE
