@@ -262,6 +262,10 @@ def query_documents_stream(
                     "delta": piece_content,
                     "text_content": full_answer,
                     "images": [],
+                    "methods": piece.get(
+                        "methods",
+                        ["current_location", "search", "map"],
+                    ),
                 }
 
                 continue

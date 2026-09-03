@@ -9,7 +9,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-
+from app.schemas.location_schema import LocationSubmission
 from app.core.database import get_db
 from app.core.response import success_response
 from app.core.dependency import (
@@ -28,6 +28,15 @@ from app.repository.conversation_repo import (
 from app.schemas.conversation_schema import (
     ConversationTitleUpdate,
 )
+
+from app.service.tools.location_tool import (
+    get_location,
+)
+
+from app.service.tools.places_tool import (
+    search_nearby_places,
+)
+
 
 from app.schemas.query_schema import QueryRequest
 

@@ -326,9 +326,11 @@ You have access to:
 7. Get user location tool (get_location) — for requesting the
    user's OWN current location when it is required and not
    already known
-8. Image analysis tool (analyze_image) — only present when the
+8. Search nearby places tool (search_nearby_places) — for
+   places/points-of-interest search once real coordinates are
+   known
+9. Image analysis tool (analyze_image) — only present when the
    user has attached an image directly to their CURRENT message
-
 Rules:
 
 - Answer normal conversational questions directly.
@@ -1605,6 +1607,11 @@ def generate_answer_stream(
                     "I need your location to help with that. "
                     "Please share it using the location picker."
                 ),
+                "methods": location_request.get(
+                    "methods",
+                    ["current_location", "search", "map"],
+                ),
+            
             }
 
             return

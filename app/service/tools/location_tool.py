@@ -35,26 +35,11 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 
+SUPPORTED_LOCATION_METHODS = ["current_location", "search", "map"]
+
 @tool
 def get_location() -> dict:
-    """
-    Request the user's current location.
-
-    Call this ONLY when answering the current question actually
-    requires knowing where the user is right now (for example:
-    "restaurants near me", "what's the weather here", "nearest
-    branch to my location") AND the location has not already been
-    given in the current question or the conversation history.
-
-    Do NOT call this if the user already named a place (use
-    get_weather or search_knowledge_base as appropriate instead).
-
-    This tool does not return real coordinates. It triggers a
-    location-selection UI on the user's device. The actual
-    latitude, longitude, and optionally address will arrive later
-    as a new message from the user — do not guess or invent
-    coordinates in the meantime.
-    """
+    """..."""  # docstring same rehne do
 
     logger.info(
         "GET_LOCATION TOOL CALLED: requesting user location "
@@ -70,4 +55,5 @@ def get_location() -> dict:
             "to provide their actual location in a follow-up "
             "message."
         ),
+        "methods": SUPPORTED_LOCATION_METHODS,
     }
