@@ -238,6 +238,34 @@ def query_documents_stream(
 
                 continue
 
+            # ================================================
+            # LOCATION REQUEST
+            #
+            # get_location was called by the agent. This is not
+            # normal answer text streaming — it's a one-shot
+            # signal telling the frontend to show a location-
+            # selection UI. Still accumulated into full_answer
+            # so the usual persist/"done" flow below saves it as
+            # the assistant's message, same as any other turn.
+            # ================================================
+
+            if piece_type == "location_request":
+
+                full_answer += piece_content
+
+                yield {
+                    "event": "location_request",
+                    "success": True,
+                    "error_code": None,
+                    "conversation_id": conversation_id,
+                    "message_id": user_message.id,
+                    "delta": piece_content,
+                    "text_content": full_answer,
+                    "images": [],
+                }
+
+                continue
+
             full_answer += piece_content
 
             yield {

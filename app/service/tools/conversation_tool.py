@@ -21,6 +21,10 @@ from app.service.tools.image_tool import (
     create_document_image_analysis_tool,
 )
 
+from app.service.tools.location_tool import (
+    get_location,
+)
+
 
 # ============================================================
 # CREATE CONVERSATION TOOLS
@@ -67,7 +71,12 @@ def create_conversation_tools(
     5. get_weather
        -> Current weather information.
 
-    6. analyze_image (only when image_paths is provided)
+    6. get_location
+       -> Requests the user's current location by triggering a
+          location-selection UI on the frontend. Does not return
+          real coordinates itself (see location_tool.py).
+
+    7. analyze_image (only when image_paths is provided)
        -> Vision analysis of image(s) attached directly to the
           CURRENT chat message.
     """
@@ -160,6 +169,7 @@ def create_conversation_tools(
         analyze_document_image,
         get_current_datetime,
         get_weather,
+        get_location,
     ]
 
     # ========================================================
