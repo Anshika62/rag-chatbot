@@ -58,10 +58,30 @@ def send_message(
 
     # --------------------------------------------------------
     # Create new conversation when frontend sends
-    # is_new_conv=True
+    # is_new_conv=True.
+    #
+    # DEFENSIVE FALLBACK:
+    # Some frontend call sites omit is_new_conv entirely (it
+    # then defaults to False via Pydantic) while ALSO omitting
+    # conversation_id. That combination is indistinguishable
+    # from "start a new conversation" — there is no existing
+    # conversation to validate against. Previously this fell
+    # through to the "existing conversation" branch below and
+    # hard-failed with 400 "conversation_id is required", even
+    # though the user's intent was clearly to start a fresh
+    # chat. Treating "conversation_id is missing" the same as
+    # "is_new_conv=True" removes that failure mode without
+    # weakening the explicit-True case at all — it only changes
+    # behavior for requests that would otherwise have been a
+    # guaranteed 400.
     # --------------------------------------------------------
 
-    if request.is_new_conv:
+    starting_new_conversation = (
+        request.is_new_conv
+        or conversation_id is None
+    )
+
+    if starting_new_conversation:
 
         title = generate_title(
             request.question,
@@ -80,15 +100,6 @@ def send_message(
     # --------------------------------------------------------
 
     else:
-
-        if conversation_id is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    "conversation_id is required "
-                    "for an existing conversation"
-                ),
-            )
 
         from app.repository.conversation_repo import get_conversation
 
@@ -126,11 +137,12 @@ def send_message(
         "question=%s | "
         "conversation_id=%s | "
         "document_id=%s | "
-        "is_new_conv=%s",
+        "is_new_conv=%s (effective=%s)",
         request.question,
         conversation_id,
         request.document_id,
         request.is_new_conv,
+        starting_new_conversation,
     )
 
     # --------------------------------------------------------
