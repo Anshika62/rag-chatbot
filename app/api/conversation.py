@@ -57,10 +57,11 @@ def send_message(
     conversation_id = request.conversation_id
 
     # --------------------------------------------------------
-    # Create conversation if conversation_id is not provided
+    # Create new conversation when frontend sends
+    # is_new_conv=True
     # --------------------------------------------------------
 
-    if conversation_id is None:
+    if request.is_new_conv:
 
         title = generate_title(
             request.question,
@@ -79,6 +80,15 @@ def send_message(
     # --------------------------------------------------------
 
     else:
+
+        if conversation_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "conversation_id is required "
+                    "for an existing conversation"
+                ),
+            )
 
         from app.repository.conversation_repo import get_conversation
 
@@ -100,9 +110,6 @@ def send_message(
     # Debug request scope
     # --------------------------------------------------------
     #
-    # This confirms exactly which document_id is coming
-    # from the client/Swagger request.
-    #
     # document_id=None means:
     #
     #     Global documents
@@ -118,10 +125,12 @@ def send_message(
         "CONVERSATION REQUEST | "
         "question=%s | "
         "conversation_id=%s | "
-        "document_id=%s",
+        "document_id=%s | "
+        "is_new_conv=%s",
         request.question,
         conversation_id,
         request.document_id,
+        request.is_new_conv,
     )
 
     # --------------------------------------------------------

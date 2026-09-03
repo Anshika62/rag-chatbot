@@ -26,6 +26,7 @@ from app.core.dependency import (
 from app.models.document import Document
 
 from app.repository import document_repo
+from app.repository.conversation_repo import create_conversation
 
 from app.schemas.document import (
     FolderCreate,
@@ -92,6 +93,7 @@ def upload_document(
     file: UploadFile = File(...),
     parent_id: Optional[str] = Form(None),
     conversation_id: Optional[str] = Form(None),
+    is_new_conv: bool = Form(False),
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -100,13 +102,17 @@ def upload_document(
 
     Scope rules:
 
-    1. conversation_id is NULL
-       -> Global document.
-       -> Accessible from all conversations.
+    1. is_new_conv=True
+       -> Create a new conversation.
+       -> Document is attached to that new conversation.
 
-    2. conversation_id contains a valid conversation ID
+    2. is_new_conv=False + conversation_id provided
        -> Conversation-scoped document.
        -> Accessible only from that conversation.
+
+    3. is_new_conv=False + conversation_id=None
+       -> Global document.
+       -> Accessible from all conversations.
 
     parent_id is independent from conversation scope, except that
     conversation-scoped documents cannot be placed inside a
@@ -134,6 +140,28 @@ def upload_document(
         conversation_id = conversation_id.strip() or None
 
     # --------------------------------------------------------
+    # CREATE NEW CONVERSATION IF REQUESTED
+    # --------------------------------------------------------
+
+    if is_new_conv:
+
+        conversation = create_conversation(
+            db=db,
+            user_id=user.id,
+            title=file.filename or "New Conversation",
+        )
+
+        conversation_id = str(conversation.id)
+
+        logger.info(
+            "NEW CONVERSATION CREATED FOR DOCUMENT UPLOAD | "
+            "conversation_id=%s | file=%r | user_id=%r",
+            conversation_id,
+            file.filename,
+            user.id,
+        )
+
+    # --------------------------------------------------------
     # DEBUG REQUEST
     # --------------------------------------------------------
 
@@ -142,10 +170,12 @@ def upload_document(
         "file=%r | "
         "parent_id=%r | "
         "conversation_id=%r | "
+        "is_new_conv=%r | "
         "user_id=%r",
         file.filename,
         parent_id,
         conversation_id,
+        is_new_conv,
         user.id,
     )
 
