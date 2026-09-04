@@ -142,17 +142,19 @@ def send_message(
     # --------------------------------------------------------
 
     logger.info(
-        "CONVERSATION REQUEST | "
-        "question=%s | "
-        "conversation_id=%s | "
-        "document_id=%s | "
-        "is_new_conv=%s (effective=%s)",
-        request.question,
-        conversation_id,
-        request.document_id,
-        request.is_new_conv,
-        starting_new_conversation,
-    )
+       "CONVERSATION REQUEST | "
+       "question=%s | "
+       "conversation_id=%s | "
+       "document_id=%s | "
+       "is_new_conv=%s (effective=%s) | "
+       "latitude=%s | longitude=%s",
+       request.question,
+       conversation_id,
+       request.document_id,
+       request.is_new_conv,
+       starting_new_conversation,
+       request.latitude,
+       request.longitude,)
 
     # --------------------------------------------------------
     # SSE event generator
@@ -168,6 +170,9 @@ def send_message(
                 user_id=str(user.id),
                 conversation_id=conversation_id,
                 document_id=request.document_id,
+                latitude=request.latitude,
+                longitude=request.longitude,
+                address=request.address,
             ):
 
                 event_name = event_data.get(
