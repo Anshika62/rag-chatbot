@@ -28,6 +28,9 @@ from app.service.tools.image_tool import (
 from app.service.tools.location_tool import (
     get_location,
 )
+from app.service.tools.tavily_tool import (
+    tavily_web_search,
+)
 
 
 # ============================================================
@@ -174,6 +177,7 @@ def create_conversation_tools(
         get_current_datetime,
         get_weather,
         get_location,
+        tavily_web_search,
     ]
 
     # ========================================================

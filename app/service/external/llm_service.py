@@ -331,6 +331,9 @@ You have access to:
    known
 9. Image analysis tool (analyze_image) — only present when the
    user has attached an image directly to their CURRENT message
+10. Web search tool (tavily_web_search) — for searching the live/public
+    web for information that is not reliably available from the
+    conversation or uploaded knowledge base
 Rules:
 
 - Answer normal conversational questions directly.
@@ -422,6 +425,32 @@ Rules:
 - Never invent current weather information. Always use
   get_weather for current weather questions.
 
+- Use tavily_web_search when the user asks for information that
+  requires live/current web information, recent public information,
+  web research, online sources, current events, newly published
+  information, or information that is not available in the
+  conversation or uploaded knowledge base.
+
+- tavily_web_search is a GENERAL web-search tool. Do not restrict it
+  to location or places. It can be used for current events, recent
+  information, public websites, articles, documentation, research,
+  comparisons, and other questions that benefit from web search.
+
+- Do not use tavily_web_search when the answer is clearly available
+  from the uploaded knowledge base or normal conversation context,
+  unless the user also explicitly needs current/external web
+  information.
+
+- Do not invent web-search results, URLs, facts, or source details.
+  Base web-researched claims on the information returned by
+  tavily_web_search.
+
+- When web search results are returned together with knowledge-base
+  results or other tool results, compare and synthesize them
+  carefully. Prefer the source that is most directly relevant to the
+  user's question and do not treat unrelated retrieved results as
+  authoritative.
+
 - Use get_location ONLY when the user's own current/live
   location is required to answer (e.g. "near me", "closest to
   me", "here") and it has not already been provided in the
@@ -453,6 +482,17 @@ Rules:
   search_knowledge_base or analyze_document_image earlier in this
   same turn. Never invent, guess, or reuse a document_id/url from
   a previous conversation turn.
+
+- When tavily_web_search returns web results, use those results as
+  the source of truth for the web-researched portion of the answer.
+  Do not invent URLs, publication details, source names, or facts
+  that are not supported by the returned results.
+
+- If both web-search results and uploaded-document results are
+  available, keep the two sources distinct and synthesize them
+  according to the user's question. Do not replace uploaded
+  document facts with web information unless the question requires
+  current/external information.
 
 - If more than one image is relevant to different parts of your
   answer, place each image inline right next to the text it
@@ -1132,6 +1172,9 @@ def _build_reasoning_messages(
         "- Do not mention that you are a separate reasoning "
         "step, that you used tools, or that some results were "
         "discarded.\n"
+        "- If web-search results are present, synthesize only the "
+        "relevant information returned by the web-search tool. Do "
+        "not invent or assume unsupported web facts or URLs.\n"
         "- If any tool result above includes a retrieved image "
         "(a result whose content_type starts with \"image/\", or "
         "an analyze_document_image result), and that image helps "
