@@ -27,11 +27,11 @@ logger = logging.getLogger(__name__)
 #
 # HOW IT WORKS:
 #   1. `query` (a free-text hint like "cafes", "famous spots",
-#      "pharmacy") is mapped to one or more OSM tag filters via a
-#      small keyword table below. If nothing matches, it defaults
-#      to "tourist attraction"-style tags (tourism=attraction,
-#      historic=*, museum, viewpoint) — this covers "famous spots
-#      near me" style queries.
+#      "pharmacy", "petrol pump") is mapped to one or more OSM
+#      tag filters via a small keyword table below. If nothing
+#      matches, it defaults to "tourist attraction"-style tags
+#      (tourism=attraction, historic=*, museum, viewpoint) — this
+#      covers "famous spots near me" style queries.
 #   2. Overpass is queried for named nodes/ways of that category
 #      within `radius_meters` of the given coordinates.
 #   3. Results are sorted by straight-line (haversine) distance
@@ -92,6 +92,17 @@ CATEGORY_FILTERS: dict[str, list[str]] = {
     "park": ['["leisure"="park"]'],
     "mall": ['["shop"="mall"]'],
     "temple": ['["amenity"="place_of_worship"]'],
+    # Petrol pump / gas station / fuel — OSM tags this as
+    # amenity=fuel regardless of fuel type (petrol, diesel, CNG,
+    # EV charging is separate: amenity=charging_station).
+    "fuel": ['["amenity"="fuel"]'],
+    # Railway/bus stations — was previously missing entirely,
+    # so "nearby stations" silently fell back to "attraction".
+    "station": [
+        '["railway"="station"]',
+        '["railway"="halt"]',
+        '["amenity"="bus_station"]',
+    ],
 }
 
 DEFAULT_CATEGORY = "attraction"
@@ -127,6 +138,20 @@ KEYWORD_TO_CATEGORY: dict[str, str] = {
     "temple": "temple",
     "mandir": "temple",
     "worship": "temple",
+    # fuel / petrol pump keywords
+    "petrol pump": "fuel",
+    "petrol": "fuel",
+    "fuel": "fuel",
+    "gas station": "fuel",
+    "diesel": "fuel",
+    "cng": "fuel",
+    "pump": "fuel",
+    # station keywords
+    "station": "station",
+    "railway": "station",
+    "train": "station",
+    "bus stand": "station",
+    "bus station": "station",
 }
 
 
@@ -188,8 +213,8 @@ def search_nearby_places(
     """
     Search for named places (tourist attractions, cafes,
     restaurants, pharmacies, hotels, banks, parks, malls, temples,
-    etc.) near a given latitude/longitude, using free OpenStreetMap
-    data.
+    petrol pumps/fuel stations, railway/bus stations, etc.) near a
+    given latitude/longitude, using free OpenStreetMap data.
 
     Call this ONLY after a real latitude/longitude is known —
     either because the user just provided their current location
@@ -211,9 +236,10 @@ def search_nearby_places(
         latitude: Latitude of the search center, decimal degrees.
         longitude: Longitude of the search center, decimal degrees.
         query: What to search for, e.g. "cafes", "restaurants",
-            "pharmacy", "famous spots", "tourist attractions".
-            Omit or use a generic phrase for "what's interesting
-            around here" — defaults to tourist attractions.
+            "pharmacy", "petrol pump", "fuel station", "railway
+            station", "famous spots", "tourist attractions". Omit
+            or use a generic phrase for "what's interesting around
+            here" — defaults to tourist attractions.
         radius_meters: Search radius in meters. Omit to use a
             5 km default. Capped at 20 km.
     """

@@ -1,28 +1,20 @@
-from pydantic import BaseModel, Field
+from typing import Optional
+from pydantic import BaseModel
 
 
 class QueryRequest(BaseModel):
     question: str
-    conversation_id: str | None = None
-    document_id: str | None = None
+    conversation_id: Optional[str] = None
     is_new_conv: bool = False
+    document_id: Optional[str] = None
 
-    latitude: float | None = Field(
-        default=None,
-        ge=-90,
-        le=90,
-        description="User's current latitude, if already known.",
-    )
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    address: Optional[str] = None
+    full_address: Optional[str] = None
 
-    longitude: float | None = Field(
-        default=None,
-        ge=-180,
-        le=180,
-        description="User's current longitude, if already known.",
-    )
 
-    address: str | None = Field(
-        default=None,
-        description="Optional human-readable address for the "
-        "given latitude/longitude.",
-    )
+    location: Optional[dict] = None
+    coordinates: Optional[dict] = None
+
+    model_config = {"extra": "ignore"}
