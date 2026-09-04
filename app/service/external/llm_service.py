@@ -2,10 +2,10 @@ import json
 import logging
 import os
 from typing import Generator, Optional
-
+from openai import OpenAI
 from fastapi import HTTPException, status
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_groq import ChatGroq
+from langchain_openrouter import ChatOpenRouter
 import requests
 
 from app.service.tools.conversation_tool import (
@@ -72,6 +72,12 @@ LLM_MODEL_NAME = os.getenv(
 # field per SSE line out) and still emits its chain-of-thought
 # as inline <think>...</think> tags, so _stream_with_thinking_
 # split() below works completely unchanged.
+
+OPENROUTER_API_KEY = (
+    os.getenv("OPENROUTER_API_KEY") or ""
+).strip()
+
+
 REASONING_MODEL_NAME = os.getenv(
     "REASONING_MODEL",
     "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
@@ -85,10 +91,11 @@ CLOUDFLARE_API_TOKEN = (os.getenv("CLOUDFLARE_API_TOKEN") or "").strip()
 CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4/accounts"
 
 
-llm = ChatGroq(
+llm = ChatOpenRouter(
     model=LLM_MODEL_NAME,
     temperature=0.2,
-    api_key=GROQ_API_KEY,
+    api_key=OPENROUTER_API_KEY,
+    max_retries=2,
 )
 
 
@@ -334,6 +341,9 @@ You have access to:
 10. Web search tool (tavily_web_search) — for searching the live/public
     web for information that is not reliably available from the
     conversation or uploaded knowledge base
+11. Find location on map tool (find_location_on_map) — for
+    locating ONE specific named place so it can be shown as a
+    pin on a map
 Rules:
 
 - Answer normal conversational questions directly.
@@ -465,6 +475,27 @@ Rules:
   provide it in a later message rather than answering as if a
   location is already known.
 
+- Always check the "User Location" section below (in the human
+  message) before deciding whether to call get_location. If it
+  states that the user's location is already known, do NOT call
+  get_location — use those exact coordinates directly when
+  calling search_nearby_places, get_distance_bw_2_locations, or
+  compare_travel_modes.
+
+- Use find_location_on_map when the user names ONE specific
+  place (not a category) and wants to see it located on a map —
+  e.g. "show me Vijay Nagar on the map", "where is Bargi Dam".
+  Do not use this for the user's own current location (use
+  get_location instead), and do not use it for finding multiple
+  places of a category nearby (use search_nearby_places instead).
+
+- After calling find_location_on_map, do NOT invent or embed any
+  map image URL, static-map link, or third-party maps deep link
+  (Google Maps, Yandex Maps, etc.) in your answer — the frontend
+  renders the actual map separately using the tool's coordinates.
+  Just confirm the place was found in plain text (e.g. "Here's
+  Vijay Nagar, Indore — you can see it on the map above.").
+
 - When search_knowledge_base or analyze_document_image returns an
   image (a result whose content_type starts with "image/", or a
   document_id returned by analyze_document_image), and that image
@@ -501,6 +532,50 @@ Rules:
 
 
 # ============================================================
+# BUILD LOCATION CONTEXT
+#
+# Turns the latitude/longitude/address (if any) that arrived
+# with THIS request into a plain-language line the LLM can read
+# in the human message. This is what lets the agent skip calling
+# get_location on every subsequent turn once the frontend has
+# already sent real coordinates — see SYSTEM_PROMPT rule above.
+# ============================================================
+
+
+def _build_location_context(
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    address: Optional[str] = None,
+) -> str:
+
+    if latitude is not None and longitude is not None:
+
+        location_line = (
+            f"The user's current location is ALREADY KNOWN: "
+            f"latitude={latitude}, longitude={longitude}"
+        )
+
+        if address:
+
+            location_line += f", address='{address}'"
+
+        location_line += (
+            ". Do NOT call get_location — this location is "
+            "already available. Use these exact coordinates "
+            "directly when calling search_nearby_places, "
+            "get_distance_bw_2_locations, or compare_travel_modes."
+        )
+
+        return location_line
+
+    return (
+        "The user's current location is NOT known yet. If the "
+        "current question requires it (e.g. 'near me', "
+        "'closest to me', 'here'), call get_location first."
+    )
+
+
+# ============================================================
 # BUILD LLM MESSAGES
 # ============================================================
 
@@ -509,6 +584,9 @@ def _build_messages(
     question: str,
     chat_history: Optional[list[dict]] = None,
     document_available: bool = False,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    address: Optional[str] = None,
 ):
 
     chat_history = chat_history or []
@@ -546,6 +624,12 @@ def _build_messages(
         "because none is pre-selected."
     )
 
+    location_context = _build_location_context(
+        latitude=latitude,
+        longitude=longitude,
+        address=address,
+    )
+
     prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -562,6 +646,10 @@ Uploaded Document Available:
 
 {document_context}
 
+User Location:
+
+{location_context}
+
 Current User Question:
 
 {question}""",
@@ -572,6 +660,7 @@ Current User Question:
     return prompt.format_messages(
         history=history_text,
         document_context=document_context,
+        location_context=location_context,
         question=question,
     )
 
@@ -653,6 +742,8 @@ def _execute_tool_calls(
     tool_calls: list,
     conversation_id: Optional[str],
     log_prefix: str = "",
+    known_latitude: Optional[float] = None,
+    known_longitude: Optional[float] = None,
 ):
 
     tool_messages = []
@@ -660,6 +751,8 @@ def _execute_tool_calls(
     collected_images = []
 
     location_request = None
+
+    map_location = None
 
     for tool_call in tool_calls:
 
@@ -669,6 +762,48 @@ def _execute_tool_calls(
             "args",
             {},
         )
+
+        # ====================================================
+        # SAFETY NET — LOCATION ALREADY KNOWN
+        #
+        # If the frontend already sent real coordinates for
+        # this turn but the LLM called get_location anyway
+        # (e.g. it ignored the "User Location" context), don't
+        # re-trigger the frontend location picker. Short-circuit
+        # with the already-known coordinates instead, so the
+        # agent can immediately continue with
+        # search_nearby_places / get_distance_bw_2_locations /
+        # compare_travel_modes in its next step.
+        # ====================================================
+
+        if (
+            tool_name == "get_location"
+            and known_latitude is not None
+            and known_longitude is not None
+        ):
+
+            logger.info(
+                "%sLOCATION ALREADY KNOWN, SKIPPING "
+                "get_location: conversation_id=%s",
+                log_prefix,
+                conversation_id,
+            )
+
+            tool_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": (
+                        f"Location already known: "
+                        f"latitude={known_latitude}, "
+                        f"longitude={known_longitude}. Use "
+                        "this directly, do not ask the user "
+                        "again."
+                    ),
+                }
+            )
+
+            continue
 
         selected_tool = _get_tool(
             tools=tools,
@@ -834,6 +969,25 @@ def _execute_tool_calls(
 
             location_request = tool_result
 
+        # ====================================================
+        # DETECT MAP LOCATION
+        #
+        # find_location_on_map returns real coordinates for a
+        # single named place, marked with action="show_map".
+        # Captured here so generate_answer_stream can emit a
+        # dedicated "map_location" piece for the frontend to
+        # render a pin on a map. See geocode_tool.py.
+        # ====================================================
+
+        elif (
+            tool_name == "find_location_on_map"
+            and isinstance(tool_result, dict)
+            and tool_result.get("success")
+            and tool_result.get("action") == "show_map"
+        ):
+
+            map_location = tool_result
+
         tool_messages.append(
             {
                 "role": "tool",
@@ -846,6 +1000,7 @@ def _execute_tool_calls(
         tool_messages,
         collected_images,
         location_request,
+        map_location,
     )
 
 
@@ -895,6 +1050,13 @@ def _should_use_reasoning(
     if collected_images:
         return True
 
+    # Distance/travel results need structured interpretation
+    if (
+        "get_distance_bw_2_locations" in tool_names
+        or "compare_travel_modes" in tool_names
+    ):
+        return True
+
     # A single search_knowledge_base call that returned a
     # substantial amount of text (multiple/long chunks) benefits
     # from a reasoning pass to compare and synthesize across them.
@@ -906,6 +1068,7 @@ def _should_use_reasoning(
             if (
                 isinstance(message, dict)
                 and message.get("role") == "tool"
+        
             )
         )
 
@@ -1208,6 +1371,9 @@ def generate_answer(
     images_output: Optional[list] = None,
     document_id: Optional[str] = None,
     image_paths: Optional[list[str]] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    address: Optional[str] = None,
 ):
 
     """
@@ -1218,6 +1384,13 @@ def generate_answer(
     image_paths:
         Local file path(s) of images attached directly to
         THIS message.
+
+    latitude / longitude / address:
+        The user's current location, if it was already sent
+        with this request (e.g. by the frontend location
+        picker). When provided, the LLM is told the location is
+        already known so it never re-triggers get_location for
+        this turn.
     """
 
     try:
@@ -1226,6 +1399,9 @@ def generate_answer(
             question=question,
             chat_history=chat_history,
             document_available=bool(document_id),
+            latitude=latitude,
+            longitude=longitude,
+            address=address,
         )
 
         tools = _create_tools(
@@ -1260,12 +1436,17 @@ def generate_answer(
             response
         ]
 
-        extra_messages, collected_images, _location_request = (
-            _execute_tool_calls(
-                tools=tools,
-                tool_calls=response.tool_calls,
-                conversation_id=conversation_id,
-            )
+        (
+            extra_messages,
+            collected_images,
+            _location_request,
+            _map_location,
+        ) = _execute_tool_calls(
+            tools=tools,
+            tool_calls=response.tool_calls,
+            conversation_id=conversation_id,
+            known_latitude=latitude,
+            known_longitude=longitude,
         )
 
         tool_messages.extend(
@@ -1466,6 +1647,9 @@ def generate_answer_stream(
     images_output: Optional[list] = None,
     document_id: Optional[str] = None,
     image_paths: Optional[list[str]] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    address: Optional[str] = None,
 ) -> Generator[dict, None, None]:
 
     """
@@ -1477,14 +1661,25 @@ def generate_answer_stream(
         Local file path(s) of image(s) attached directly to
         THIS message.
 
+    latitude / longitude / address:
+        The user's current location, if it was already sent
+        with this request (e.g. by the frontend location
+        picker). When provided, the LLM is told the location is
+        already known so it never re-triggers get_location for
+        this turn.
+
     Yields:
-        dicts of the form {"type": "thinking" | "answer",
-        "content": str}. "thinking" pieces are the reasoning
-        model's live chain-of-thought (only ever produced during
-        the REASONING STAGE below) and should be shown to the
-        user as a transient "thinking..." trace, never saved as
-        the final message content. "answer" pieces are the real
+        dicts of the form {"type": "thinking" | "answer" |
+        "location_request" | "map_location", "content": str}.
+        "thinking" pieces are the reasoning model's live
+        chain-of-thought (only ever produced during the
+        REASONING STAGE below) and should be shown to the user
+        as a transient "thinking..." trace, never saved as the
+        final message content. "answer" pieces are the real
         response and should be both streamed and saved.
+        "map_location" pieces carry latitude/longitude/name/
+        address for a single named place found via
+        find_location_on_map, alongside the normal answer text.
     """
 
     try:
@@ -1493,6 +1688,9 @@ def generate_answer_stream(
             question=question,
             chat_history=chat_history,
             document_available=bool(document_id),
+            latitude=latitude,
+            longitude=longitude,
+            address=address,
         )
 
         tools = _create_tools(
@@ -1606,13 +1804,18 @@ def generate_answer_stream(
         # EXECUTE TOOLS
         # ====================================================
 
-        extra_messages, collected_images, location_request = (
-            _execute_tool_calls(
-                tools=tools,
-                tool_calls=tool_calls,
-                conversation_id=conversation_id,
-                log_prefix="STREAM ",
-            )
+        (
+            extra_messages,
+            collected_images,
+            location_request,
+            map_location,
+        ) = _execute_tool_calls(
+            tools=tools,
+            tool_calls=tool_calls,
+            conversation_id=conversation_id,
+            log_prefix="STREAM ",
+            known_latitude=latitude,
+            known_longitude=longitude,
         )
 
         tool_messages.extend(
@@ -1635,6 +1838,11 @@ def generate_answer_stream(
         # streaming caller (rag_service.py) turns this into a
         # dedicated SSE event that tells the frontend to show the
         # location picker.
+        #
+        # Note: if latitude/longitude were already known for
+        # this turn, _execute_tool_calls above short-circuits
+        # get_location itself and location_request stays None,
+        # so this branch is never hit in that case.
         # ====================================================
 
         if location_request is not None:
@@ -1658,6 +1866,37 @@ def generate_answer_stream(
             }
 
             return
+
+        # ====================================================
+        # MAP LOCATION FOUND
+        #
+        # find_location_on_map returned real coordinates for a
+        # single named place. Unlike get_location, this does NOT
+        # short-circuit the answer — the LLM still writes a
+        # normal reply using the tool result (see the "do NOT
+        # invent map links" SYSTEM_PROMPT rule). This piece just
+        # carries the coordinates separately so the frontend can
+        # drop a pin on a map alongside the text answer.
+        # ====================================================
+
+        if map_location is not None:
+
+            logger.info(
+                "MAP LOCATION FOUND: conversation_id=%s",
+                conversation_id,
+            )
+
+            yield {
+                "type": "map_location",
+                "content": (
+                    f"Showing {map_location.get('name')} on "
+                    "the map."
+                ),
+                "latitude": map_location.get("latitude"),
+                "longitude": map_location.get("longitude"),
+                "name": map_location.get("name"),
+                "address": map_location.get("address"),
+            }
 
         # ====================================================
         # GENERATE FINAL RESPONSE

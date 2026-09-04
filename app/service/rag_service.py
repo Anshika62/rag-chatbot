@@ -120,6 +120,9 @@ def query_documents_stream(
     conversation_id: str,
     document_id: str | None = None,
     image_paths: list[str] | None = None,
+    latitude: float | None = None,      # NEW
+    longitude: float | None = None,     # NEW
+    address: str | None = None,         
 ):
     try:
         if not question or not question.strip():
@@ -213,6 +216,10 @@ def query_documents_stream(
             images_output=images_output,
             document_id=document_id,
             image_paths=image_paths,
+            latitude=latitude,        
+            longitude=longitude,      
+            address=address,          
+
         ):
             if not piece:
                 continue
@@ -270,6 +277,37 @@ def query_documents_stream(
 
                 continue
 
+            # ================================================
+            # MAP LOCATION
+            #
+            # find_location_on_map found coordinates for a
+            # single named place. Sent as its own dedicated
+            # SSE event carrying lat/long/name so the frontend
+            # can render a map pin. Not accumulated into
+            # full_answer — the LLM's own text answer (which
+            # streams separately as normal "delta" events)
+            # already covers the visible chat reply.
+            # ================================================
+
+            if piece_type == "map_location":
+                yield {
+                    "event": "map_location",
+                    "success": True,
+                    "error_code": None,
+                    "conversation_id": conversation_id,
+                    "message_id": user_message.id,
+                    "delta": None,
+                    "text_content": full_answer,
+                    "images": [],
+                    "latitude": piece.get("latitude"),
+                    "longitude": piece.get("longitude"),
+                    "name": piece.get("name"),
+                    "address": piece.get("address"),
+                    
+                }
+
+                continue
+
             full_answer += piece_content
 
             yield {
@@ -282,6 +320,9 @@ def query_documents_stream(
                 "text_content": full_answer,
                 "images": [],
             }
+
+
+            
 
         # ====================================================
         # FINAL ANSWER CLEANUP

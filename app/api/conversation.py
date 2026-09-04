@@ -1,3 +1,4 @@
+
 import json
 import logging
 
@@ -15,6 +16,10 @@ from app.core.response import success_response
 from app.core.dependency import (
     get_current_user,
     get_current_conversation,
+)
+
+from app.service.tools.geocode_tool import (
+    find_location_on_map,
 )
 
 from app.repository.conversation_repo import (
@@ -142,17 +147,19 @@ def send_message(
     # --------------------------------------------------------
 
     logger.info(
-        "CONVERSATION REQUEST | "
-        "question=%s | "
-        "conversation_id=%s | "
-        "document_id=%s | "
-        "is_new_conv=%s (effective=%s)",
-        request.question,
-        conversation_id,
-        request.document_id,
-        request.is_new_conv,
-        starting_new_conversation,
-    )
+       "CONVERSATION REQUEST | "
+       "question=%s | "
+       "conversation_id=%s | "
+       "document_id=%s | "
+       "is_new_conv=%s (effective=%s) | "
+       "latitude=%s | longitude=%s",
+       request.question,
+       conversation_id,
+       request.document_id,
+       request.is_new_conv,
+       starting_new_conversation,
+       request.latitude,
+       request.longitude,)
 
     # --------------------------------------------------------
     # SSE event generator
@@ -168,6 +175,9 @@ def send_message(
                 user_id=str(user.id),
                 conversation_id=conversation_id,
                 document_id=request.document_id,
+                latitude=request.latitude,
+                longitude=request.longitude,
+                address=request.address,
             ):
 
                 event_name = event_data.get(
@@ -350,3 +360,4 @@ def delete_conversation_endpoint(
         data=None,
         status_code=status.HTTP_200_OK,
     )
+
