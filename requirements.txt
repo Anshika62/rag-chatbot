@@ -111,3 +111,4 @@ python-docx
 pytesseract
 python-pptx==1.0.2
 langchain-openrouter
+tavily-python
