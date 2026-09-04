@@ -15,6 +15,9 @@ from app.service.tools.distance_tool import (
 from app.service.tools.search_kb import (
     create_search_knowledge_base_tool,
 )
+from app.service.tools.geocode_tool import (
+    find_location_on_map,
+)
 
 from app.service.tools.datetime_tool import (
     get_current_datetime,
