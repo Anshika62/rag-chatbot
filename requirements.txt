@@ -1,5 +1,4 @@
-﻿langchain-openrouter
-﻿alembic==1.19.1
+alembic==1.19.1
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.14.2
@@ -111,3 +110,4 @@ openpyxl
 python-docx
 pytesseract
 python-pptx==1.0.2
+langchain-openrouter
