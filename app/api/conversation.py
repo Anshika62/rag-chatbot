@@ -1,3 +1,4 @@
+
 import json
 import logging
 
@@ -15,6 +16,10 @@ from app.core.response import success_response
 from app.core.dependency import (
     get_current_user,
     get_current_conversation,
+)
+
+from app.service.tools.geocode_tool import (
+    find_location_on_map,
 )
 
 from app.repository.conversation_repo import (
@@ -355,3 +360,4 @@ def delete_conversation_endpoint(
         data=None,
         status_code=status.HTTP_200_OK,
     )
+

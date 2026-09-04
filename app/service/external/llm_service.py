@@ -2,10 +2,10 @@ import json
 import logging
 import os
 from typing import Generator, Optional
-
+from openai import OpenAI
 from fastapi import HTTPException, status
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_groq import ChatGroq
+from langchain_openrouter import ChatOpenRouter
 import requests
 
 from app.service.tools.conversation_tool import (
@@ -72,6 +72,12 @@ LLM_MODEL_NAME = os.getenv(
 # field per SSE line out) and still emits its chain-of-thought
 # as inline <think>...</think> tags, so _stream_with_thinking_
 # split() below works completely unchanged.
+
+OPENROUTER_API_KEY = (
+    os.getenv("OPENROUTER_API_KEY") or ""
+).strip()
+
+
 REASONING_MODEL_NAME = os.getenv(
     "REASONING_MODEL",
     "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
@@ -85,10 +91,11 @@ CLOUDFLARE_API_TOKEN = (os.getenv("CLOUDFLARE_API_TOKEN") or "").strip()
 CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4/accounts"
 
 
-llm = ChatGroq(
+llm = ChatOpenRouter(
     model=LLM_MODEL_NAME,
     temperature=0.2,
-    api_key=GROQ_API_KEY,
+    api_key=OPENROUTER_API_KEY,
+    max_retries=2,
 )
 
 
@@ -331,6 +338,9 @@ You have access to:
    known
 9. Image analysis tool (analyze_image) — only present when the
    user has attached an image directly to their CURRENT message
+10. Find location on map tool (find_location_on_map) — for
+    locating ONE specific named place so it can be shown as a
+    pin on a map
 Rules:
 
 - Answer normal conversational questions directly.
@@ -442,6 +452,20 @@ Rules:
   get_location — use those exact coordinates directly when
   calling search_nearby_places, get_distance_bw_2_locations, or
   compare_travel_modes.
+
+- Use find_location_on_map when the user names ONE specific
+  place (not a category) and wants to see it located on a map —
+  e.g. "show me Vijay Nagar on the map", "where is Bargi Dam".
+  Do not use this for the user's own current location (use
+  get_location instead), and do not use it for finding multiple
+  places of a category nearby (use search_nearby_places instead).
+
+- After calling find_location_on_map, do NOT invent or embed any
+  map image URL, static-map link, or third-party maps deep link
+  (Google Maps, Yandex Maps, etc.) in your answer — the frontend
+  renders the actual map separately using the tool's coordinates.
+  Just confirm the place was found in plain text (e.g. "Here's
+  Vijay Nagar, Indore — you can see it on the map above.").
 
 - When search_knowledge_base or analyze_document_image returns an
   image (a result whose content_type starts with "image/", or a
@@ -688,6 +712,8 @@ def _execute_tool_calls(
 
     location_request = None
 
+    map_location = None
+
     for tool_call in tool_calls:
 
         tool_name = tool_call["name"]
@@ -903,6 +929,25 @@ def _execute_tool_calls(
 
             location_request = tool_result
 
+        # ====================================================
+        # DETECT MAP LOCATION
+        #
+        # find_location_on_map returns real coordinates for a
+        # single named place, marked with action="show_map".
+        # Captured here so generate_answer_stream can emit a
+        # dedicated "map_location" piece for the frontend to
+        # render a pin on a map. See geocode_tool.py.
+        # ====================================================
+
+        elif (
+            tool_name == "find_location_on_map"
+            and isinstance(tool_result, dict)
+            and tool_result.get("success")
+            and tool_result.get("action") == "show_map"
+        ):
+
+            map_location = tool_result
+
         tool_messages.append(
             {
                 "role": "tool",
@@ -915,6 +960,7 @@ def _execute_tool_calls(
         tool_messages,
         collected_images,
         location_request,
+        map_location,
     )
 
 
@@ -964,6 +1010,13 @@ def _should_use_reasoning(
     if collected_images:
         return True
 
+    # Distance/travel results need structured interpretation
+    if (
+        "get_distance_bw_2_locations" in tool_names
+        or "compare_travel_modes" in tool_names
+    ):
+        return True
+
     # A single search_knowledge_base call that returned a
     # substantial amount of text (multiple/long chunks) benefits
     # from a reasoning pass to compare and synthesize across them.
@@ -975,6 +1028,7 @@ def _should_use_reasoning(
             if (
                 isinstance(message, dict)
                 and message.get("role") == "tool"
+        
             )
         )
 
@@ -1339,14 +1393,17 @@ def generate_answer(
             response
         ]
 
-        extra_messages, collected_images, _location_request = (
-            _execute_tool_calls(
-                tools=tools,
-                tool_calls=response.tool_calls,
-                conversation_id=conversation_id,
-                known_latitude=latitude,
-                known_longitude=longitude,
-            )
+        (
+            extra_messages,
+            collected_images,
+            _location_request,
+            _map_location,
+        ) = _execute_tool_calls(
+            tools=tools,
+            tool_calls=response.tool_calls,
+            conversation_id=conversation_id,
+            known_latitude=latitude,
+            known_longitude=longitude,
         )
 
         tool_messages.extend(
@@ -1569,13 +1626,17 @@ def generate_answer_stream(
         this turn.
 
     Yields:
-        dicts of the form {"type": "thinking" | "answer",
-        "content": str}. "thinking" pieces are the reasoning
-        model's live chain-of-thought (only ever produced during
-        the REASONING STAGE below) and should be shown to the
-        user as a transient "thinking..." trace, never saved as
-        the final message content. "answer" pieces are the real
+        dicts of the form {"type": "thinking" | "answer" |
+        "location_request" | "map_location", "content": str}.
+        "thinking" pieces are the reasoning model's live
+        chain-of-thought (only ever produced during the
+        REASONING STAGE below) and should be shown to the user
+        as a transient "thinking..." trace, never saved as the
+        final message content. "answer" pieces are the real
         response and should be both streamed and saved.
+        "map_location" pieces carry latitude/longitude/name/
+        address for a single named place found via
+        find_location_on_map, alongside the normal answer text.
     """
 
     try:
@@ -1700,15 +1761,18 @@ def generate_answer_stream(
         # EXECUTE TOOLS
         # ====================================================
 
-        extra_messages, collected_images, location_request = (
-            _execute_tool_calls(
-                tools=tools,
-                tool_calls=tool_calls,
-                conversation_id=conversation_id,
-                log_prefix="STREAM ",
-                known_latitude=latitude,
-                known_longitude=longitude,
-            )
+        (
+            extra_messages,
+            collected_images,
+            location_request,
+            map_location,
+        ) = _execute_tool_calls(
+            tools=tools,
+            tool_calls=tool_calls,
+            conversation_id=conversation_id,
+            log_prefix="STREAM ",
+            known_latitude=latitude,
+            known_longitude=longitude,
         )
 
         tool_messages.extend(
@@ -1759,6 +1823,37 @@ def generate_answer_stream(
             }
 
             return
+
+        # ====================================================
+        # MAP LOCATION FOUND
+        #
+        # find_location_on_map returned real coordinates for a
+        # single named place. Unlike get_location, this does NOT
+        # short-circuit the answer — the LLM still writes a
+        # normal reply using the tool result (see the "do NOT
+        # invent map links" SYSTEM_PROMPT rule). This piece just
+        # carries the coordinates separately so the frontend can
+        # drop a pin on a map alongside the text answer.
+        # ====================================================
+
+        if map_location is not None:
+
+            logger.info(
+                "MAP LOCATION FOUND: conversation_id=%s",
+                conversation_id,
+            )
+
+            yield {
+                "type": "map_location",
+                "content": (
+                    f"Showing {map_location.get('name')} on "
+                    "the map."
+                ),
+                "latitude": map_location.get("latitude"),
+                "longitude": map_location.get("longitude"),
+                "name": map_location.get("name"),
+                "address": map_location.get("address"),
+            }
 
         # ====================================================
         # GENERATE FINAL RESPONSE

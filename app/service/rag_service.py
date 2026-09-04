@@ -277,6 +277,37 @@ def query_documents_stream(
 
                 continue
 
+            # ================================================
+            # MAP LOCATION
+            #
+            # find_location_on_map found coordinates for a
+            # single named place. Sent as its own dedicated
+            # SSE event carrying lat/long/name so the frontend
+            # can render a map pin. Not accumulated into
+            # full_answer — the LLM's own text answer (which
+            # streams separately as normal "delta" events)
+            # already covers the visible chat reply.
+            # ================================================
+
+            if piece_type == "map_location":
+                yield {
+                    "event": "map_location",
+                    "success": True,
+                    "error_code": None,
+                    "conversation_id": conversation_id,
+                    "message_id": user_message.id,
+                    "delta": None,
+                    "text_content": full_answer,
+                    "images": [],
+                    "latitude": piece.get("latitude"),
+                    "longitude": piece.get("longitude"),
+                    "name": piece.get("name"),
+                    "address": piece.get("address"),
+                    
+                }
+
+                continue
+
             full_answer += piece_content
 
             yield {
@@ -289,6 +320,9 @@ def query_documents_stream(
                 "text_content": full_answer,
                 "images": [],
             }
+
+
+            
 
         # ====================================================
         # FINAL ANSWER CLEANUP

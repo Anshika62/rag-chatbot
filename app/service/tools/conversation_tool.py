@@ -181,6 +181,8 @@ def create_conversation_tools(
         get_distance_bw_2_locations,
         compare_travel_modes, 
         search_nearby_places,
+        find_location_on_map,
+
     ]
 
     # ========================================================
