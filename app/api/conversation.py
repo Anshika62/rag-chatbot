@@ -1,4 +1,3 @@
-
 import json
 import logging
 
@@ -42,10 +41,6 @@ from app.service.tools.places_tool import (
     search_nearby_places,
 )
 
-from app.service.tools.geocode_tool import (
-    find_location_on_map,
-)
-
 from app.schemas.query_schema import QueryRequest
 
 from app.service.external.llm_service import generate_title
@@ -58,6 +53,65 @@ router = APIRouter(
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# NORMALIZE LOCATION FROM REQUEST
+#
+# Frontend has sent the SAME location in up to three shapes in
+# one payload: flat (latitude/longitude/address/full_address)
+# and nested under "location" / "coordinates". This picks one
+# consistent set of values instead of trusting only the flat
+# fields, so a payload that only fills the nested objects (or
+# only full_address) still works.
+#
+# Priority: flat fields > "location" object > "coordinates"
+# object. Within each source, address falls back to
+# full_address when address is missing/empty.
+# ============================================================
+
+
+def _normalize_request_location(request: QueryRequest):
+
+    def _pick(source: dict | None):
+        if not source:
+            return None, None, None
+
+        lat = source.get("latitude")
+        lon = source.get("longitude")
+        addr = (
+            source.get("address")
+            or source.get("full_address")
+        )
+        return lat, lon, addr
+
+    latitude = request.latitude
+    longitude = request.longitude
+    address = request.address or request.full_address
+
+    if latitude is None or longitude is None:
+
+        for source in (request.location, request.coordinates):
+
+            lat, lon, addr = _pick(source)
+
+            if lat is not None and lon is not None:
+                latitude = lat
+                longitude = lon
+                address = address or addr
+                break
+
+    elif not address:
+
+        for source in (request.location, request.coordinates):
+
+            _, _, addr = _pick(source)
+
+            if addr:
+                address = addr
+                break
+
+    return latitude, longitude, address
 
 
 # ============================================================
@@ -135,6 +189,15 @@ def send_message(
         conversation_id = str(conversation.id)
 
     # --------------------------------------------------------
+    # Normalize location (flat vs nested "location"/"coordinates",
+    # address vs full_address — see _normalize_request_location).
+    # --------------------------------------------------------
+
+    resolved_latitude, resolved_longitude, resolved_address = (
+        _normalize_request_location(request)
+    )
+
+    # --------------------------------------------------------
     # Debug request scope
     # --------------------------------------------------------
     #
@@ -155,14 +218,16 @@ def send_message(
        "conversation_id=%s | "
        "document_id=%s | "
        "is_new_conv=%s (effective=%s) | "
-       "latitude=%s | longitude=%s",
+       "latitude=%s | longitude=%s | address=%s",
        request.question,
        conversation_id,
        request.document_id,
        request.is_new_conv,
        starting_new_conversation,
-       request.latitude,
-       request.longitude,)
+       resolved_latitude,
+       resolved_longitude,
+       resolved_address,
+    )
 
     # --------------------------------------------------------
     # SSE event generator
@@ -178,9 +243,9 @@ def send_message(
                 user_id=str(user.id),
                 conversation_id=conversation_id,
                 document_id=request.document_id,
-                latitude=request.latitude,
-                longitude=request.longitude,
-                address=request.address,
+                latitude=resolved_latitude,
+                longitude=resolved_longitude,
+                address=resolved_address,
             ):
 
                 event_name = event_data.get(
@@ -363,4 +428,3 @@ def delete_conversation_endpoint(
         data=None,
         status_code=status.HTTP_200_OK,
     )
-

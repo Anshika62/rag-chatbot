@@ -1005,24 +1005,27 @@ def _execute_tool_calls(
 
 
 # ============================================================
-# REASONING DECISION (Section 16)
+# REASONING DECISION
 #
-# Keep simple questions simple: "Hello", "What is Python?", a
-# single short knowledge-base hit, or a single weather/datetime
-# call never reach the reasoning model. Reasoning is only used
-# when the tool results actually need to be compared/combined —
-# multiple tools used together, an image analyzed alongside other
-# content, or a substantial amount of retrieved text to reason
-# over.
+# UPDATED: reasoning is now used for EVERY turn where at least
+# one tool was called, regardless of which tool(s) or how much
+# text they returned. This fixes two problems seen in prod:
+#
+#   1. Reasoning showing up inconsistently — tools like
+#      find_location_on_map (map pin) or search_nearby_places
+#      (fuel/station/etc.) were never in the old allow-list, so
+#      those turns silently skipped reasoning and went straight
+#      to the (buggy) tool-bound final-answer path.
+#   2. reasoning_llm never has tools bound to it, so routing
+#      every tool-based turn through it also means it can never
+#      emit an empty tool-call chunk instead of text — removing
+#      the "I was unable to generate a response" failure mode
+#      for those turns as a side effect.
+#
+# Turns with NO tool calls (plain chit-chat, "hi", etc.) still
+# skip reasoning and answer directly from the Main LLM, so
+# simple conversation stays fast/cheap.
 # ============================================================
-
-
-REASONING_MIN_TOOL_CONTENT_CHARS = int(
-    os.getenv(
-        "REASONING_MIN_TOOL_CONTENT_CHARS",
-        "600",
-    )
-)
 
 
 def _should_use_reasoning(
@@ -1031,51 +1034,7 @@ def _should_use_reasoning(
     extra_messages: list,
 ) -> bool:
 
-    if not tool_calls:
-        return False
-
-    tool_names = {
-        tool_call["name"]
-        for tool_call in tool_calls
-    }
-
-    # Multiple different tools used together -> results need to
-    # be combined/synthesized.
-    if len(tool_names) > 1:
-        return True
-
-    # An image was analyzed alongside other tool output -> combining
-    # vision output with text is exactly the case Section 16 calls
-    # out for reasoning.
-    if collected_images:
-        return True
-
-    # Distance/travel results need structured interpretation
-    if (
-        "get_distance_bw_2_locations" in tool_names
-        or "compare_travel_modes" in tool_names
-    ):
-        return True
-
-    # A single search_knowledge_base call that returned a
-    # substantial amount of text (multiple/long chunks) benefits
-    # from a reasoning pass to compare and synthesize across them.
-    if "search_knowledge_base" in tool_names:
-
-        combined_length = sum(
-            len(str(message.get("content", "")))
-            for message in extra_messages
-            if (
-                isinstance(message, dict)
-                and message.get("role") == "tool"
-        
-            )
-        )
-
-        if combined_length > REASONING_MIN_TOOL_CONTENT_CHARS:
-            return True
-
-    return False
+    return bool(tool_calls)
 
 
 # ============================================================
@@ -1462,9 +1421,8 @@ def generate_answer(
         # ====================================================
         # REASONING STAGE (final-answer synthesis)
         #
-        # Only used when the tool results actually need to be
-        # compared/combined (see _should_use_reasoning). Simple
-        # single-tool turns keep using the Main LLM directly.
+        # Now runs for every turn that made at least one tool
+        # call (see _should_use_reasoning above).
         # ====================================================
 
         use_reasoning = _should_use_reasoning(
@@ -1529,9 +1487,21 @@ def generate_answer(
         # ====================================================
         # MAIN LLM FINAL ANSWER (default path / reasoning
         # fallback)
+        #
+        # UPDATED: uses the plain, tools-UNBOUND `llm` instead
+        # of `llm_with_tools`. With tools still bound here, the
+        # model could (and did, per prod logs) emit ANOTHER
+        # tool_call instead of text when it wasn't fully
+        # satisfied with the tool results (e.g. a failed
+        # find_location_on_map call, or wanting one more web
+        # search) — that tool-call chunk has no .content, so the
+        # caller ends up with nothing to show ("I was unable to
+        # generate a response"). Using the plain model forces a
+        # text answer using whatever tool results are already
+        # available.
         # ====================================================
 
-        final_response = llm_with_tools.invoke(
+        final_response = llm.invoke(
             messages + tool_messages
         )
 
@@ -1667,19 +1637,6 @@ def generate_answer_stream(
         picker). When provided, the LLM is told the location is
         already known so it never re-triggers get_location for
         this turn.
-
-    Yields:
-        dicts of the form {"type": "thinking" | "answer" |
-        "location_request" | "map_location", "content": str}.
-        "thinking" pieces are the reasoning model's live
-        chain-of-thought (only ever produced during the
-        REASONING STAGE below) and should be shown to the user
-        as a transient "thinking..." trace, never saved as the
-        final message content. "answer" pieces are the real
-        response and should be both streamed and saved.
-        "map_location" pieces carry latitude/longitude/name/
-        address for a single named place found via
-        find_location_on_map, alongside the normal answer text.
     """
 
     try:
@@ -1909,10 +1866,8 @@ def generate_answer_stream(
         # ====================================================
         # REASONING STAGE (final-answer synthesis)
         #
-        # Only used when the tool results actually need to be
-        # compared/combined (see _should_use_reasoning). Simple
-        # single-tool turns keep streaming from the Main LLM
-        # directly, unchanged from prior behavior.
+        # Now runs for every turn that made at least one tool
+        # call (see _should_use_reasoning above).
         # ====================================================
 
         use_reasoning = _should_use_reasoning(
@@ -2014,9 +1969,16 @@ def generate_answer_stream(
         # ====================================================
         # MAIN LLM FINAL ANSWER (default path / reasoning
         # fallback)
+        #
+        # UPDATED: streams from the plain, tools-UNBOUND `llm`
+        # instead of `llm_with_tools` — see the matching comment
+        # in generate_answer() above for why. This is what
+        # actually fixes the "I was unable to generate a
+        # response" case seen in prod for find_location_on_map /
+        # tavily_web_search turns.
         # ====================================================
 
-        for chunk in llm_with_tools.stream(
+        for chunk in llm.stream(
             final_messages
         ):
 
