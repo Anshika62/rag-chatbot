@@ -120,6 +120,9 @@ def query_documents_stream(
     conversation_id: str,
     document_id: str | None = None,
     image_paths: list[str] | None = None,
+    latitude: float | None = None,      # NEW
+    longitude: float | None = None,     # NEW
+    address: str | None = None,         
 ):
     try:
         if not question or not question.strip():
@@ -213,6 +216,10 @@ def query_documents_stream(
             images_output=images_output,
             document_id=document_id,
             image_paths=image_paths,
+            latitude=latitude,        
+            longitude=longitude,      
+            address=address,          
+
         ):
             if not piece:
                 continue

@@ -436,6 +436,13 @@ Rules:
   provide it in a later message rather than answering as if a
   location is already known.
 
+- Always check the "User Location" section below (in the human
+  message) before deciding whether to call get_location. If it
+  states that the user's location is already known, do NOT call
+  get_location — use those exact coordinates directly when
+  calling search_nearby_places, get_distance_bw_2_locations, or
+  compare_travel_modes.
+
 - When search_knowledge_base or analyze_document_image returns an
   image (a result whose content_type starts with "image/", or a
   document_id returned by analyze_document_image), and that image
@@ -461,6 +468,50 @@ Rules:
 
 
 # ============================================================
+# BUILD LOCATION CONTEXT
+#
+# Turns the latitude/longitude/address (if any) that arrived
+# with THIS request into a plain-language line the LLM can read
+# in the human message. This is what lets the agent skip calling
+# get_location on every subsequent turn once the frontend has
+# already sent real coordinates — see SYSTEM_PROMPT rule above.
+# ============================================================
+
+
+def _build_location_context(
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    address: Optional[str] = None,
+) -> str:
+
+    if latitude is not None and longitude is not None:
+
+        location_line = (
+            f"The user's current location is ALREADY KNOWN: "
+            f"latitude={latitude}, longitude={longitude}"
+        )
+
+        if address:
+
+            location_line += f", address='{address}'"
+
+        location_line += (
+            ". Do NOT call get_location — this location is "
+            "already available. Use these exact coordinates "
+            "directly when calling search_nearby_places, "
+            "get_distance_bw_2_locations, or compare_travel_modes."
+        )
+
+        return location_line
+
+    return (
+        "The user's current location is NOT known yet. If the "
+        "current question requires it (e.g. 'near me', "
+        "'closest to me', 'here'), call get_location first."
+    )
+
+
+# ============================================================
 # BUILD LLM MESSAGES
 # ============================================================
 
@@ -469,6 +520,9 @@ def _build_messages(
     question: str,
     chat_history: Optional[list[dict]] = None,
     document_available: bool = False,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    address: Optional[str] = None,
 ):
 
     chat_history = chat_history or []
@@ -506,6 +560,12 @@ def _build_messages(
         "because none is pre-selected."
     )
 
+    location_context = _build_location_context(
+        latitude=latitude,
+        longitude=longitude,
+        address=address,
+    )
+
     prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -522,6 +582,10 @@ Uploaded Document Available:
 
 {document_context}
 
+User Location:
+
+{location_context}
+
 Current User Question:
 
 {question}""",
@@ -532,6 +596,7 @@ Current User Question:
     return prompt.format_messages(
         history=history_text,
         document_context=document_context,
+        location_context=location_context,
         question=question,
     )
 
@@ -613,6 +678,8 @@ def _execute_tool_calls(
     tool_calls: list,
     conversation_id: Optional[str],
     log_prefix: str = "",
+    known_latitude: Optional[float] = None,
+    known_longitude: Optional[float] = None,
 ):
 
     tool_messages = []
@@ -629,6 +696,48 @@ def _execute_tool_calls(
             "args",
             {},
         )
+
+        # ====================================================
+        # SAFETY NET — LOCATION ALREADY KNOWN
+        #
+        # If the frontend already sent real coordinates for
+        # this turn but the LLM called get_location anyway
+        # (e.g. it ignored the "User Location" context), don't
+        # re-trigger the frontend location picker. Short-circuit
+        # with the already-known coordinates instead, so the
+        # agent can immediately continue with
+        # search_nearby_places / get_distance_bw_2_locations /
+        # compare_travel_modes in its next step.
+        # ====================================================
+
+        if (
+            tool_name == "get_location"
+            and known_latitude is not None
+            and known_longitude is not None
+        ):
+
+            logger.info(
+                "%sLOCATION ALREADY KNOWN, SKIPPING "
+                "get_location: conversation_id=%s",
+                log_prefix,
+                conversation_id,
+            )
+
+            tool_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": (
+                        f"Location already known: "
+                        f"latitude={known_latitude}, "
+                        f"longitude={known_longitude}. Use "
+                        "this directly, do not ask the user "
+                        "again."
+                    ),
+                }
+            )
+
+            continue
 
         selected_tool = _get_tool(
             tools=tools,
@@ -1165,6 +1274,9 @@ def generate_answer(
     images_output: Optional[list] = None,
     document_id: Optional[str] = None,
     image_paths: Optional[list[str]] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    address: Optional[str] = None,
 ):
 
     """
@@ -1175,6 +1287,13 @@ def generate_answer(
     image_paths:
         Local file path(s) of images attached directly to
         THIS message.
+
+    latitude / longitude / address:
+        The user's current location, if it was already sent
+        with this request (e.g. by the frontend location
+        picker). When provided, the LLM is told the location is
+        already known so it never re-triggers get_location for
+        this turn.
     """
 
     try:
@@ -1183,6 +1302,9 @@ def generate_answer(
             question=question,
             chat_history=chat_history,
             document_available=bool(document_id),
+            latitude=latitude,
+            longitude=longitude,
+            address=address,
         )
 
         tools = _create_tools(
@@ -1222,6 +1344,8 @@ def generate_answer(
                 tools=tools,
                 tool_calls=response.tool_calls,
                 conversation_id=conversation_id,
+                known_latitude=latitude,
+                known_longitude=longitude,
             )
         )
 
@@ -1423,6 +1547,9 @@ def generate_answer_stream(
     images_output: Optional[list] = None,
     document_id: Optional[str] = None,
     image_paths: Optional[list[str]] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    address: Optional[str] = None,
 ) -> Generator[dict, None, None]:
 
     """
@@ -1433,6 +1560,13 @@ def generate_answer_stream(
     image_paths:
         Local file path(s) of image(s) attached directly to
         THIS message.
+
+    latitude / longitude / address:
+        The user's current location, if it was already sent
+        with this request (e.g. by the frontend location
+        picker). When provided, the LLM is told the location is
+        already known so it never re-triggers get_location for
+        this turn.
 
     Yields:
         dicts of the form {"type": "thinking" | "answer",
@@ -1450,6 +1584,9 @@ def generate_answer_stream(
             question=question,
             chat_history=chat_history,
             document_available=bool(document_id),
+            latitude=latitude,
+            longitude=longitude,
+            address=address,
         )
 
         tools = _create_tools(
@@ -1569,6 +1706,8 @@ def generate_answer_stream(
                 tool_calls=tool_calls,
                 conversation_id=conversation_id,
                 log_prefix="STREAM ",
+                known_latitude=latitude,
+                known_longitude=longitude,
             )
         )
 
@@ -1592,6 +1731,11 @@ def generate_answer_stream(
         # streaming caller (rag_service.py) turns this into a
         # dedicated SSE event that tells the frontend to show the
         # location picker.
+        #
+        # Note: if latitude/longitude were already known for
+        # this turn, _execute_tool_calls above short-circuits
+        # get_location itself and location_request stays None,
+        # so this branch is never hit in that case.
         # ====================================================
 
         if location_request is not None:
