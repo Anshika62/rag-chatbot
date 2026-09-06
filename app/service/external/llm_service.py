@@ -313,8 +313,23 @@ class _CloudflareReasoningLLM:
                 continue
 
             # ----------------------------------------------------
-            # Cloudflare normally exposes generated text in
-            # result.response.
+            # FIX: Cloudflare Workers AI's STREAMING (SSE) payload
+            # puts the generated token at the TOP LEVEL, e.g.
+            #     {"response": "some token"}
+            # The nested {"result": {"response": ...}} shape only
+            # applies to the NON-STREAMING /ai/run JSON response
+            # (see invoke() above). Previously this method only
+            # ever checked data["result"]["response"], which for
+            # streamed responses is always {} -> None -> every
+            # chunk was silently dropped -> the whole stream
+            # yielded nothing, surfacing as "REASONING EMPTY
+            # RESULT" in the logs even though Cloudflare was
+            # responding successfully.
+            #
+            # Both shapes are now checked, nested first (kept for
+            # forward/backward compatibility in case a future
+            # Cloudflare model nests it), falling back to the
+            # top-level key that streaming actually uses.
             # ----------------------------------------------------
 
             result = data.get(
@@ -325,6 +340,12 @@ class _CloudflareReasoningLLM:
             token = result.get(
                 "response"
             )
+
+            if token is None:
+
+                token = data.get(
+                    "response"
+                )
 
             if token:
 
@@ -385,6 +406,8 @@ You have access to:
 9. Direct image analysis tool
 10. Web search tool
 11. Find location on map tool
+12. Distance-between-two-locations tool
+13. Compare-travel-modes tool
 
 RULES:
 
@@ -443,12 +466,18 @@ WEATHER:
 - Use get_weather for current weather questions.
 - Never invent current weather information.
 
-WEB:
+WEB SEARCH:
 
-- Use tavily_web_search for live/current web information,
-  recent information, current events, public web research,
-  or information unavailable in the conversation or
-  uploaded knowledge base.
+- Use tavily_web_search only for information that is current,
+  changing, or external to this app — general public web
+  knowledge, news, live facts, or anything not answerable from
+  the conversation or the uploaded knowledge base.
+
+- Do not use tavily_web_search for questions about the user's
+  own location, distance/travel between two places, nearby
+  places, weather, or the current date/time — each of those has
+  its own dedicated tool listed above and below. Web search is
+  the LAST resort, not a substitute for those tools.
 
 - Do not use web search when the uploaded knowledge base
   clearly contains the answer unless the user explicitly
@@ -467,8 +496,12 @@ LOCATION:
   get_distance_bw_2_locations,
   compare_travel_modes.
 
-- Use get_location only when the user's own current location
-  is required and is not already known.
+- Use get_location ONLY when the user's OWN current/live
+  location is required and is not already known. get_location
+  never returns real coordinates itself — it only triggers the
+  frontend to ask the user for their location. Do not call any
+  other location-based tool until the user's actual coordinates
+  come back in a follow-up message.
 
 - If the user asks for "near me", "nearby", "closest to me",
   or similar and no location is available, use get_location.
@@ -479,20 +512,62 @@ LOCATION:
   supplied by the frontend before treating the location as
   known.
 
-MAP:
+MAP (find_location_on_map):
 
-- Use find_location_on_map when the user names ONE specific
-  place and wants it displayed on a map.
+- Use find_location_on_map ONLY when the user names ONE
+  specific place and wants it visually located / shown as a pin
+  on a map — e.g. "show me Vijay Nagar on the map", "where is
+  Bargi Dam", "find Jabalpur station on the map".
 
-- Do not use find_location_on_map for "near me" category
-  searches.
+- Do NOT use find_location_on_map for "near me" category
+  searches (use search_nearby_places instead).
 
-- Do not invent map URLs.
+- Do NOT use find_location_on_map to answer "how far", "how
+  many km", "distance to X", or any travel-time question — see
+  DISTANCE / TRAVEL below. find_location_on_map only geocodes a
+  single named place; it never calculates distance or duration.
+
+- Do not invent map URLs or coordinates.
 
 - The frontend renders the map using the coordinates returned
   by find_location_on_map.
 
-PLACES:
+DISTANCE / TRAVEL (get_distance_bw_2_locations, compare_travel_modes):
+
+- Use get_distance_bw_2_locations whenever the user asks how
+  far apart two places are, or the travel time for ONE specific
+  travel mode — e.g. "how many km is Vijay Nagar from my
+  location", "how far is the airport", "how long by car to X".
+
+- Use compare_travel_modes instead when the user wants two or
+  more travel modes compared side by side — e.g. "compare car
+  vs bike", "which is faster, walking or driving?".
+
+- Both tools require REAL latitude/longitude for BOTH the
+  origin and the destination:
+    - The origin is usually the user's own location — check the
+      User Location section first; call get_location only if it
+      is not already known.
+    - The destination is a NAMED place the user mentioned. If
+      its coordinates are not already known from this
+      conversation, first resolve them with find_location_on_map
+      (or search_knowledge_base/search_nearby_places if
+      relevant), THEN call get_distance_bw_2_locations or
+      compare_travel_modes with the coordinates that came back.
+
+- Never guess or invent coordinates for either location. Never
+  substitute find_location_on_map's result for an actual
+  distance calculation — always follow through with
+  get_distance_bw_2_locations or compare_travel_modes to get the
+  real distance/duration.
+
+- Supported travel modes: driving, walking, cycling.
+  'motorcycle' and 'transit' are recognised by the tool but are
+  not supported by the underlying routing provider, and the
+  tool will say so explicitly — do not work around this by
+  guessing a number yourself.
+
+PLACES (search_nearby_places):
 
 - search_nearby_places accepts category_hint and place_name in
   addition to query. Prefer these over relying on exact wording:
@@ -526,6 +601,12 @@ PLACES:
     history to reuse the same category_hint or place_name as the
     previous places search, together with the already-known
     location. Do not ask the user to repeat the category.
+
+  - Distances returned by search_nearby_places are approximate
+    (straight-line), for ranking only. If the user then asks for
+    an exact route distance/time to one of those results, follow
+    up with get_distance_bw_2_locations or compare_travel_modes
+    using that place's coordinates.
 
   - Never fabricate business names, addresses, coordinates,
     distances, ratings, or hours. Only report what the tool
