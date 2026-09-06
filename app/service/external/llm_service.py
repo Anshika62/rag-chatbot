@@ -1888,6 +1888,32 @@ def generate_answer_stream(
                     conversation_id,
                 )
 
+                # ----------------------------------------------------
+                # FIX: previously the frontend only saw a "thinking"
+                # status event if the reasoning model happened to
+                # wrap its output in <think>...</think> tags this
+                # turn (detected inside _stream_with_thinking_split
+                # below). When the model skipped that wrapper, no
+                # "thinking" event was ever sent, so the reasoning
+                # panel silently never appeared in the UI even though
+                # reasoning was running normally in the backend (see
+                # REASONING START/COMPLETE in the logs).
+                #
+                # Emitting one unconditional "thinking" event here,
+                # as soon as reasoning begins, guarantees the UI
+                # reasoning panel shows consistently every time,
+                # regardless of whether this particular model output
+                # includes <think> tags.
+                # ----------------------------------------------------
+
+                yield {
+                    "type": "thinking",
+                    "content": (
+                        "Analyzing the "
+                        "retrieved information..."
+                    ),
+                }
+
                 reasoning_messages = (
                     _build_reasoning_messages(
                         base_messages=messages,
