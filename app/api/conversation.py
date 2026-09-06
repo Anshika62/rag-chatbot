@@ -9,7 +9,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from app.schemas.location_schema import LocationSubmission
+
 from app.core.database import get_db
 from app.core.response import success_response
 from app.core.dependency import (
@@ -17,28 +17,15 @@ from app.core.dependency import (
     get_current_conversation,
 )
 
-from app.service.tools.geocode_tool import (
-    find_location_on_map,
-)
-
 from app.repository.conversation_repo import (
     create_conversation,
-    delete_conversation,
     get_all_messages,
+    get_conversation,
     get_conversations_by_user,
-    update_conversation_title,
 )
 
 from app.schemas.conversation_schema import (
     ConversationTitleUpdate,
-)
-
-from app.service.tools.location_tool import (
-    get_location,
-)
-
-from app.service.tools.places_tool import (
-    search_nearby_places,
 )
 
 from app.schemas.query_schema import QueryRequest
@@ -57,61 +44,134 @@ logger = logging.getLogger(__name__)
 
 # ============================================================
 # NORMALIZE LOCATION FROM REQUEST
+# ============================================================
 #
-# Frontend has sent the SAME location in up to three shapes in
-# one payload: flat (latitude/longitude/address/full_address)
-# and nested under "location" / "coordinates". This picks one
-# consistent set of values instead of trusting only the flat
-# fields, so a payload that only fills the nested objects (or
-# only full_address) still works.
+# Frontend may send location in different forms:
 #
-# Priority: flat fields > "location" object > "coordinates"
-# object. Within each source, address falls back to
-# full_address when address is missing/empty.
+# 1. Flat:
+#       latitude
+#       longitude
+#       address
+#       full_address
+#
+# 2. Nested:
+#       location: {
+#           latitude,
+#           longitude,
+#           address
+#       }
+#
+# 3. Nested:
+#       coordinates: {
+#           latitude,
+#           longitude,
+#           address
+#       }
+#
+# Priority:
+#       flat fields
+#       -> location
+#       -> coordinates
+#
+# Address:
+#       address
+#       -> full_address
+#
 # ============================================================
 
 
 def _normalize_request_location(request: QueryRequest):
 
     def _pick(source: dict | None):
+
         if not source:
             return None, None, None
 
-        lat = source.get("latitude")
-        lon = source.get("longitude")
-        addr = (
+        latitude = source.get("latitude")
+        longitude = source.get("longitude")
+
+        address = (
             source.get("address")
             or source.get("full_address")
         )
-        return lat, lon, addr
+
+        return (
+            latitude,
+            longitude,
+            address,
+        )
+
+    # --------------------------------------------------------
+    # First check flat fields
+    # --------------------------------------------------------
 
     latitude = request.latitude
     longitude = request.longitude
-    address = request.address or request.full_address
+
+    address = (
+        request.address
+        or request.full_address
+    )
+
+    # --------------------------------------------------------
+    # If flat coordinates are incomplete,
+    # check nested location / coordinates.
+    # --------------------------------------------------------
 
     if latitude is None or longitude is None:
 
-        for source in (request.location, request.coordinates):
+        for source in (
+            request.location,
+            request.coordinates,
+        ):
 
-            lat, lon, addr = _pick(source)
+            (
+                nested_latitude,
+                nested_longitude,
+                nested_address,
+            ) = _pick(source)
 
-            if lat is not None and lon is not None:
-                latitude = lat
-                longitude = lon
-                address = address or addr
+            if (
+                nested_latitude is not None
+                and nested_longitude is not None
+            ):
+
+                latitude = nested_latitude
+                longitude = nested_longitude
+
+                if not address:
+                    address = nested_address
+
                 break
+
+    # --------------------------------------------------------
+    # Coordinates exist but address is missing.
+    # Try nested objects for address.
+    # --------------------------------------------------------
 
     elif not address:
 
-        for source in (request.location, request.coordinates):
+        for source in (
+            request.location,
+            request.coordinates,
+        ):
 
-            _, _, addr = _pick(source)
+            (
+                _,
+                _,
+                nested_address,
+            ) = _pick(source)
 
-            if addr:
-                address = addr
+            if nested_address:
+
+                address = nested_address
                 break
 
-    return latitude, longitude, address
+    return (
+        latitude,
+        longitude,
+        address,
+    )
 
 
 # ============================================================
@@ -125,27 +185,22 @@ def send_message(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
+
     conversation_id = request.conversation_id
 
-    # --------------------------------------------------------
-    # Create new conversation when frontend sends
-    # is_new_conv=True.
+    # ========================================================
+    # CREATE NEW CONVERSATION
+    # ========================================================
     #
-    # DEFENSIVE FALLBACK:
-    # Some frontend call sites omit is_new_conv entirely (it
-    # then defaults to False via Pydantic) while ALSO omitting
-    # conversation_id. That combination is indistinguishable
-    # from "start a new conversation" — there is no existing
-    # conversation to validate against. Previously this fell
-    # through to the "existing conversation" branch below and
-    # hard-failed with 400 "conversation_id is required", even
-    # though the user's intent was clearly to start a fresh
-    # chat. Treating "conversation_id is missing" the same as
-    # "is_new_conv=True" removes that failure mode without
-    # weakening the explicit-True case at all — it only changes
-    # behavior for requests that would otherwise have been a
-    # guaranteed 400.
-    # --------------------------------------------------------
+    # New conversation when:
+    #
+    #   is_new_conv=True
+    #
+    # OR
+    #
+    #   conversation_id is missing
+    #
+    # ========================================================
 
     starting_new_conversation = (
         request.is_new_conv
@@ -164,74 +219,86 @@ def send_message(
             title=title,
         )
 
-        conversation_id = str(conversation.id)
+        conversation_id = str(
+            conversation.id
+        )
 
-    # --------------------------------------------------------
-    # Verify existing conversation ownership
-    # --------------------------------------------------------
+    # ========================================================
+    # EXISTING CONVERSATION
+    # ========================================================
 
     else:
 
-        from app.repository.conversation_repo import get_conversation
-
         conversation = get_conversation(
             db=db,
-            conversation_id=str(conversation_id),
+            conversation_id=str(
+                conversation_id
+            ),
             user_id=str(user.id),
         )
 
         if not conversation:
+
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Conversation not found",
             )
 
-        conversation_id = str(conversation.id)
+        conversation_id = str(
+            conversation.id
+        )
 
-    # --------------------------------------------------------
-    # Normalize location (flat vs nested "location"/"coordinates",
-    # address vs full_address — see _normalize_request_location).
-    # --------------------------------------------------------
+    # ========================================================
+    # NORMALIZE LOCATION
+    # ========================================================
+    #
+    # IMPORTANT:
+    #
+    # This API layer does NOT save/load conversation location.
+    #
+    # It only extracts location from the current request and
+    # passes it to rag_service.
+    #
+    # rag_service is responsible for:
+    #
+    #   1. Saving new coordinates to Conversation.
+    #   2. Loading saved coordinates when request has none.
+    #
+    # ========================================================
 
-    resolved_latitude, resolved_longitude, resolved_address = (
-        _normalize_request_location(request)
+    (
+        resolved_latitude,
+        resolved_longitude,
+        resolved_address,
+    ) = _normalize_request_location(
+        request
     )
 
-    # --------------------------------------------------------
-    # Debug request scope
-    # --------------------------------------------------------
-    #
-    # document_id=None means:
-    #
-    #     Global documents
-    #     +
-    #     Current conversation documents
-    #
-    # document_id=<UUID> means:
-    #
-    #     Search that specific accessible document.
-    # --------------------------------------------------------
+    # ========================================================
+    # DEBUG REQUEST
+    # ========================================================
 
     logger.info(
-       "CONVERSATION REQUEST | "
-       "question=%s | "
-       "conversation_id=%s | "
-       "document_id=%s | "
-       "is_new_conv=%s (effective=%s) | "
-       "latitude=%s | longitude=%s | address=%s",
-       request.question,
-       conversation_id,
-       request.document_id,
-       request.is_new_conv,
-       starting_new_conversation,
-       resolved_latitude,
-       resolved_longitude,
-       resolved_address,
+        "CONVERSATION REQUEST | "
+        "question=%s | "
+        "conversation_id=%s | "
+        "document_id=%s | "
+        "is_new_conv=%s | "
+        "latitude=%s | "
+        "longitude=%s | "
+        "address=%s",
+        request.question,
+        conversation_id,
+        request.document_id,
+        request.is_new_conv,
+        resolved_latitude,
+        resolved_longitude,
+        resolved_address,
     )
 
-    # --------------------------------------------------------
-    # SSE event generator
-    # --------------------------------------------------------
+    # ========================================================
+    # SSE EVENT GENERATOR
+    # ========================================================
 
     def event_generator():
 
@@ -243,6 +310,11 @@ def send_message(
                 user_id=str(user.id),
                 conversation_id=conversation_id,
                 document_id=request.document_id,
+
+                # Current request location.
+                #
+                # If None, rag_service will load the
+                # previously persisted conversation location.
                 latitude=resolved_latitude,
                 longitude=resolved_longitude,
                 address=resolved_address,
@@ -283,6 +355,10 @@ def send_message(
                 f"data: {json.dumps(error_data)}\n\n"
             )
 
+    # ========================================================
+    # RETURN SSE STREAM
+    # ========================================================
+
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
@@ -304,6 +380,7 @@ def list_conversations(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
+
     conversations = get_conversations_by_user(
         db=db,
         user_id=str(user.id),
@@ -311,10 +388,16 @@ def list_conversations(
 
     data = [
         {
-            "conversation_id": str(conversation.id),
+            "conversation_id": str(
+                conversation.id
+            ),
             "title": conversation.title,
-            "created_at": conversation.created_at.isoformat(),
-            "updated_at": conversation.updated_at.isoformat(),
+            "created_at": (
+                conversation.created_at.isoformat()
+            ),
+            "updated_at": (
+                conversation.updated_at.isoformat()
+            ),
         }
         for conversation in conversations
     ]
@@ -333,26 +416,38 @@ def list_conversations(
 
 @router.get("/{conversation_id}")
 def get_conversation_detail(
-    conversation=Depends(get_current_conversation),
+    conversation=Depends(
+        get_current_conversation
+    ),
     db: Session = Depends(get_db),
 ):
+
     messages = get_all_messages(
         db=db,
-        conversation_id=str(conversation.id),
+        conversation_id=str(
+            conversation.id
+        ),
     )
 
     def _parse_images(raw_images):
+
         if not raw_images:
             return []
 
         try:
-            return json.loads(raw_images)
 
-        except (TypeError, ValueError):
+            return json.loads(
+                raw_images
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
 
             logger.warning(
-                "Unable to parse stored images JSON for a message "
-                "in conversation_id=%s",
+                "Unable to parse stored images JSON "
+                "for conversation_id=%s",
                 conversation.id,
             )
 
@@ -361,13 +456,21 @@ def get_conversation_detail(
     return success_response(
         message="Conversation fetched successfully",
         data={
-            "conversation_id": str(conversation.id),
+            "conversation_id": str(
+                conversation.id
+            ),
             "title": conversation.title,
-            "created_at": conversation.created_at.isoformat(),
-            "updated_at": conversation.updated_at.isoformat(),
+            "created_at": (
+                conversation.created_at.isoformat()
+            ),
+            "updated_at": (
+                conversation.updated_at.isoformat()
+            ),
             "messages": [
                 {
-                    "message_id": str(message.id),
+                    "message_id": str(
+                        message.id
+                    ),
                     "role": message.role,
                     "content": message.content,
                     "images": _parse_images(
@@ -392,9 +495,12 @@ def get_conversation_detail(
 @router.patch("/{conversation_id}")
 def update_title(
     request: ConversationTitleUpdate,
-    conversation=Depends(get_current_conversation),
+    conversation=Depends(
+        get_current_conversation
+    ),
     db: Session = Depends(get_db),
 ):
+
     conversation.title = request.title
 
     db.commit()
@@ -403,7 +509,9 @@ def update_title(
     return success_response(
         message="Title updated successfully",
         data={
-            "conversation_id": str(conversation.id),
+            "conversation_id": str(
+                conversation.id
+            ),
             "title": conversation.title,
         },
         status_code=status.HTTP_200_OK,
@@ -417,9 +525,12 @@ def update_title(
 
 @router.delete("/{conversation_id}")
 def delete_conversation_endpoint(
-    conversation=Depends(get_current_conversation),
+    conversation=Depends(
+        get_current_conversation
+    ),
     db: Session = Depends(get_db),
 ):
+
     db.delete(conversation)
     db.commit()
 
