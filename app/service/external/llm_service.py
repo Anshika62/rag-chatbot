@@ -1124,6 +1124,75 @@ LOCATION_TOOL_NAMES = {
 }
 
 
+# ============================================================
+# TOOL -> USER-FACING STAGE DESCRIPTION
+#
+# Used only to build a friendlier, multi-step "thinking" status
+# trail in the UI (see _build_stage_message below). This is NOT
+# raw chain-of-thought — just a human-readable label for which
+# kind of tool result the reasoning step is working with, so the
+# UI can show a believable multi-stage process (Understanding ->
+# Reviewing <this> -> Analyzing -> Preparing answer) instead of a
+# single static line repeated forever.
+# ============================================================
+
+TOOL_STAGE_DESCRIPTIONS = {
+    "get_conversation_history": "Reviewing the conversation so far",
+    "search_knowledge_base": "Searching the uploaded documents",
+    "analyze_document_image": "Looking closely at the document image",
+    "analyze_image": "Looking closely at the attached image",
+    "get_current_datetime": "Checking the current date and time",
+    "get_weather": "Checking the weather",
+    "get_location": "Getting your location",
+    "tavily_web_search": "Searching the web",
+    "get_distance_bw_2_locations": "Calculating the distance",
+    "compare_travel_modes": "Comparing travel options",
+    "search_nearby_places": "Looking for nearby places",
+    "find_location_on_map": "Locating that place on the map",
+}
+
+
+def _build_stage_message(
+    tool_calls: list,
+) -> Optional[str]:
+    """
+    Build a short, human-readable "what am I working with right
+    now" status line from the tools that were actually called this
+    turn, e.g. "Reviewing nearby places and distance results...".
+    Falls back to a generic line if none of the tool names are
+    recognised. Never reveals raw tool arguments/results or model
+    chain-of-thought — just the category of work in progress.
+    """
+
+    if not tool_calls:
+        return None
+
+    labels = []
+
+    for tool_call in tool_calls:
+
+        tool_name = tool_call.get("name")
+
+        label = TOOL_STAGE_DESCRIPTIONS.get(
+            tool_name
+        )
+
+        if label and label not in labels:
+
+            labels.append(label)
+
+    if not labels:
+        return "Reviewing the retrieved information"
+
+    if len(labels) == 1:
+        return f"{labels[0]}..."
+
+    return (
+        ", ".join(labels[:-1])
+        + f" and {labels[-1]}..."
+    )
+
+
 def _should_use_reasoning(
     tool_calls: list,
     collected_images: list,
@@ -1889,22 +1958,41 @@ def generate_answer_stream(
                 )
 
                 # ----------------------------------------------------
-                # FIX: previously the frontend only saw a "thinking"
-                # status event if the reasoning model happened to
-                # wrap its output in <think>...</think> tags this
-                # turn (detected inside _stream_with_thinking_split
-                # below). When the model skipped that wrapper, no
-                # "thinking" event was ever sent, so the reasoning
-                # panel silently never appeared in the UI even though
-                # reasoning was running normally in the backend (see
-                # REASONING START/COMPLETE in the logs).
+                # MULTI-STAGE THINKING STATUS
                 #
-                # Emitting one unconditional "thinking" event here,
-                # as soon as reasoning begins, guarantees the UI
-                # reasoning panel shows consistently every time,
-                # regardless of whether this particular model output
-                # includes <think> tags.
+                # _stream_with_thinking_split() below never actually
+                # yields a "thinking"-type piece (it only discards
+                # raw <think> content for safety and yields "answer"
+                # pieces) — so previously the ONLY "thinking" event
+                # the UI ever saw was the single hardcoded line
+                # emitted here, once, no matter how long reasoning
+                # took. That's why the UI showed one static line
+                # instead of a proper multi-step process.
+                #
+                # These are still not raw chain-of-thought — just a
+                # short sequence of human-readable stage labels
+                # driven by which tools actually ran this turn, so
+                # the UI gets a believable step-by-step trail again
+                # (Understanding -> Reviewing <tool(s)> -> Analyzing
+                # -> Preparing answer) without exposing model
+                # internals.
                 # ----------------------------------------------------
+
+                yield {
+                    "type": "thinking",
+                    "content": "Understanding your question...",
+                }
+
+                stage_message = _build_stage_message(
+                    tool_calls
+                )
+
+                if stage_message:
+
+                    yield {
+                        "type": "thinking",
+                        "content": stage_message,
+                    }
 
                 yield {
                     "type": "thinking",
@@ -1920,6 +2008,8 @@ def generate_answer_stream(
                         tool_messages=tool_messages,
                     )
                 )
+
+                answer_stage_sent = False
 
                 for piece in (
                     _stream_with_thinking_split(
@@ -1957,6 +2047,17 @@ def generate_answer_stream(
                         piece["type"]
                         == "answer"
                     ):
+
+                        if not answer_stage_sent:
+
+                            yield {
+                                "type": "thinking",
+                                "content": (
+                                    "Preparing your answer..."
+                                ),
+                            }
+
+                            answer_stage_sent = True
 
                         reasoning_answer_yielded = True
 
