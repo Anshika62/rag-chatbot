@@ -41,6 +41,16 @@ logger = logging.getLogger(__name__)
 #      should follow up with get_distance_bw_2_locations or
 #      compare_travel_modes using that place's coordinates.
 #
+# NEW (semantic Places AI): search_nearby_places now also accepts
+# category_hint and place_name, so the LLM can pass a normalized
+# category (from its own semantic understanding of the user's
+# wording) or a specific business name, instead of this file's
+# KEYWORD_TO_CATEGORY table being the only intelligence. That table
+# is still used — as the deterministic fallback when category_hint
+# is not supplied. If neither resolves to a category, a broader
+# multi-category search is performed instead of failing or silently
+# defaulting to "attraction".
+#
 # Never invents places: if all mirrors fail or Overpass returns
 # nothing, this returns an honest empty/error result, not
 # fabricated place names.
@@ -108,6 +118,7 @@ CATEGORY_FILTERS: dict[str, list[str]] = {
 DEFAULT_CATEGORY = "attraction"
 
 # Free-text keyword -> category. Substring match, checked in order.
+# UNCHANGED — still used as the deterministic fallback layer.
 KEYWORD_TO_CATEGORY: dict[str, str] = {
     "famous": "attraction",
     "attraction": "attraction",
@@ -154,6 +165,23 @@ KEYWORD_TO_CATEGORY: dict[str, str] = {
     "bus station": "station",
 }
 
+# NEW: canonical category names, surfaced to the LLM via the tool
+# docstring so it can pass a normalized category_hint.
+CANONICAL_CATEGORIES: list[str] = list(CATEGORY_FILTERS.keys())
+
+# NEW: bounded set of categories used only for the broad/ambiguous
+# fallback search ("what's around me?" with no resolvable category).
+# Not an exhaustive union of every category — keeps the Overpass
+# query bounded.
+BROAD_CATEGORY_KEYS: list[str] = [
+    "attraction",
+    "restaurant",
+    "cafe",
+    "fuel",
+    "pharmacy",
+    "mall",
+]
+
 
 def _validate_coordinates(latitude, longitude) -> str | None:
     if latitude is None or longitude is None:
@@ -170,14 +198,24 @@ def _validate_coordinates(latitude, longitude) -> str | None:
     return None
 
 
-def _resolve_category(query: str | None) -> str:
+def _resolve_category(query: str | None) -> str | None:
+    """
+    Keyword-based fallback category resolution.
+
+    CHANGED: previously returned DEFAULT_CATEGORY ("attraction") when
+    nothing matched, which silently mis-mapped unmatched queries
+    (e.g. "I need somewhere to refuel my bike") onto tourist
+    attractions. Now returns None on no match, so the caller can
+    fall through to a broad multi-category search instead of
+    guessing wrong.
+    """
     if not query:
-        return DEFAULT_CATEGORY
+        return None
     query_lower = query.lower()
     for keyword, category in KEYWORD_TO_CATEGORY.items():
         if keyword in query_lower:
             return category
-    return DEFAULT_CATEGORY
+    return None
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -203,78 +241,56 @@ def _build_overpass_query(
     return f"[out:json][timeout:20];\n(\n  {body}\n);\nout center {MAX_RESULTS * 3};"
 
 
-@tool
-def search_nearby_places(
+def _build_broad_query(latitude: float, longitude: float, radius: int) -> str:
+    """
+    NEW. Used only when no category could be resolved (no valid
+    category_hint, no keyword match, no place_name) — e.g. "what's
+    around me?". Unions a bounded set of common categories instead
+    of failing or silently defaulting to "attraction".
+    """
+    all_filters: list[str] = []
+    for key in BROAD_CATEGORY_KEYS:
+        all_filters.extend(CATEGORY_FILTERS[key])
+    return _build_overpass_query(latitude, longitude, radius, all_filters)
+
+
+def _build_named_query(
     latitude: float,
     longitude: float,
-    query: str | None = None,
-    radius_meters: int | None = None,
-) -> dict:
+    radius: int,
+    place_name: str,
+    filters: list[str] | None,
+) -> str:
     """
-    Search for named places (tourist attractions, cafes,
-    restaurants, pharmacies, hotels, banks, parks, malls, temples,
-    petrol pumps/fuel stations, railway/bus stations, etc.) near a
-    given latitude/longitude, using free OpenStreetMap data.
-
-    Call this ONLY after a real latitude/longitude is known —
-    either because the user just provided their current location
-    in response to a get_location request, or because a location
-    was already given earlier in the conversation (e.g. a city the
-    user named).
-
-    Never guess or invent latitude/longitude, and never invent
-    place names — if this returns an empty list, tell the user
-    nothing was found rather than making something up.
-
-    Distances returned here are straight-line (approximate), only
-    for ranking which places are nearest. If the user wants an
-    actual route distance and travel time to one of these places,
-    follow up with get_distance_bw_2_locations or
-    compare_travel_modes using that place's coordinates.
-
-    Args:
-        latitude: Latitude of the search center, decimal degrees.
-        longitude: Longitude of the search center, decimal degrees.
-        query: What to search for, e.g. "cafes", "restaurants",
-            "pharmacy", "petrol pump", "fuel station", "railway
-            station", "famous spots", "tourist attractions". Omit
-            or use a generic phrase for "what's interesting around
-            here" — defaults to tourist attractions.
-        radius_meters: Search radius in meters. Omit to use a
-            5 km default. Capped at 20 km.
+    NEW. Supports searching for a specific named business/place
+    (e.g. "Starbucks"), optionally narrowed by a resolved category's
+    tag filters. Overpass QL supports name-tag regex matching
+    directly, so no new data source is needed.
     """
+    safe_name = place_name.replace("\\", "\\\\").replace('"', '\\"')
+    name_clause = f'["name"~"{safe_name}",i]'
 
-    logger.info(
-        "SEARCH_NEARBY_PLACES CALLED | latitude=%s longitude=%s "
-        "query=%s radius_meters=%s",
-        latitude,
-        longitude,
-        query,
-        radius_meters,
-    )
+    if filters:
+        tag_filters = [f"{tag_filter}{name_clause}" for tag_filter in filters]
+    else:
+        tag_filters = [name_clause]
 
-    coord_error = _validate_coordinates(latitude, longitude)
-    if coord_error:
-        return {
-            "success": False,
-            "error": "invalid_coordinates",
-            "message": coord_error,
-        }
+    clauses = []
+    for tag_filter in tag_filters:
+        clauses.append(f"node{tag_filter}(around:{radius},{latitude},{longitude});")
+        clauses.append(f"way{tag_filter}(around:{radius},{latitude},{longitude});")
 
-    radius = radius_meters or DEFAULT_RADIUS_METERS
-    try:
-        radius = int(radius)
-    except (TypeError, ValueError):
-        radius = DEFAULT_RADIUS_METERS
-    radius = max(100, min(radius, MAX_RADIUS_METERS))
+    body = "\n  ".join(clauses)
+    return f"[out:json][timeout:20];\n(\n  {body}\n);\nout center {MAX_RESULTS * 3};"
 
-    category = _resolve_category(query)
-    filters = CATEGORY_FILTERS[category]
 
-    overpass_query = _build_overpass_query(latitude, longitude, radius, filters)
+def _query_overpass(overpass_query: str) -> tuple[dict | None, dict | None]:
+    """
+    NEW (refactor only — behavior identical to the previous inline
+    mirror-fallback loop inside search_nearby_places; extracted so it
+    can be reused for the radius-escalation retry below).
+    """
     headers = {"User-Agent": OVERPASS_USER_AGENT}
-
-    data = None
     last_error: dict[str, Any] | None = None
 
     for mirror_url in OVERPASS_URLS:
@@ -286,8 +302,7 @@ def search_nearby_places(
                 timeout=20,
             )
             response.raise_for_status()
-            data = response.json()
-            break  # success, stop trying further mirrors
+            return response.json(), None
 
         except requests.Timeout:
             logger.warning("Overpass mirror timed out: %s", mirror_url)
@@ -314,15 +329,26 @@ def search_nearby_places(
                 "message": "Unable to search for nearby places right now.",
             }
 
-    if data is None:
-        logger.error("All Overpass mirrors failed for places search")
-        return {"success": False, **(last_error or {
+    return None, (
+        last_error
+        or {
             "error": "places_api_request_failed",
             "message": "Unable to search for nearby places right now.",
-        })}
+        }
+    )
 
-    elements = data.get("elements", [])
 
+def _parse_elements(
+    elements: list[dict],
+    latitude: float,
+    longitude: float,
+    category_label: str,
+) -> list[dict[str, Any]]:
+    """
+    NEW (refactor only — identical parsing/dedup logic to before,
+    extracted so it can run for both the initial query and the
+    radius-escalation retry query).
+    """
     seen_names: set[str] = set()
     results: list[dict[str, Any]] = []
 
@@ -353,27 +379,220 @@ def search_nearby_places(
                 "latitude": place_lat,
                 "longitude": place_lon,
                 "approx_distance_km": round(distance_km, 2),
-                "category": category,
+                "category": category_label,
             }
         )
 
     results.sort(key=lambda place: place["approx_distance_km"])
-    results = results[:MAX_RESULTS]
+    return results[:MAX_RESULTS]
+
+
+@tool
+def search_nearby_places(
+    latitude: float,
+    longitude: float,
+    query: str | None = None,
+    radius_meters: int | None = None,
+    category_hint: str | None = None,
+    place_name: str | None = None,
+) -> dict:
+    """
+    Search for named places (tourist attractions, cafes,
+    restaurants, pharmacies, hotels, banks, parks, malls, temples,
+    petrol pumps/fuel stations, railway/bus stations, etc.) near a
+    given latitude/longitude, using free OpenStreetMap data.
+
+    Call this ONLY after a real latitude/longitude is known —
+    either because the user just provided their current location
+    in response to a get_location request, or because a location
+    was already given earlier in the conversation (e.g. a city the
+    user named).
+
+    Never guess or invent latitude/longitude, and never invent
+    place names — if this returns an empty list, tell the user
+    nothing was found rather than making something up.
+
+    SEMANTIC USAGE (preferred): interpret the user's natural-language
+    request yourself and pass a normalized category_hint — one of:
+        attraction, cafe, restaurant, food, pharmacy, hospital,
+        hotel, bank, atm, park, mall, temple, fuel, station
+    For example "I need somewhere to refuel my bike" ->
+    category_hint="fuel"; "I'm hungry, what's around me?" ->
+    category_hint="food".
+
+    If category_hint is omitted, the query string is matched against
+    a deterministic keyword table as a fallback.
+
+    If NEITHER resolves to a category (e.g. "what's around me?",
+    "what can I find nearby?"), do NOT treat this as a failure —
+    call with both category_hint and query omitted, and a broader
+    multi-category nearby search will be performed automatically.
+
+    SPECIFIC PLACE SEARCH: if the user names one business (e.g.
+    "Find Starbucks near me"), pass place_name="Starbucks" (optionally
+    together with category_hint for precision).
+
+    FOLLOW-UPS: for "another one", "which one is closest?", "show me
+    something else nearby" — reuse the same category_hint/place_name
+    as the previous places search in this conversation (use
+    get_conversation_history if the immediate context doesn't already
+    make it clear), together with the already-known location.
+
+    Distances returned here are straight-line (approximate), only
+    for ranking which places are nearest. If the user wants an
+    actual route distance and travel time to a specific place,
+    follow up with get_distance_bw_2_locations or
+    compare_travel_modes using that place's coordinates.
+
+    Args:
+        latitude: Latitude of the search center, decimal degrees.
+        longitude: Longitude of the search center, decimal degrees.
+        query: What to search for, e.g. "cafes", "restaurants",
+            "pharmacy", "petrol pump", "fuel station", "railway
+            station", "famous spots", "tourist attractions". Used
+            only as a fallback keyword match when category_hint is
+            not given.
+        radius_meters: Search radius in meters. Omit to use a
+            5 km default. Capped at 20 km.
+        category_hint: Optional normalized category — one of the
+            canonical categories listed above. Preferred over query
+            when you already understand the user's intent.
+        place_name: Optional specific business/place name to search
+            for (e.g. "Starbucks"), instead of a generic category.
+    """
+
+    logger.info(
+        "SEARCH_NEARBY_PLACES CALLED | latitude=%s longitude=%s "
+        "query=%s radius_meters=%s category_hint=%s place_name=%s",
+        latitude,
+        longitude,
+        query,
+        radius_meters,
+        category_hint,
+        place_name,
+    )
+
+    coord_error = _validate_coordinates(latitude, longitude)
+    if coord_error:
+        return {
+            "success": False,
+            "error": "invalid_coordinates",
+            "message": coord_error,
+        }
+
+    radius = radius_meters or DEFAULT_RADIUS_METERS
+    try:
+        radius = int(radius)
+    except (TypeError, ValueError):
+        radius = DEFAULT_RADIUS_METERS
+    radius = max(100, min(radius, MAX_RADIUS_METERS))
+
+    place_name = place_name.strip() if place_name else None
+
+    # ------------------------------------------------------------
+    # RESOLVE CATEGORY
+    #   1. category_hint from the LLM's semantic understanding
+    #   2. deterministic keyword fallback (existing KEYWORD_TO_CATEGORY)
+    #   3. None -> broad multi-category fallback below
+    # ------------------------------------------------------------
+
+    resolved_category: str | None = None
+
+    if category_hint and category_hint.strip().lower() in CATEGORY_FILTERS:
+        resolved_category = category_hint.strip().lower()
+    else:
+        resolved_category = _resolve_category(query)
+
+    filters = CATEGORY_FILTERS[resolved_category] if resolved_category else None
+    broad_search = False
+
+    if place_name:
+        overpass_query = _build_named_query(
+            latitude, longitude, radius, place_name, filters
+        )
+        category_label = resolved_category or "named_place"
+
+    elif resolved_category:
+        overpass_query = _build_overpass_query(latitude, longitude, radius, filters)
+        category_label = resolved_category
+
+    else:
+        overpass_query = _build_broad_query(latitude, longitude, radius)
+        category_label = "general"
+        broad_search = True
+
+    data, error = _query_overpass(overpass_query)
+
+    if data is None:
+        logger.error("All Overpass mirrors failed for places search")
+        return {"success": False, **error}
+
+    results = _parse_elements(
+        data.get("elements", []), latitude, longitude, category_label
+    )
+
+    # ------------------------------------------------------------
+    # RADIUS ESCALATION (single step, capped at MAX_RADIUS_METERS)
+    # ------------------------------------------------------------
+
+    radius_expanded = False
+
+    if not results and radius < MAX_RADIUS_METERS:
+        expanded_radius = min(radius * 2, MAX_RADIUS_METERS)
+
+        if expanded_radius > radius:
+            if place_name:
+                retry_query = _build_named_query(
+                    latitude, longitude, expanded_radius, place_name, filters
+                )
+            elif resolved_category:
+                retry_query = _build_overpass_query(
+                    latitude, longitude, expanded_radius, filters
+                )
+            else:
+                retry_query = _build_broad_query(
+                    latitude, longitude, expanded_radius
+                )
+
+            retry_data, _retry_error = _query_overpass(retry_query)
+
+            if retry_data is not None:
+                retry_results = _parse_elements(
+                    retry_data.get("elements", []),
+                    latitude,
+                    longitude,
+                    category_label,
+                )
+                if retry_results:
+                    results = retry_results
+                    radius = expanded_radius
+                    radius_expanded = True
+
+    note = (
+        "approx_distance_km is straight-line distance, for ranking "
+        "only. For actual route distance and travel time to a "
+        "specific place, call get_distance_bw_2_locations or "
+        "compare_travel_modes."
+    )
+
+    if broad_search:
+        note += (
+            " No specific category was identified for this query, so a "
+            "broader nearby search across common categories was "
+            "performed instead of failing."
+        )
 
     return {
         "success": True,
         "latitude": latitude,
         "longitude": longitude,
         "query": query,
-        "category_used": category,
+        "category_used": category_label,
+        "broad_search": broad_search,
         "radius_meters": radius,
+        "radius_expanded": radius_expanded,
         "count": len(results),
         "places": results,
-        "note": (
-            "approx_distance_km is straight-line distance, for ranking "
-            "only. For actual route distance and travel time to a "
-            "specific place, call get_distance_bw_2_locations or "
-            "compare_travel_modes."
-        ),
+        "note": note,
         "provider": "openstreetmap_overpass",
     }

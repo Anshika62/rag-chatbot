@@ -120,9 +120,9 @@ def query_documents_stream(
     conversation_id: str,
     document_id: str | None = None,
     image_paths: list[str] | None = None,
-    latitude: float | None = None,      # NEW
-    longitude: float | None = None,     # NEW
-    address: str | None = None,         
+    latitude: float | None = None,
+    longitude: float | None = None,
+    address: str | None = None,
 ):
     try:
         if not question or not question.strip():
@@ -159,6 +159,60 @@ def query_documents_stream(
             }
             return
 
+        # ====================================================
+        # RESOLVE + PERSIST CONVERSATION LOCATION
+        # ====================================================
+        #
+        # First request:
+        #   frontend sends latitude + longitude
+        #   -> save them in Conversation
+        #
+        # Next request:
+        #   frontend does not send coordinates
+        #   -> load them from Conversation
+        #
+        # Only update the stored location when BOTH coordinates
+        # are available. This prevents partial location updates.
+        # ====================================================
+
+        if latitude is not None and longitude is not None:
+
+            if (
+                conversation.latitude != latitude
+                or conversation.longitude != longitude
+            ):
+                conversation.latitude = latitude
+                conversation.longitude = longitude
+
+                db.add(conversation)
+                db.commit()
+                db.refresh(conversation)
+
+                logger.info(
+                    "Conversation location persisted: "
+                    "conversation_id=%s latitude=%s longitude=%s",
+                    conversation_id,
+                    latitude,
+                    longitude,
+                )
+
+        else:
+
+            latitude = conversation.latitude
+            longitude = conversation.longitude
+
+            logger.info(
+                "Using persisted conversation location: "
+                "conversation_id=%s latitude=%s longitude=%s",
+                conversation_id,
+                latitude,
+                longitude,
+            )
+
+        # ====================================================
+        # GET CHAT HISTORY
+        # ====================================================
+
         previous_messages = get_last_10_messages(
             db=db,
             conversation_id=conversation_id,
@@ -172,6 +226,10 @@ def query_documents_stream(
             for message in previous_messages
         ]
 
+        # ====================================================
+        # START EVENT
+        # ====================================================
+
         yield {
             "event": "start",
             "success": True,
@@ -182,6 +240,10 @@ def query_documents_stream(
             "text_content": "",
             "images": [],
         }
+
+        # ====================================================
+        # SAVE USER MESSAGE
+        # ====================================================
 
         user_message = create_message(
             db=db,
@@ -195,16 +257,6 @@ def query_documents_stream(
 
         # ====================================================
         # STREAM LOOP
-        #
-        # generate_answer_stream() yields structured pieces:
-        #
-        #     {"type": "thinking", "content": "..."}
-        #     {"type": "answer", "content": "..."}
-        #
-        # Thinking pieces are streamed to the frontend but are
-        # never added to full_answer or persisted.
-        #
-        # Only answer pieces are stored as the final response.
         # ====================================================
 
         for piece in generate_answer_stream(
@@ -216,10 +268,9 @@ def query_documents_stream(
             images_output=images_output,
             document_id=document_id,
             image_paths=image_paths,
-            latitude=latitude,        
-            longitude=longitude,      
-            address=address,          
-
+            latitude=latitude,
+            longitude=longitude,
+            address=address,
         ):
             if not piece:
                 continue
@@ -229,6 +280,10 @@ def query_documents_stream(
 
             if not piece_content:
                 continue
+
+            # ====================================================
+            # THINKING
+            # ====================================================
 
             if piece_type == "thinking":
 
@@ -245,16 +300,9 @@ def query_documents_stream(
 
                 continue
 
-            # ================================================
+            # ====================================================
             # LOCATION REQUEST
-            #
-            # get_location was called by the agent. This is not
-            # normal answer text streaming — it's a one-shot
-            # signal telling the frontend to show a location-
-            # selection UI. Still accumulated into full_answer
-            # so the usual persist/"done" flow below saves it as
-            # the assistant's message, same as any other turn.
-            # ================================================
+            # ====================================================
 
             if piece_type == "location_request":
 
@@ -277,19 +325,12 @@ def query_documents_stream(
 
                 continue
 
-            # ================================================
+            # ====================================================
             # MAP LOCATION
-            #
-            # find_location_on_map found coordinates for a
-            # single named place. Sent as its own dedicated
-            # SSE event carrying lat/long/name so the frontend
-            # can render a map pin. Not accumulated into
-            # full_answer — the LLM's own text answer (which
-            # streams separately as normal "delta" events)
-            # already covers the visible chat reply.
-            # ================================================
+            # ====================================================
 
             if piece_type == "map_location":
+
                 yield {
                     "event": "map_location",
                     "success": True,
@@ -303,10 +344,13 @@ def query_documents_stream(
                     "longitude": piece.get("longitude"),
                     "name": piece.get("name"),
                     "address": piece.get("address"),
-                    
                 }
 
                 continue
+
+            # ====================================================
+            # NORMAL ANSWER DELTA
+            # ====================================================
 
             full_answer += piece_content
 
@@ -321,9 +365,6 @@ def query_documents_stream(
                 "images": [],
             }
 
-
-            
-
         # ====================================================
         # FINAL ANSWER CLEANUP
         # ====================================================
@@ -334,8 +375,6 @@ def query_documents_stream(
 
         else:
 
-            # Remove accidental leading/trailing whitespace from
-            # the final answer before persisting it.
             full_answer = full_answer.strip()
 
         # ====================================================
@@ -351,12 +390,7 @@ def query_documents_stream(
         )
 
         # ====================================================
-        # EXISTING DONE EVENT
-        #
-        # IMPORTANT:
-        # Keep this event before suggestion generation.
-        # This means the frontend receives the completed answer
-        # before we start sending suggestions.
+        # DONE EVENT
         # ====================================================
 
         yield {
@@ -372,13 +406,6 @@ def query_documents_stream(
 
         # ====================================================
         # GENERATE FOLLOW-UP SUGGESTIONS
-        #
-        # IMPORTANT:
-        # This happens AFTER the done event.
-        #
-        # Suggestion generation is an optional enhancement.
-        # If it fails, the already completed answer remains
-        # successful and no error event is sent.
         # ====================================================
 
         try:
@@ -420,13 +447,10 @@ def query_documents_stream(
                 user_id,
             )
 
-            # Do NOT send an error event here.
-            #
-            # The answer was already completed successfully.
-            # Suggestion failure must not make the chat request
-            # appear to have failed.
+            # Suggestion failure must not fail the completed answer.
 
     except HTTPException as exc:
+
         logger.exception(
             "QUERY STREAM HTTP ERROR: "
             "conversation_id=%s user_id=%s",
@@ -446,6 +470,7 @@ def query_documents_stream(
         }
 
     except Exception as exc:
+
         logger.exception(
             "QUERY STREAM ERROR: "
             "conversation_id=%s user_id=%s error=%s",
