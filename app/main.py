@@ -1,21 +1,16 @@
 import logging
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
 from app.api.routes import router
 from app.core.response import setup_exception_handlers
-
-from fastapi.middleware.cors import CORSMiddleware
 
 
 # ============================================================
 # LOGGING
-#
-# Without this, the root logger has no handler attached, so
-# every logger.info/warning/exception(...) call across the app
-# (doc_service, rag_service, image_tool, search_kb, etc.) is
-# silently dropped — nothing shows up in the terminal, even for
-# real failures. This just wires up a basic handler; it doesn't
-# touch any of the actual logger.* call sites.
 # ============================================================
 
 logging.basicConfig(
@@ -23,14 +18,45 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
+
 app = FastAPI()
 
+
+# ============================================================
+# GENERATED IMAGES
+#
+# Generated images are stored by image_generation_tool.py
+# inside ./generated-images.
+#
+# This exposes them through:
+# /generated-images/<filename>
+#
+# Example:
+# /generated-images/abc123.png
+# ============================================================
+
+GENERATED_IMAGE_DIR = Path("generated-images")
+GENERATED_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+app.mount(
+    "/generated-images",
+    StaticFiles(directory=GENERATED_IMAGE_DIR),
+    name="generated-images",
+)
+
+
+# ============================================================
+# CORS
+# ============================================================
+
 origins = [
-    "http://localhost:3000",   # React/Next frontend
-    "http://localhost:5173",   # Vite frontend
-    "https://your-frontend-domain.com",  # deployed frontend
-    "https://chat-bot-three-topaz.vercel.app"
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "https://your-frontend-domain.com",
+    "https://chat-bot-three-topaz.vercel.app",
+    "https://chat-bot.bhawsarvinayak55.workers.dev/",
 ]
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,6 +67,15 @@ app.add_middleware(
 )
 
 
+# ============================================================
+# EXCEPTION HANDLERS
+# ============================================================
+
 setup_exception_handlers(app)
+
+
+# ============================================================
+# API ROUTES
+# ============================================================
 
 app.include_router(router)
