@@ -12,7 +12,6 @@ from app.service.tools.conversation_tool import (
     create_conversation_tools,
 )
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -59,6 +58,74 @@ llm = ChatOpenRouter(
     api_key=OPENROUTER_API_KEY,
     max_retries=2,
 )
+
+
+# ============================================================
+# MULTI-ROUND TOOL CALLING
+# ============================================================
+#
+# Some tasks require a SEQUENCE of tool calls where the second
+# tool depends on the result of the first (e.g. resolve a place's
+# coordinates with find_location_on_map, THEN call
+# get_distance_bw_2_locations with those coordinates). A single
+# request/response pass can only execute one round of tool calls,
+# so without a loop the model is only ever able to run the FIRST
+# step and then has no way to run the second step — it can only
+# describe it in prose instead of executing it.
+#
+# MAX_TOOL_ITERATIONS bounds how many such rounds are allowed per
+# user turn, so a misbehaving tool-call loop can never run forever.
+# ============================================================
+
+MAX_TOOL_ITERATIONS = int(
+    os.getenv(
+        "MAX_TOOL_ITERATIONS",
+        "4",
+    )
+)
+
+
+# ============================================================
+# TOOLLESS FAST PATH
+# ============================================================
+#
+# Binding ~11 tool schemas plus the full SYSTEM_PROMPT to every
+# single request adds real prompt-processing latency and also
+# requires building tool objects (_create_tools) before the LLM
+# is even called - overhead a bare greeting or acknowledgement
+# ("hi", "ok", "thanks", "bye") never needed in the first place,
+# since the model can answer those directly from general
+# knowledge with no tool access at all.
+#
+# Detection is deliberately based on LENGTH, not a keyword list:
+# a single-word message with no "?" is treated as too short to be
+# a real request. This covers "hi"/"hii"/"heyy"/"thanks"/"ok"/
+# "bye"/"gm" etc. regardless of exact wording or language, without
+# needing to enumerate them.
+#
+# TRADE-OFF: a genuine single-word, non-question request (e.g.
+# "weather") will also take this fast path and will NOT get tool
+# access. This is intentionally conservative (single word only,
+# not two words) precisely because skipping tools is riskier than
+# skipping the suggestions call. If this trade-off is not
+# acceptable, remove or tighten this fast path rather than trying
+# to special-case individual words.
+# ============================================================
+
+
+def _is_toolless_fast_path(
+    question: str,
+) -> bool:
+
+    if not question:
+        return False
+
+    words = question.strip().split()
+
+    return (
+        len(words) <= 1
+        and "?" not in question
+    )
 
 
 # ============================================================
@@ -408,6 +475,25 @@ You have access to:
 11. Find location on map tool
 12. Distance-between-two-locations tool
 13. Compare-travel-modes tool
+
+TOOL EXECUTION RULE:
+
+- You are allowed to call tools across multiple turns in the
+  same response cycle. If a task requires information from one
+  tool before another tool can be called (for example: resolving
+  a place's coordinates with find_location_on_map before calling
+  get_distance_bw_2_locations or compare_travel_modes with those
+  coordinates), call the first tool now. You will be given its
+  result and another opportunity to call the next tool
+  immediately after, in the same response cycle — you do not
+  need to ask the user for permission first.
+
+- Never describe a multi-step plan in your answer instead of
+  executing it. If you already have everything you need to call
+  the next tool, call it directly instead of explaining what you
+  are about to do. Only ask the user a question when the tool
+  results genuinely leave the request ambiguous (for example,
+  multiple different places matching the same name).
 
 RULES:
 
@@ -1101,12 +1187,12 @@ def _execute_tool_calls(
 # since tool output usually needs to be synthesized into a
 # clean final answer.
 #
-# EXCEPTION: if the ONLY tool call this turn is "get_location",
-# there is no real data to reason over yet — the model is just
-# asking the frontend for the user's coordinates. Sending that
-# to the reasoning model wastes a call and is a likely source
-# of "REASONING EMPTY RESULT" (nothing meaningful to summarize).
-# In that case we skip reasoning entirely.
+# EXCEPTION: if the ONLY tool call across all rounds this turn is
+# "get_location", there is no real data to reason over yet — the
+# model is just asking the frontend for the user's coordinates.
+# Sending that to the reasoning model wastes a call and is a
+# likely source of "REASONING EMPTY RESULT" (nothing meaningful
+# to summarize). In that case we skip reasoning entirely.
 #
 # Every OTHER location-related tool (search_nearby_places,
 # get_distance_bw_2_locations, compare_travel_modes,
@@ -1459,6 +1545,33 @@ def generate_answer(
             address=address,
         )
 
+        # ========================================================
+        # TOOLLESS FAST PATH
+        #
+        # Skip tool creation/binding entirely for bare greetings
+        # and acknowledgements - see _is_toolless_fast_path() above
+        # for the exact rule and its trade-off.
+        # ========================================================
+
+        if _is_toolless_fast_path(
+            question
+        ):
+
+            logger.info(
+                "TOOLLESS FAST PATH: "
+                "conversation_id=%s question=%s",
+                conversation_id,
+                question,
+            )
+
+            fast_response = llm.invoke(
+                messages
+            )
+
+            return _strip_thinking(
+                fast_response.content
+            )
+
         tools = _create_tools(
             db=db,
             user_id=user_id,
@@ -1471,51 +1584,123 @@ def generate_answer(
             tools
         )
 
-        response = llm_with_tools.invoke(
-            messages
-        )
+        # ========================================================
+        # MULTI-ROUND TOOL CALLING LOOP
+        #
+        # Runs up to MAX_TOOL_ITERATIONS rounds so that a task
+        # requiring a chain of tool calls (e.g. find_location_on_map
+        # -> get_distance_bw_2_locations) can actually complete,
+        # instead of the model only ever getting to run the first
+        # tool and then being forced to describe the remaining
+        # steps in prose. If the model responds with no further
+        # tool_calls in any round, that round's response is treated
+        # as final (same behavior as before for the single-round
+        # case).
+        # ========================================================
 
-        if not response.tool_calls:
+        current_messages = list(messages)
+
+        all_tool_messages = []
+
+        all_tool_calls = []
+
+        response = None
+
+        for _iteration in range(MAX_TOOL_ITERATIONS):
+
+            try:
+
+                response = llm_with_tools.invoke(
+                    current_messages
+                )
+
+            except Exception:
+
+                # ----------------------------------------------------
+                # A later round (after we already have at least one
+                # round of real tool results, e.g. a web search) can
+                # fail/timeout because the tool result made the
+                # request too large/slow for the provider. Rather
+                # than losing the tool data we already fetched, fall
+                # back to answering with what we have. If this is
+                # the VERY FIRST round (no tool results yet at all),
+                # there is nothing useful to fall back to, so the
+                # original behavior (raise, handled by the outer
+                # except block below) is preserved.
+                # ----------------------------------------------------
+
+                if all_tool_calls:
+
+                    logger.exception(
+                        "TOOL ROUND FAILED (iteration=%s), "
+                        "falling back to results gathered so far: "
+                        "conversation_id=%s",
+                        _iteration,
+                        conversation_id,
+                    )
+
+                    break
+
+                raise
+
+            if not response.tool_calls:
+                break
+
+            logger.info(
+                "LLM TOOL CALLS: tools=%s "
+                "conversation_id=%s",
+                [
+                    tool_call["name"]
+                    for tool_call in response.tool_calls
+                ],
+                conversation_id,
+            )
+
+            all_tool_calls.extend(
+                response.tool_calls
+            )
+
+            (
+                extra_messages,
+                collected_images,
+                _location_request,
+                _map_location,
+            ) = _execute_tool_calls(
+                tools=tools,
+                tool_calls=response.tool_calls,
+                conversation_id=conversation_id,
+                known_latitude=latitude,
+                known_longitude=longitude,
+            )
+
+            if images_output is not None:
+
+                images_output.extend(
+                    collected_images
+                )
+
+            round_messages = (
+                [response] + extra_messages
+            )
+
+            all_tool_messages.extend(
+                round_messages
+            )
+
+            current_messages = (
+                current_messages + round_messages
+            )
+
+        if response is None:
+
+            raise RuntimeError(
+                "Unable to obtain a response from the LLM"
+            )
+
+        if not all_tool_calls:
 
             return _strip_thinking(
                 response.content
-            )
-
-        logger.info(
-            "LLM TOOL CALLS: tools=%s "
-            "conversation_id=%s",
-            [
-                tool_call["name"]
-                for tool_call in response.tool_calls
-            ],
-            conversation_id,
-        )
-
-        tool_messages = [
-            response
-        ]
-
-        (
-            extra_messages,
-            collected_images,
-            _location_request,
-            _map_location,
-        ) = _execute_tool_calls(
-            tools=tools,
-            tool_calls=response.tool_calls,
-            conversation_id=conversation_id,
-            known_latitude=latitude,
-            known_longitude=longitude,
-        )
-
-        tool_messages.extend(
-            extra_messages
-        )
-
-        if images_output is not None:
-
-            images_output.extend(
-                collected_images
             )
 
         # ========================================================
@@ -1523,9 +1708,9 @@ def generate_answer(
         # ========================================================
 
         if _should_use_reasoning(
-            tool_calls=response.tool_calls,
-            collected_images=collected_images,
-            extra_messages=extra_messages,
+            tool_calls=all_tool_calls,
+            collected_images=[],
+            extra_messages=all_tool_messages,
             conversation_id=conversation_id,
         ):
 
@@ -1541,7 +1726,7 @@ def generate_answer(
                 reasoning_messages = (
                     _build_reasoning_messages(
                         base_messages=messages,
-                        tool_messages=tool_messages,
+                        tool_messages=all_tool_messages,
                     )
                 )
 
@@ -1576,7 +1761,7 @@ def generate_answer(
         # ========================================================
 
         final_response = llm.invoke(
-            messages + tool_messages
+            messages + all_tool_messages
         )
 
         return _strip_thinking(
@@ -1713,6 +1898,44 @@ def generate_answer_stream(
             address=address,
         )
 
+        # ========================================================
+        # TOOLLESS FAST PATH
+        #
+        # Skip tool creation/binding entirely for bare greetings
+        # and acknowledgements - see _is_toolless_fast_path() above
+        # for the exact rule and its trade-off.
+        # ========================================================
+
+        if _is_toolless_fast_path(
+            question
+        ):
+
+            logger.info(
+                "TOOLLESS FAST PATH: "
+                "conversation_id=%s question=%s",
+                conversation_id,
+                question,
+            )
+
+            for chunk in llm.stream(
+                messages
+            ):
+
+                content = getattr(
+                    chunk,
+                    "content",
+                    None,
+                )
+
+                if content:
+
+                    yield {
+                        "type": "answer",
+                        "content": content,
+                    }
+
+            return
+
         tools = _create_tools(
             db=db,
             user_id=user_id,
@@ -1735,204 +1958,280 @@ def generate_answer_stream(
             ],
         )
 
-        streamed_chunks = []
-
-        tool_call_chunks = []
-
         # ========================================================
-        # FIRST LLM STREAM
+        # MULTI-ROUND TOOL CALLING LOOP (STREAMING)
+        #
+        # Same reasoning as generate_answer() above: without this
+        # loop, a chained task like "find place -> then calculate
+        # distance to it" could only ever execute the FIRST tool
+        # call and then had no way to run the second one, so the
+        # model was forced to explain the remaining steps in prose
+        # instead of actually doing them.
+        #
+        # Each round streams the model's response, parses any tool
+        # calls, executes them, and (if there are more tool calls)
+        # feeds the results back in for another round. If a round
+        # produces no tool calls, that round's streamed content is
+        # the final answer and is streamed straight to the caller
+        # exactly like the original NO TOOLS case.
         # ========================================================
 
-        for chunk in llm_with_tools.stream(
-            messages
-        ):
+        current_messages = list(messages)
 
-            streamed_chunks.append(
-                chunk
+        all_tool_messages = []
+
+        all_tool_calls = []
+
+        for _iteration in range(MAX_TOOL_ITERATIONS):
+
+            streamed_chunks = []
+
+            tool_call_chunks = []
+
+            round_failed = False
+
+            try:
+
+                for chunk in llm_with_tools.stream(
+                    current_messages
+                ):
+
+                    streamed_chunks.append(
+                        chunk
+                    )
+
+                    current_tool_chunks = getattr(
+                        chunk,
+                        "tool_call_chunks",
+                        None,
+                    )
+
+                    if current_tool_chunks:
+
+                        tool_call_chunks.extend(
+                            current_tool_chunks
+                        )
+
+            except Exception:
+
+                # ----------------------------------------------------
+                # Same reasoning as the non-streaming version above:
+                # a later round can time out (e.g. a large web-search
+                # tool result makes the next request too slow for the
+                # provider). If we already have at least one round of
+                # real tool results, don't lose that data - fall back
+                # to answering with what was already gathered instead
+                # of failing the whole response. If this is the very
+                # first round (nothing gathered yet), preserve the
+                # original behavior and let the outer except handle
+                # it.
+                # ----------------------------------------------------
+
+                if all_tool_calls:
+
+                    logger.exception(
+                        "STREAM TOOL ROUND FAILED (iteration=%s), "
+                        "falling back to results gathered so far: "
+                        "conversation_id=%s",
+                        _iteration,
+                        conversation_id,
+                    )
+
+                    round_failed = True
+
+                else:
+
+                    raise
+
+            if round_failed:
+                break
+
+            tool_calls = _parse_tool_calls(
+                tool_call_chunks
             )
 
-            current_tool_chunks = getattr(
-                chunk,
-                "tool_call_chunks",
-                None,
+            # ====================================================
+            # NO (MORE) TOOLS -> stream this round as the final
+            # answer, exactly like the original single-round
+            # NO TOOLS case.
+            # ====================================================
+
+            if not tool_calls:
+
+                for chunk in streamed_chunks:
+
+                    content = getattr(
+                        chunk,
+                        "content",
+                        None,
+                    )
+
+                    if content:
+
+                        yield {
+                            "type": "answer",
+                            "content": content,
+                        }
+
+                return
+
+            # ====================================================
+            # TOOLS DETECTED THIS ROUND
+            # ====================================================
+
+            logger.info(
+                "STREAM TOOL CALLS: tools=%s "
+                "conversation_id=%s",
+                [
+                    tool_call["name"]
+                    for tool_call in tool_calls
+                ],
+                conversation_id,
             )
 
-            if current_tool_chunks:
+            all_tool_calls.extend(
+                tool_calls
+            )
 
-                tool_call_chunks.extend(
-                    current_tool_chunks
-                )
+            # ====================================================
+            # RECONSTRUCT AI TOOL RESPONSE FOR THIS ROUND
+            # ====================================================
 
-        tool_calls = _parse_tool_calls(
-            tool_call_chunks
-        )
-
-        # ========================================================
-        # NO TOOLS
-        # ========================================================
-
-        if not tool_calls:
+            full_ai_response = None
 
             for chunk in streamed_chunks:
 
-                content = getattr(
-                    chunk,
-                    "content",
-                    None,
-                )
+                if full_ai_response is None:
 
-                if content:
+                    full_ai_response = chunk
 
-                    yield {
-                        "type": "answer",
-                        "content": content,
-                    }
+                else:
 
-            return
-
-        # ========================================================
-        # TOOLS DETECTED
-        # ========================================================
-
-        logger.info(
-            "STREAM TOOL CALLS: tools=%s "
-            "conversation_id=%s",
-            [
-                tool_call["name"]
-                for tool_call in tool_calls
-            ],
-            conversation_id,
-        )
-
-        # ========================================================
-        # RECONSTRUCT AI TOOL RESPONSE
-        # ========================================================
-
-        full_ai_response = None
-
-        for chunk in streamed_chunks:
+                    full_ai_response = (
+                        full_ai_response + chunk
+                    )
 
             if full_ai_response is None:
 
-                full_ai_response = chunk
-
-            else:
-
-                full_ai_response = (
-                    full_ai_response + chunk
+                raise RuntimeError(
+                    "Unable to reconstruct "
+                    "tool-call response"
                 )
 
-        if full_ai_response is None:
+            round_messages = [
+                full_ai_response
+            ]
 
-            raise RuntimeError(
-                "Unable to reconstruct "
-                "tool-call response"
+            # ====================================================
+            # EXECUTE TOOLS FOR THIS ROUND
+            # ====================================================
+
+            (
+                extra_messages,
+                collected_images,
+                location_request,
+                map_location,
+            ) = _execute_tool_calls(
+                tools=tools,
+                tool_calls=tool_calls,
+                conversation_id=conversation_id,
+                log_prefix="STREAM ",
+                known_latitude=latitude,
+                known_longitude=longitude,
             )
 
-        tool_messages = [
-            full_ai_response
-        ]
-
-        # ========================================================
-        # EXECUTE TOOLS
-        # ========================================================
-
-        (
-            extra_messages,
-            collected_images,
-            location_request,
-            map_location,
-        ) = _execute_tool_calls(
-            tools=tools,
-            tool_calls=tool_calls,
-            conversation_id=conversation_id,
-            log_prefix="STREAM ",
-            known_latitude=latitude,
-            known_longitude=longitude,
-        )
-
-        tool_messages.extend(
-            extra_messages
-        )
-
-        if images_output is not None:
-
-            images_output.extend(
-                collected_images
+            round_messages.extend(
+                extra_messages
             )
 
-        # ========================================================
-        # LOCATION REQUEST
-        # ========================================================
+            if images_output is not None:
 
-        if location_request is not None:
+                images_output.extend(
+                    collected_images
+                )
 
-            logger.info(
-                "LOCATION REQUESTED: "
-                "conversation_id=%s",
-                conversation_id,
+            # ====================================================
+            # LOCATION REQUEST -> stop immediately, same as before
+            # ====================================================
+
+            if location_request is not None:
+
+                logger.info(
+                    "LOCATION REQUESTED: "
+                    "conversation_id=%s",
+                    conversation_id,
+                )
+
+                yield {
+                    "type": "location_request",
+                    "content": (
+                        "I need your location to help "
+                        "with that. Please share it "
+                        "using the location picker."
+                    ),
+                    "methods": location_request.get(
+                        "methods",
+                        [
+                            "current_location",
+                            "search",
+                            "map",
+                        ],
+                    ),
+                }
+
+                return
+
+            # ====================================================
+            # MAP LOCATION -> emit event, then continue looping so
+            # a follow-up tool (e.g. get_distance_bw_2_locations)
+            # can still run using the coordinates just resolved.
+            # ====================================================
+
+            if map_location is not None:
+
+                logger.info(
+                    "MAP LOCATION FOUND: "
+                    "conversation_id=%s",
+                    conversation_id,
+                )
+
+                yield {
+                    "type": "map_location",
+                    "content": (
+                        f"Showing "
+                        f"{map_location.get('name')} "
+                        "on the map."
+                    ),
+                    "latitude": map_location.get(
+                        "latitude"
+                    ),
+                    "longitude": map_location.get(
+                        "longitude"
+                    ),
+                    "name": map_location.get(
+                        "name"
+                    ),
+                    "address": map_location.get(
+                        "address"
+                    ),
+                }
+
+            all_tool_messages.extend(
+                round_messages
             )
 
-            yield {
-                "type": "location_request",
-                "content": (
-                    "I need your location to help "
-                    "with that. Please share it "
-                    "using the location picker."
-                ),
-                "methods": location_request.get(
-                    "methods",
-                    [
-                        "current_location",
-                        "search",
-                        "map",
-                    ],
-                ),
-            }
-
-            return
-
-        # ========================================================
-        # MAP LOCATION
-        # ========================================================
-
-        if map_location is not None:
-
-            logger.info(
-                "MAP LOCATION FOUND: "
-                "conversation_id=%s",
-                conversation_id,
+            current_messages = (
+                current_messages + round_messages
             )
-
-            yield {
-                "type": "map_location",
-                "content": (
-                    f"Showing "
-                    f"{map_location.get('name')} "
-                    "on the map."
-                ),
-                "latitude": map_location.get(
-                    "latitude"
-                ),
-                "longitude": map_location.get(
-                    "longitude"
-                ),
-                "name": map_location.get(
-                    "name"
-                ),
-                "address": map_location.get(
-                    "address"
-                ),
-            }
 
         # ========================================================
         # REASONING
         # ========================================================
 
         use_reasoning = _should_use_reasoning(
-            tool_calls=tool_calls,
-            collected_images=collected_images,
-            extra_messages=extra_messages,
+            tool_calls=all_tool_calls,
+            collected_images=[],
+            extra_messages=all_tool_messages,
             conversation_id=conversation_id,
         )
 
@@ -1984,7 +2283,7 @@ def generate_answer_stream(
                 }
 
                 stage_message = _build_stage_message(
-                    tool_calls
+                    all_tool_calls
                 )
 
                 if stage_message:
@@ -2005,7 +2304,7 @@ def generate_answer_stream(
                 reasoning_messages = (
                     _build_reasoning_messages(
                         base_messages=messages,
-                        tool_messages=tool_messages,
+                        tool_messages=all_tool_messages,
                     )
                 )
 
@@ -2100,7 +2399,7 @@ def generate_answer_stream(
         # ========================================================
 
         final_messages = (
-            messages + tool_messages
+            messages + all_tool_messages
         )
 
         for chunk in llm.stream(
