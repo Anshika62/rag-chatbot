@@ -12,9 +12,11 @@ from app.service.tools.distance_tool import (
     get_distance_bw_2_locations,
     compare_travel_modes,
 )
+
 from app.service.tools.search_kb import (
     create_search_knowledge_base_tool,
 )
+
 from app.service.tools.geocode_tool import (
     find_location_on_map,
 )
@@ -32,9 +34,14 @@ from app.service.tools.image_tool import (
     create_document_image_analysis_tool,
 )
 
+from app.service.tools.image_generation_tool import (
+    generate_image,
+)
+
 from app.service.tools.location_tool import (
     get_location,
 )
+
 from app.service.tools.tavily_tool import (
     tavily_web_search,
 )
@@ -75,9 +82,9 @@ def create_conversation_tools(
 
     3. analyze_document_image
        -> Vision analysis of a SPECIFIC image previously extracted
-          from an uploaded document/PDF, identified by document_id
-          (as returned by search_knowledge_base). Always available,
-          since it looks up images already stored for this user.
+          from an uploaded document/PDF, identified by document_id.
+          Always available because it looks up images already stored
+          for this user.
 
     4. get_current_datetime
        -> Current date and time.
@@ -87,12 +94,29 @@ def create_conversation_tools(
 
     6. get_location
        -> Requests the user's current location by triggering a
-          location-selection UI on the frontend. Does not return
-          real coordinates itself (see location_tool.py).
+          location-selection UI on the frontend.
 
-    7. analyze_image (only when image_paths is provided)
-       -> Vision analysis of image(s) attached directly to the
-          CURRENT chat message.
+    7. tavily_web_search
+       -> General/current external web search.
+
+    8. get_distance_bw_2_locations
+       -> Distance/travel time between two coordinates.
+
+    9. compare_travel_modes
+       -> Compare supported travel modes.
+
+    10. search_nearby_places
+        -> Search for physical nearby places/POIs.
+
+    11. find_location_on_map
+        -> Resolve a specific named place to coordinates.
+
+    12. generate_image
+        -> Generate a NEW image from a text prompt.
+
+    13. analyze_image
+        -> Analyze image(s) attached directly to the CURRENT
+           chat message.
     """
 
     user_id = str(user_id)
@@ -104,7 +128,6 @@ def create_conversation_tools(
     )
 
     if document_id:
-
         document_id = str(document_id)
 
     # ========================================================
@@ -124,7 +147,6 @@ def create_conversation_tools(
         """
 
         if conversation_id is None:
-
             return (
                 "No conversation ID is available, so previous "
                 "conversation history cannot be retrieved."
@@ -136,7 +158,6 @@ def create_conversation_tools(
         )
 
         if not messages:
-
             return (
                 "No previous conversation history found."
             )
@@ -161,9 +182,8 @@ def create_conversation_tools(
     # ========================================================
     # DOCUMENT IMAGE ANALYSIS TOOL
     #
-    # Unlike analyze_image (below), this is always available —
-    # it looks up a previously-uploaded image by document_id
-    # rather than depending on an image attached to THIS message.
+    # Always available because it looks up previously uploaded
+    # document images using the document information.
     # ========================================================
 
     analyze_document_image = (
@@ -174,26 +194,42 @@ def create_conversation_tools(
     )
 
     # ========================================================
-    # RETURN ALL TOOLS
+    # BASE TOOLS
     # ========================================================
 
     tools = [
+        # Conversation / RAG
         get_conversation_history,
         search_knowledge_base,
         analyze_document_image,
+
+        # General utilities
         get_current_datetime,
         get_weather,
+
+        # Location
         get_location,
+
+        # Web
         tavily_web_search,
+
+        # Distance / travel
         get_distance_bw_2_locations,
-        compare_travel_modes, 
+        compare_travel_modes,
+
+        # Places / maps
         search_nearby_places,
         find_location_on_map,
 
+        # NEW: Image generation
+        generate_image,
     ]
 
     # ========================================================
-    # IMAGE ANALYSIS TOOL
+    # DIRECT IMAGE ANALYSIS TOOL
+    #
+    # This is ONLY for images attached to the current message.
+    # Do not confuse this with generate_image.
     # ========================================================
 
     valid_image_paths = [
@@ -203,7 +239,6 @@ def create_conversation_tools(
     ]
 
     if valid_image_paths:
-
         tools.append(
             create_image_tool(
                 image_paths=valid_image_paths,
