@@ -15,6 +15,11 @@ from app.service.external.llm_service import (
     generate_suggestions,
 )
 
+from app.service.location.conversation_location_store import (
+    set_conversation_location,
+    get_conversation_location,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -160,54 +165,87 @@ def query_documents_stream(
             return
 
         # ====================================================
-        # RESOLVE + PERSIST CONVERSATION LOCATION
+        # RESOLVE CONVERSATION LOCATION
         # ====================================================
+        #
+        # Location is NOT persisted in the database.
         #
         # First request:
         #   frontend sends latitude + longitude
-        #   -> save them in Conversation
+        #       ↓
+        #   temporarily store for this conversation
         #
         # Next request:
         #   frontend does not send coordinates
-        #   -> load them from Conversation
+        #       ↓
+        #   load them from temporary conversation storage
         #
-        # Only update the stored location when BOTH coordinates
-        # are available. This prevents partial location updates.
+        # Only a complete latitude + longitude pair is stored.
         # ====================================================
 
         if latitude is not None and longitude is not None:
 
-            if (
-                conversation.latitude != latitude
-                or conversation.longitude != longitude
-            ):
-                conversation.latitude = latitude
-                conversation.longitude = longitude
+            # Frontend provided a new location.
+            #
+            # Store it temporarily for this conversation.
+            # This also refreshes the TTL.
+            set_conversation_location(
+                conversation_id=conversation_id,
+                latitude=latitude,
+                longitude=longitude,
+                address=address,
+            )
 
-                db.add(conversation)
-                db.commit()
-                db.refresh(conversation)
+            logger.info(
+                "Conversation location stored temporarily: "
+                "conversation_id=%s latitude=%s longitude=%s",
+                conversation_id,
+                latitude,
+                longitude,
+            )
+
+        else:
+
+            # Frontend did not provide coordinates.
+            #
+            # Try to retrieve the previously supplied location
+            # from temporary conversation storage.
+            stored_location = get_conversation_location(
+                conversation_id=conversation_id,
+            )
+
+            if stored_location:
+
+                latitude = stored_location.get("latitude")
+                longitude = stored_location.get("longitude")
+
+                # Use stored address only when the current request
+                # did not provide one.
+                if not address:
+                    address = stored_location.get("address")
 
                 logger.info(
-                    "Conversation location persisted: "
+                    "Using temporary conversation location: "
                     "conversation_id=%s latitude=%s longitude=%s",
                     conversation_id,
                     latitude,
                     longitude,
                 )
 
-        else:
+            else:
 
-            latitude = conversation.latitude
-            longitude = conversation.longitude
+                # No location has been provided for this conversation.
+                #
+                # Keep latitude/longitude as None so the existing
+                # LLM location-request flow can work normally.
+                latitude = None
+                longitude = None
 
-            logger.info(
-                "Using persisted conversation location: "
-                "conversation_id=%s latitude=%s longitude=%s",
-                conversation_id,
-                latitude,
-                longitude,
-            )
+                logger.info(
+                    "No temporary conversation location found: "
+                    "conversation_id=%s",
+                    conversation_id,
+                )
 
         # ====================================================
         # GET CHAT HISTORY
@@ -319,7 +357,11 @@ def query_documents_stream(
                     "images": [],
                     "methods": piece.get(
                         "methods",
-                        ["current_location", "search", "map"],
+                        [
+                            "current_location",
+                            "search",
+                            "map",
+                        ],
                     ),
                 }
 
@@ -408,8 +450,7 @@ def query_documents_stream(
         # GENERATE FOLLOW-UP SUGGESTIONS
         #
         # Always generated, for every message - including bare
-        # greetings like "hi" - per explicit request. No skip
-        # condition here anymore.
+        # greetings like "hi" - per existing behavior.
         # ====================================================
 
         try:
