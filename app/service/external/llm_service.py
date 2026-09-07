@@ -598,6 +598,19 @@ LOCATION:
   supplied by the frontend before treating the location as
   known.
 
+- Location persists for the rest of THIS conversation. Once the
+  User Location section shows the user's location as ALREADY
+  KNOWN (whether it was known from the start or the user shared
+  it earlier in this same conversation), treat it as valid for
+  every later question in this conversation too — including
+  questions unrelated to the message where location was first
+  shared. Do NOT call get_location again in this conversation
+  just because the current question is a new/different query;
+  only call get_location again if the User Location section
+  explicitly says it is NOT known, or if the user explicitly
+  asks to search near a different place or update their
+  location.
+
 MAP (find_location_on_map):
 
 - Use find_location_on_map ONLY when the user names ONE
@@ -654,6 +667,24 @@ DISTANCE / TRAVEL (get_distance_bw_2_locations, compare_travel_modes):
   guessing a number yourself.
 
 PLACES (search_nearby_places):
+
+- For nearby-place searches, understand the user's intent
+  semantically and map it to exactly ONE canonical category from
+  the allowed list: attraction, cafe, restaurant, food, pharmacy,
+  hospital, hotel, bank, atm, park, mall, temple, fuel, station.
+  Do not invent categories or aliases outside this list — always
+  convert natural language into the closest canonical category.
+  Examples: "petrol pump" / "gas station" / "refuel my bike" ->
+  fuel; "coffee shop" -> cafe; "medicine shop" -> pharmacy;
+  "place to eat" -> food.
+
+- If the user names a specific place/business, use place_name
+  and optionally category_hint together for precision.
+
+- If no category can be confidently determined, leave
+  category_hint empty (and do not force a guess) — the tool's
+  broad multi-category search fallback will handle it instead of
+  failing.
 
 - search_nearby_places accepts category_hint and place_name in
   addition to query. Prefer these over relying on exact wording:
@@ -2051,29 +2082,56 @@ def generate_answer_stream(
             )
 
             # ====================================================
-            # NO (MORE) TOOLS -> stream this round as the final
-            # answer, exactly like the original single-round
-            # NO TOOLS case.
+            # NO (MORE) TOOLS THIS ROUND
+            #
+            # Two different situations land here, and they must be
+            # handled differently:
+            #
+            #   1. No tool was ever called this whole turn (this is
+            #      round 0 and all_tool_calls is still empty) ->
+            #      there is nothing to reason over, this round's
+            #      streamed content IS the final answer. Stream it
+            #      straight through, exactly like the original
+            #      single-round NO TOOLS case.
+            #
+            #   2. Tool(s) WERE called in an earlier round this turn
+            #      (all_tool_calls is non-empty), and the model has
+            #      now stopped calling tools and started producing a
+            #      plain-text reply based on those results. THIS
+            #      round's raw streamed text must be discarded (not
+            #      shown to the user) and control must fall through
+            #      to the REASONING block below, so the retrieved
+            #      tool data is actually synthesized by the
+            #      reasoning model and the "thinking" stage events
+            #      are emitted. Previously this branch incorrectly
+            #      did `return` here for BOTH situations, which
+            #      skipped the reasoning block entirely any time
+            #      tools were used - that was the bug causing
+            #      reasoning to never show up.
             # ====================================================
 
             if not tool_calls:
 
-                for chunk in streamed_chunks:
+                if not all_tool_calls:
 
-                    content = getattr(
-                        chunk,
-                        "content",
-                        None,
-                    )
+                    for chunk in streamed_chunks:
 
-                    if content:
+                        content = getattr(
+                            chunk,
+                            "content",
+                            None,
+                        )
 
-                        yield {
-                            "type": "answer",
-                            "content": content,
-                        }
+                        if content:
 
-                return
+                            yield {
+                                "type": "answer",
+                                "content": content,
+                            }
+
+                    return
+
+                break
 
             # ====================================================
             # TOOLS DETECTED THIS ROUND
