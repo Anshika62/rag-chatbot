@@ -475,6 +475,7 @@ You have access to:
 11. Find location on map tool
 12. Distance-between-two-locations tool
 13. Compare-travel-modes tool
+14. Image generation tool
 
 TOOL EXECUTION RULE:
 
@@ -741,6 +742,37 @@ IMAGES:
 
 - Only use document IDs and URLs actually returned by the
   current turn's tools.
+
+IMAGE GENERATION:
+
+- Use generate_image ONLY when the user explicitly asks to
+  generate, create, draw, make, or produce a NEW image.
+
+- Examples:
+  - "Generate an image of a futuristic city"
+  - "Create a picture of a mountain landscape"
+  - "Draw a cartoon robot"
+  - "Make an image of a red sports car"
+
+- Do NOT use generate_image when the user is asking you to:
+  - analyze an uploaded image
+  - describe an uploaded image
+  - analyze an image from an uploaded document
+  - find an existing image on the web
+
+- For an image attached directly to the current message,
+  use analyze_image.
+
+- For an image inside an uploaded document, use
+  search_knowledge_base and analyze_document_image.
+
+- When generate_image successfully returns an image URL,
+  use the exact URL returned by the tool.
+
+- Never invent a generated image URL.
+
+- Do not call generate_image for ordinary questions about
+  images unless the user explicitly asks for a new image.
 """
 
 
@@ -1164,6 +1196,34 @@ def _execute_tool_calls(
             )
 
         # ====================================================
+        # GENERATED IMAGE
+        # ====================================================
+
+        elif (
+            tool_name == "generate_image"
+            and isinstance(tool_result, dict)
+            and tool_result.get("success")
+            and tool_result.get("url")
+        ):
+            collected_images.append(
+                {
+                    "type": "generated",
+                    "filename": tool_result.get(
+                        "filename"
+                    ),
+                    "url": tool_result.get(
+                        "url"
+                    ),
+                    "prompt": tool_result.get(
+                        "prompt"
+                    ),
+                    "model": tool_result.get(
+                        "model"
+                    ),
+                }
+            )
+
+        # ====================================================
         # LOCATION REQUEST
         # ====================================================
 
@@ -1258,6 +1318,7 @@ TOOL_STAGE_DESCRIPTIONS = {
     "search_knowledge_base": "Searching the uploaded documents",
     "analyze_document_image": "Looking closely at the document image",
     "analyze_image": "Looking closely at the attached image",
+    "generate_image": "Creating the image",
     "get_current_datetime": "Checking the current date and time",
     "get_weather": "Checking the weather",
     "get_location": "Getting your location",
@@ -1530,6 +1591,9 @@ def _build_reasoning_messages(
         "- Keep the answer natural and concise.\n"
         "- If the tool results contain a relevant image URL, "
         "use that URL exactly as returned by the tool.\n"
+        "- If an image was generated successfully, refer to the "
+        "generated image naturally and never invent or modify "
+        "its URL.\n"
     )
 
     return (
@@ -2207,6 +2271,32 @@ def generate_answer_stream(
                 images_output.extend(
                     collected_images
                 )
+
+            # ====================================================
+            # GENERATED IMAGE EVENT
+            # ====================================================
+
+            for image in collected_images:
+                if (
+                    image.get("type")
+                    == "generated"
+                    and image.get("url")
+                ):
+                    yield {
+                        "type": "generated_image",
+                        "url": image.get(
+                            "url"
+                        ),
+                        "filename": image.get(
+                            "filename"
+                        ),
+                        "prompt": image.get(
+                            "prompt"
+                        ),
+                        "model": image.get(
+                            "model"
+                        ),
+                    }
 
             # ====================================================
             # LOCATION REQUEST -> stop immediately, same as before
