@@ -1,5 +1,4 @@
 import logging
-import re
 
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
@@ -18,88 +17,6 @@ from app.service.external.llm_service import (
 
 
 logger = logging.getLogger(__name__)
-
-
-# ============================================================
-# CASUAL / TRIVIAL MESSAGE DETECTION
-#
-# generate_suggestions() is a full extra LLM round-trip
-# (another OpenRouter chat/completions call) that previously ran
-# unconditionally after every single answer, even for a plain
-# "hey" or "thanks". On this deployment WEB_CONCURRENCY=1 (a
-# single worker process), so that extra blocking call doesn't
-# just slow down the current user's reply — it holds up the
-# ENTIRE server from handling any other request until it
-# finishes.
-#
-# Follow-up suggestions add no real value after a bare greeting
-# or acknowledgement anyway, so those are skipped outright. This
-# is intentionally conservative (short exact-phrase matches
-# only) so real questions — even short ones like "why?" or
-# "how far?" — are never skipped.
-# ============================================================
-
-_CASUAL_EXACT_PHRASES = {
-    "hi",
-    "hii",
-    "hiii",
-    "hey",
-    "heyy",
-    "heyyy",
-    "hello",
-    "helloo",
-    "yo",
-    "sup",
-    "ok",
-    "okk",
-    "okay",
-    "okey",
-    "bye",
-    "byee",
-    "goodbye",
-    "thanks",
-    "thank you",
-    "thankyou",
-    "thanku",
-    "thx",
-    "ty",
-    "cool",
-    "nice",
-    "great",
-    "good morning",
-    "good afternoon",
-    "good evening",
-    "good night",
-    "gn",
-    "gm",
-}
-
-
-def _should_skip_suggestions(
-    question: str,
-) -> bool:
-    """
-    Returns True only for bare greetings/acknowledgements where
-    follow-up suggestions add no value. Deliberately narrow: only
-    an exact match (after lowercasing and stripping punctuation)
-    against a known casual-phrase list is skipped. Anything else —
-    including short real questions — still gets suggestions as
-    before.
-    """
-
-    if not question:
-        return False
-
-    normalized = re.sub(
-        r"[^\w\s]",
-        "",
-        question.strip().lower(),
-    ).strip()
-
-    if not normalized:
-        return False
-
-    return normalized in _CASUAL_EXACT_PHRASES
 
 
 def query_documents(
@@ -490,67 +407,51 @@ def query_documents_stream(
         # ====================================================
         # GENERATE FOLLOW-UP SUGGESTIONS
         #
-        # FIX: skip this extra LLM round-trip for bare greetings/
-        # acknowledgements ("heyy", "thanks", "ok", ...). On this
-        # deployment WEB_CONCURRENCY=1, so every second this call
-        # takes blocks the single worker from handling ANY other
-        # request, not just this one. Suggestions add nothing
-        # useful after a plain "hey" anyway. Real questions —
-        # short or long — are unaffected and still get suggestions
-        # exactly as before.
+        # Always generated, for every message - including bare
+        # greetings like "hi" - per explicit request. No skip
+        # condition here anymore.
         # ====================================================
 
-        if _should_skip_suggestions(question):
+        try:
 
-            logger.info(
-                "SUGGESTIONS SKIPPED (casual message): "
-                "conversation_id=%s question=%s",
-                conversation_id,
-                question,
+            suggestions = generate_suggestions(
+                question=question,
+                answer=full_answer,
+                chat_history=chat_history,
             )
 
-        else:
+            if suggestions:
 
-            try:
+                yield {
+                    "event": "suggestions",
+                    "success": True,
+                    "error_code": None,
+                    "conversation_id": conversation_id,
+                    "message_id": assistant_message.id,
+                    "delta": None,
+                    "text_content": "",
+                    "images": [],
+                    "suggestions": suggestions,
+                }
 
-                suggestions = generate_suggestions(
-                    question=question,
-                    answer=full_answer,
-                    chat_history=chat_history,
-                )
+            else:
 
-                if suggestions:
-
-                    yield {
-                        "event": "suggestions",
-                        "success": True,
-                        "error_code": None,
-                        "conversation_id": conversation_id,
-                        "message_id": assistant_message.id,
-                        "delta": None,
-                        "text_content": "",
-                        "images": [],
-                        "suggestions": suggestions,
-                    }
-
-                else:
-
-                    logger.info(
-                        "No suggestions generated: "
-                        "conversation_id=%s",
-                        conversation_id,
-                    )
-
-            except Exception:
-
-                logger.exception(
-                    "Suggestion generation failed: "
-                    "conversation_id=%s user_id=%s",
+                logger.info(
+                    "No suggestions generated: "
+                    "conversation_id=%s",
                     conversation_id,
-                    user_id,
                 )
 
-                # Suggestion failure must not fail the completed answer.
+        except Exception:
+
+            logger.exception(
+                "Suggestion generation failed: "
+                "conversation_id=%s user_id=%s",
+                conversation_id,
+                user_id,
+            )
+
+            # Suggestion failure must not fail the completed answer.
 
     except HTTPException as exc:
 
