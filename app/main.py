@@ -4,6 +4,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from app.api import livekit_token  # or wherever it ends up after step 1
 
 from app.api.routes import router
 from app.core.response import setup_exception_handlers
@@ -79,3 +80,5 @@ setup_exception_handlers(app)
 # ============================================================
 
 app.include_router(router)
+
+app.include_router(livekit_token.router)
