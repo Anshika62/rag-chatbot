@@ -8,7 +8,7 @@ __pycache__/
 # Virtual Environment
 .venv/
 # IDE
-.vscode/
+temp_auto_push.bat
 # Uploaded PDFs (personal test data)
 Uploads/
 # HuggingFace model cache
@@ -18,4 +18,5 @@ huggingface/
 *.log
 # Database
 *.sqlite3
-*.db
+*.db.gitignore
+branch_structure.json
