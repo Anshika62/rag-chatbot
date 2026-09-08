@@ -1,5 +1,4 @@
 import logging
-
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -13,11 +12,6 @@ from app.service.external.llm_service import (
     generate_answer,
     generate_answer_stream,
     generate_suggestions,
-)
-
-from app.service.location.conversation_location_store import (
-    set_conversation_location,
-    get_conversation_location,
 )
 
 
@@ -165,87 +159,54 @@ def query_documents_stream(
             return
 
         # ====================================================
-        # RESOLVE CONVERSATION LOCATION
+        # RESOLVE + PERSIST CONVERSATION LOCATION
         # ====================================================
-        #
-        # Location is NOT persisted in the database.
         #
         # First request:
         #   frontend sends latitude + longitude
-        #       ↓
-        #   temporarily store for this conversation
+        #   -> save them in Conversation
         #
         # Next request:
         #   frontend does not send coordinates
-        #       ↓
-        #   load them from temporary conversation storage
+        #   -> load them from Conversation
         #
-        # Only a complete latitude + longitude pair is stored.
+        # Only update the stored location when BOTH coordinates
+        # are available. This prevents partial location updates.
         # ====================================================
 
         if latitude is not None and longitude is not None:
 
-            # Frontend provided a new location.
-            #
-            # Store it temporarily for this conversation.
-            # This also refreshes the TTL.
-            set_conversation_location(
-                conversation_id=conversation_id,
-                latitude=latitude,
-                longitude=longitude,
-                address=address,
-            )
+            if (
+                conversation.latitude != latitude
+                or conversation.longitude != longitude
+            ):
+                conversation.latitude = latitude
+                conversation.longitude = longitude
 
-            logger.info(
-                "Conversation location stored temporarily: "
-                "conversation_id=%s latitude=%s longitude=%s",
-                conversation_id,
-                latitude,
-                longitude,
-            )
-
-        else:
-
-            # Frontend did not provide coordinates.
-            #
-            # Try to retrieve the previously supplied location
-            # from temporary conversation storage.
-            stored_location = get_conversation_location(
-                conversation_id=conversation_id,
-            )
-
-            if stored_location:
-
-                latitude = stored_location.get("latitude")
-                longitude = stored_location.get("longitude")
-
-                # Use stored address only when the current request
-                # did not provide one.
-                if not address:
-                    address = stored_location.get("address")
+                db.add(conversation)
+                db.commit()
+                db.refresh(conversation)
 
                 logger.info(
-                    "Using temporary conversation location: "
+                    "Conversation location persisted: "
                     "conversation_id=%s latitude=%s longitude=%s",
                     conversation_id,
                     latitude,
                     longitude,
                 )
 
-            else:
+        else:
 
-                # No location has been provided for this conversation.
-                #
-                # Keep latitude/longitude as None so the existing
-                # LLM location-request flow can work normally.
-                latitude = None
-                longitude = None
+            latitude = conversation.latitude
+            longitude = conversation.longitude
 
-                logger.info(
-                    "No temporary conversation location found: "
-                    "conversation_id=%s",
-                    conversation_id,
-                )
+            logger.info(
+                "Using persisted conversation location: "
+                "conversation_id=%s latitude=%s longitude=%s",
+                conversation_id,
+                latitude,
+                longitude,
+            )
 
         # ====================================================
         # GET CHAT HISTORY
@@ -256,12 +217,58 @@ def query_documents_stream(
             conversation_id=conversation_id,
         )
 
+        # ====================================================
+        # DETECT LOCATION CONTINUATION
+        #
+        # When the first request needs the user's location, the
+        # original user message is already stored in the database.
+        # The frontend then sends the same question again together
+        # with latitude/longitude after the user selects a location.
+        #
+        # Do NOT create another user-message row for that continuation.
+        # A continuation is identified safely by all three conditions:
+        #   1. real coordinates are supplied on this request,
+        #   2. the latest DB message is a user message, and
+        #   3. its question matches the current question.
+        #
+        # A normal repeated question is not affected because a
+        # completed turn ends with an assistant message.
+        # ====================================================
+
+        normalized_question = question.casefold().strip()
+        last_message = previous_messages[-1] if previous_messages else None
+
+        is_location_continuation = bool(
+            latitude is not None
+            and longitude is not None
+            and last_message is not None
+            and str(last_message.role).lower() in {"user", "human"}
+            and str(last_message.content or "").casefold().strip()
+            == normalized_question
+        )
+
+        if is_location_continuation:
+            logger.info(
+                "LOCATION CONTINUATION DETECTED: "
+                "conversation_id=%s message_id=%s",
+                conversation_id,
+                last_message.id,
+            )
+
+        chat_history_messages = previous_messages
+
+        # The current question is already the latest user message in
+        # a location continuation. Do not pass that same message twice
+        # as both history and the current question.
+        if is_location_continuation:
+            chat_history_messages = previous_messages[:-1]
+
         chat_history = [
             {
                 "role": message.role,
                 "content": message.content,
             }
-            for message in previous_messages
+            for message in chat_history_messages
         ]
 
         # ====================================================
@@ -280,15 +287,29 @@ def query_documents_stream(
         }
 
         # ====================================================
-        # SAVE USER MESSAGE
+        # SAVE / REUSE USER MESSAGE
+        #
+        # A location continuation must reuse the original user
+        # message. Creating a new row here would make the same
+        # question appear twice in the database and, after refresh,
+        # twice in the chat history.
         # ====================================================
 
-        user_message = create_message(
-            db=db,
-            conversation_id=conversation_id,
-            role="user",
-            content=question,
-        )
+        if is_location_continuation:
+            user_message = last_message
+            logger.info(
+                "REUSING USER MESSAGE FOR LOCATION CONTINUATION: "
+                "conversation_id=%s message_id=%s",
+                conversation_id,
+                user_message.id,
+            )
+        else:
+            user_message = create_message(
+                db=db,
+                conversation_id=conversation_id,
+                role="user",
+                content=question,
+            )
 
         full_answer = ""
         images_output: list = []
@@ -357,11 +378,7 @@ def query_documents_stream(
                     "images": [],
                     "methods": piece.get(
                         "methods",
-                        [
-                            "current_location",
-                            "search",
-                            "map",
-                        ],
+                        ["current_location", "search", "map"],
                     ),
                 }
 
@@ -432,7 +449,53 @@ def query_documents_stream(
         )
 
         # ====================================================
+        # GENERATE FOLLOW-UP SUGGESTIONS
+        #
+        # Compatibility-first: the existing answer streaming above is
+        # untouched. Suggestions are generated after the full answer
+        # is available, then emitted BEFORE `done` so SSE clients that
+        # stop processing after `done` cannot lose the suggestions.
+        # ====================================================
+
+        try:
+            suggestions = generate_suggestions(
+                question=question,
+                answer=full_answer,
+                chat_history=chat_history,
+            )
+
+            if suggestions:
+                yield {
+                    "event": "suggestions",
+                    "success": True,
+                    "error_code": None,
+                    "conversation_id": conversation_id,
+                    "message_id": assistant_message.id,
+                    "delta": None,
+                    "text_content": "",
+                    "images": [],
+                    "suggestions": suggestions,
+                }
+            else:
+                logger.info(
+                    "No suggestions generated: "
+                    "conversation_id=%s",
+                    conversation_id,
+                )
+
+        except Exception:
+            logger.exception(
+                "Suggestion generation failed: "
+                "conversation_id=%s user_id=%s",
+                conversation_id,
+                user_id,
+            )
+            # Suggestion failure must never fail the completed answer.
+
+        # ====================================================
         # DONE EVENT
+        #
+        # Keep this LAST so `done` remains the final completion signal.
         # ====================================================
 
         yield {
@@ -445,54 +508,6 @@ def query_documents_stream(
             "text_content": full_answer,
             "images": images_output,
         }
-
-        # ====================================================
-        # GENERATE FOLLOW-UP SUGGESTIONS
-        #
-        # Always generated, for every message - including bare
-        # greetings like "hi" - per existing behavior.
-        # ====================================================
-
-        try:
-
-            suggestions = generate_suggestions(
-                question=question,
-                answer=full_answer,
-                chat_history=chat_history,
-            )
-
-            if suggestions:
-
-                yield {
-                    "event": "suggestions",
-                    "success": True,
-                    "error_code": None,
-                    "conversation_id": conversation_id,
-                    "message_id": assistant_message.id,
-                    "delta": None,
-                    "text_content": "",
-                    "images": [],
-                    "suggestions": suggestions,
-                }
-
-            else:
-
-                logger.info(
-                    "No suggestions generated: "
-                    "conversation_id=%s",
-                    conversation_id,
-                )
-
-        except Exception:
-
-            logger.exception(
-                "Suggestion generation failed: "
-                "conversation_id=%s user_id=%s",
-                conversation_id,
-                user_id,
-            )
-
-            # Suggestion failure must not fail the completed answer.
 
     except HTTPException as exc:
 
